@@ -1550,7 +1550,7 @@ int main(int argc, char *argv[]) {
 		server.terminal_cmd = getenv("TERMINAL");
 	}
 	if (server.terminal_cmd == NULL) {
-		server.terminal_cmd = "alacritty";
+		server.terminal_cmd = "foot";
 	}
 
 	/*
