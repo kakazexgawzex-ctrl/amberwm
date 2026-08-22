@@ -13,13 +13,16 @@ LDLIBS := $(shell $(PKG_CONFIG) --libs $(PKGS))
 
 all: amberwm
 
-amberwm.o: amberwm.c
+wlr-layer-shell-unstable-v1-protocol.h: protocols/wlr-layer-shell-unstable-v1.xml
+	wayland-scanner server-header $< $@
+
+amberwm.o: amberwm.c wlr-layer-shell-unstable-v1-protocol.h
 	$(CC) -c $< $(CFLAGS) -o $@
 
 amberwm: amberwm.o
 	$(CC) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
 clean:
-	rm -f amberwm amberwm.o
+	rm -f amberwm amberwm.o wlr-layer-shell-unstable-v1-protocol.h
 
 .PHONY: all clean

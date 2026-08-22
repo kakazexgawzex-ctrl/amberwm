@@ -1,8 +1,10 @@
 #include <assert.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -14,6 +16,7 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
@@ -26,10 +29,20 @@
 #include <xkbcommon/xkbcommon.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
+#define AMBER_WORKSPACE_COUNT 9
+
 enum amber_cursor_mode {
 	AMBER_CURSOR_PASSTHROUGH,
 	AMBER_CURSOR_MOVE,
 	AMBER_CURSOR_RESIZE,
+};
+
+struct amber_workspace {
+	/* Scene tree holding every toplevel on this workspace. Hiding a
+	 * workspace is a single node disable: hidden subtrees produce no
+	 * damage and cost zero render time. */
+	struct wlr_scene_tree *tree;
+	struct wl_list toplevels; // amber_toplevel.link
 };
 
 struct amber_server {
@@ -43,7 +56,16 @@ struct amber_server {
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
-	struct wl_list toplevels;
+
+	struct wlr_layer_shell_v1 *layer_shell;
+	struct wl_listener new_layer_surface;
+
+	/* One shared xkb context for all keyboards (created once). */
+	struct xkb_context *xkb_context;
+
+	struct amber_toplevel *focused_toplevel;
+	struct amber_output *active_output;
+	const char *terminal_cmd;
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
@@ -74,6 +96,18 @@ struct amber_output {
 	struct wl_list link;
 	struct amber_server *server;
 	struct wlr_output *wlr_output;
+	/* Position and size of this output in layout coordinates. */
+	struct wlr_box layout_box;
+	/* Area not reserved by exclusive layer surfaces, local coords. */
+	struct wlr_box usable_area;
+
+	/* Children of the scene output tree, in stacking order:
+	 * background < bottom < workspaces (windows) < top < overlay. */
+	struct wlr_scene_tree *layer_trees[4];
+	struct wl_list layers[4]; // amber_layer_surface.link, per zwlr_layer_shell_v1_layer
+	struct amber_workspace workspaces[AMBER_WORKSPACE_COUNT];
+	int active_workspace;
+
 	struct wl_listener frame;
 	struct wl_listener request_state;
 	struct wl_listener destroy;
@@ -82,6 +116,8 @@ struct amber_output {
 struct amber_toplevel {
 	struct wl_list link;
 	struct amber_server *server;
+	struct amber_output *output;
+	int workspace; // index into output->workspaces
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_scene_tree *scene_tree;
 	struct wl_listener map;
@@ -94,6 +130,20 @@ struct amber_toplevel {
 	struct wl_listener request_fullscreen;
 };
 
+struct amber_layer_surface {
+	struct wl_list link;
+	struct amber_server *server;
+	struct amber_output *output;
+	struct wlr_layer_surface_v1 *layer_surface;
+	struct wlr_scene_layer_surface_v1 *scene_layer;
+	bool mapped;
+
+	struct wl_listener map;
+	struct wl_listener unmap;
+	struct wl_listener commit;
+	struct wl_listener destroy;
+};
+
 struct amber_popup {
 	struct wlr_xdg_popup *xdg_popup;
 	struct wl_listener commit;
@@ -104,11 +154,56 @@ struct amber_keyboard {
 	struct wl_list link;
 	struct amber_server *server;
 	struct wlr_keyboard *wlr_keyboard;
+	/* Modifier bits that are locks (caps/num), stripped before matching
+	 * bindings so NumLock does not break Super+key combos. */
+	uint32_t lock_mask;
 
 	struct wl_listener modifiers;
 	struct wl_listener key;
 	struct wl_listener destroy;
 };
+
+static void spawn(const char *cmd) {
+	/* SIGCHLD is ignored (see main), so children are reaped by the
+	 * kernel automatically and never become zombies. */
+	if (fork() == 0) {
+		setsid();
+		execl("/bin/sh", "/bin/sh", "-c", cmd, (void *)NULL);
+		exit(EXIT_FAILURE);
+	}
+}
+
+static struct amber_workspace *toplevel_workspace(struct amber_toplevel *toplevel) {
+	return &toplevel->output->workspaces[toplevel->workspace];
+}
+
+static struct amber_output *active_output(struct amber_server *server) {
+	if (server->active_output != NULL) {
+		return server->active_output;
+	}
+	struct wlr_output *wlr_output = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->wlr_output == wlr_output) {
+			return output;
+		}
+	}
+	return NULL;
+}
+
+static void deactivate_focused(struct amber_server *server) {
+	if (server->focused_toplevel != NULL) {
+		wlr_xdg_toplevel_set_activated(
+			server->focused_toplevel->xdg_toplevel, false);
+		server->focused_toplevel = NULL;
+	}
+	wlr_seat_keyboard_clear_focus(server->seat);
+}
+
+static void focus_nothing(struct amber_server *server) {
+	deactivate_focused(server);
+}
 
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -123,6 +218,7 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 		/* Don't re-focus an already focused surface. */
 		return;
 	}
+	deactivate_focused(server);
 	if (prev_surface) {
 		/*
 		 * Deactivate the previously focused surface. This lets the client know
@@ -139,8 +235,9 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Move the toplevel to the front */
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
 	wl_list_remove(&toplevel->link);
-	wl_list_insert(&server->toplevels, &toplevel->link);
+	wl_list_insert(&toplevel_workspace(toplevel)->toplevels, &toplevel->link);
 	/* Activate the new surface */
+	server->focused_toplevel = toplevel;
 	wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
 	/*
 	 * Tell the seat to have the keyboard enter this surface. wlroots will keep
@@ -150,6 +247,21 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 	if (keyboard != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, surface,
 			keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
+	}
+}
+
+/* Focus the most recently focused window of a workspace, or nothing. */
+static void focus_workspace_topmost(struct amber_server *server,
+		struct amber_workspace *workspace) {
+	struct amber_toplevel *toplevel = NULL;
+	if (!wl_list_empty(&workspace->toplevels)) {
+		toplevel = wl_container_of(workspace->toplevels.next,
+			toplevel, link);
+	}
+	if (toplevel != NULL) {
+		focus_toplevel(toplevel);
+	} else {
+		focus_nothing(server);
 	}
 }
 
@@ -171,31 +283,163 @@ static void keyboard_handle_modifiers(
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-static bool handle_keybinding(struct amber_server *server, xkb_keysym_t sym) {
-	/*
-	 * Here we handle compositor keybindings. This is when the compositor is
-	 * processing keys, rather than passing them on to the client for its own
-	 * processing.
-	 *
-	 * This function assumes Alt is held down.
-	 */
-	switch (sym) {
-	case XKB_KEY_Escape:
+static void cycle_focus(struct amber_server *server, int dir) {
+	struct amber_output *output = active_output(server);
+	if (output == NULL) {
+		return;
+	}
+	struct amber_workspace *workspace =
+		&output->workspaces[output->active_workspace];
+	if (wl_list_length(&workspace->toplevels) < 2) {
+		return;
+	}
+	/* toplevels list is newest-first; walk one entry away from the
+	 * focused window, skipping the list head when wrapping around. */
+	struct wl_list *pos = &workspace->toplevels;
+	if (server->focused_toplevel != NULL &&
+			server->focused_toplevel->output == output &&
+			server->focused_toplevel->workspace ==
+				output->active_workspace) {
+		pos = &server->focused_toplevel->link;
+	}
+	struct wl_list *target = dir > 0 ? pos->prev : pos->next;
+	if (target == &workspace->toplevels) {
+		target = dir > 0 ? target->prev : target->next;
+	}
+	struct amber_toplevel *next;
+	next = wl_container_of(target, next, link);
+	focus_toplevel(next);
+}
+
+static void workspace_switch(struct amber_output *output, int index) {
+	if (index < 0 || index >= AMBER_WORKSPACE_COUNT ||
+			index == output->active_workspace) {
+		return;
+	}
+	struct amber_workspace *old =
+		&output->workspaces[output->active_workspace];
+	struct amber_workspace *new = &output->workspaces[index];
+	/* Hidden workspaces cost nothing: a disabled subtree produces no
+	 * damage and is skipped entirely by the scene renderer. */
+	wlr_scene_node_set_enabled(&old->tree->node, false);
+	wlr_scene_node_set_enabled(&new->tree->node, true);
+	output->active_workspace = index;
+	focus_workspace_topmost(output->server, new);
+}
+
+static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
+		int index) {
+	if (index < 0 || index >= AMBER_WORKSPACE_COUNT ||
+			index == toplevel->workspace) {
+		return;
+	}
+	struct amber_output *output = toplevel->output;
+	struct amber_workspace *src = toplevel_workspace(toplevel);
+	bool was_focused = toplevel->server->focused_toplevel == toplevel;
+
+	wl_list_remove(&toplevel->link);
+	wl_list_insert(&output->workspaces[index].toplevels, &toplevel->link);
+	wlr_scene_node_reparent(&toplevel->scene_tree->node,
+		output->workspaces[index].tree);
+	toplevel->workspace = index;
+
+	if (was_focused && index != output->active_workspace) {
+		focus_workspace_topmost(toplevel->server, src);
+	}
+}
+
+enum amber_binding_id {
+	AMBER_BINDING_QUIT,
+	AMBER_BINDING_CLOSE,
+	AMBER_BINDING_TERMINAL,
+	AMBER_BINDING_CYCLE_FOCUS,
+	AMBER_BINDING_WORKSPACE,
+	AMBER_BINDING_MOVE_TO_WORKSPACE,
+};
+
+struct amber_binding {
+	uint32_t mods;
+	xkb_keysym_t sym;
+	enum amber_binding_id id;
+	int arg;
+};
+
+/* Default bindings. This table is what a future config parser will fill
+ * in; matching stays O(bindings), which for realistic sizes (< 100) is
+ * far cheaper per keypress than any fancier data structure. */
+static const struct amber_binding amber_default_bindings[] = {
+	{ WLR_MODIFIER_LOGO, XKB_KEY_Return, AMBER_BINDING_TERMINAL, 0 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_Q,
+		AMBER_BINDING_CLOSE, 0 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_E,
+		AMBER_BINDING_QUIT, 0 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_Tab, AMBER_BINDING_CYCLE_FOCUS, 1 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_Tab,
+		AMBER_BINDING_CYCLE_FOCUS, -1 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_1, AMBER_BINDING_WORKSPACE, 0 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_2, AMBER_BINDING_WORKSPACE, 1 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_3, AMBER_BINDING_WORKSPACE, 2 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_4, AMBER_BINDING_WORKSPACE, 3 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_5, AMBER_BINDING_WORKSPACE, 4 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_6, AMBER_BINDING_WORKSPACE, 5 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_7, AMBER_BINDING_WORKSPACE, 6 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_8, AMBER_BINDING_WORKSPACE, 7 },
+	{ WLR_MODIFIER_LOGO, XKB_KEY_9, AMBER_BINDING_WORKSPACE, 8 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_1,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 0 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_2,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 1 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_3,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 2 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_4,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 3 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_5,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 4 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_6,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 5 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_7,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 6 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_8,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 7 },
+	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_9,
+		AMBER_BINDING_MOVE_TO_WORKSPACE, 8 },
+};
+
+#define AMBER_BINDING_COUNT \
+	(sizeof(amber_default_bindings) / sizeof(amber_default_bindings[0]))
+
+static void binding_exec(struct amber_server *server,
+		const struct amber_binding *binding) {
+	switch (binding->id) {
+	case AMBER_BINDING_QUIT:
 		wl_display_terminate(server->wl_display);
 		break;
-	case XKB_KEY_F1:
-		/* Cycle to the next toplevel */
-		if (wl_list_length(&server->toplevels) < 2) {
-			break;
+	case AMBER_BINDING_CLOSE:
+		if (server->focused_toplevel != NULL) {
+			wlr_xdg_toplevel_send_close(
+				server->focused_toplevel->xdg_toplevel);
 		}
-		struct amber_toplevel *next_toplevel =
-			wl_container_of(server->toplevels.prev, next_toplevel, link);
-		focus_toplevel(next_toplevel);
 		break;
-	default:
-		return false;
+	case AMBER_BINDING_TERMINAL:
+		spawn(server->terminal_cmd);
+		break;
+	case AMBER_BINDING_CYCLE_FOCUS:
+		cycle_focus(server, binding->arg);
+		break;
+	case AMBER_BINDING_WORKSPACE: {
+		struct amber_output *output = active_output(server);
+		if (output != NULL) {
+			workspace_switch(output, binding->arg);
+		}
+		break;
 	}
-	return true;
+	case AMBER_BINDING_MOVE_TO_WORKSPACE:
+		if (server->focused_toplevel != NULL) {
+			toplevel_move_to_workspace(server->focused_toplevel,
+				binding->arg);
+		}
+		break;
+	}
 }
 
 static void keyboard_handle_key(
@@ -215,13 +459,21 @@ static void keyboard_handle_key(
 			keyboard->wlr_keyboard->xkb_state, keycode, &syms);
 
 	bool handled = false;
-	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-	if ((modifiers & WLR_MODIFIER_ALT) &&
-			event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		/* If alt is held down and this button was _pressed_, we attempt to
-		 * process it as a compositor keybinding. */
-		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i]);
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		uint32_t modifiers =
+			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
+			~keyboard->lock_mask;
+		for (int i = 0; i < nsyms && !handled; i++) {
+			for (size_t j = 0; j < AMBER_BINDING_COUNT; j++) {
+				const struct amber_binding *binding =
+					&amber_default_bindings[j];
+				if (binding->mods == modifiers &&
+						binding->sym == syms[i]) {
+					binding_exec(server, binding);
+					handled = true;
+					break;
+				}
+			}
 		}
 	}
 
@@ -255,15 +507,29 @@ static void server_new_keyboard(struct amber_server *server,
 	keyboard->server = server;
 	keyboard->wlr_keyboard = wlr_keyboard;
 
-	/* We need to prepare an XKB keymap and assign it to the keyboard. This
-	 * assumes the defaults (e.g. layout = "us"). */
-	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	/* We need to prepare an XKB keymap and assign it to the keyboard.
+	 * This assumes the defaults (e.g. layout = "us"). The xkb context is
+	 * shared across all keyboards (see amber_server). */
+	struct xkb_context *context = server->xkb_context;
 	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
 		XKB_KEYMAP_COMPILE_NO_FLAGS);
 
 	wlr_keyboard_set_keymap(wlr_keyboard, keymap);
 	xkb_keymap_unref(keymap);
-	xkb_context_unref(context);
+
+	/* Remember which modifiers are locks so keybinding matching can
+	 * ignore them (NumLock must not break Super+1..9). wlr normalizes
+	 * modifier bits to the same indexes xkb uses, so 1 << index works. */
+	keyboard->lock_mask = 0;
+	xkb_mod_index_t lock_idx =
+		xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CAPS);
+	if (lock_idx != XKB_MOD_INVALID) {
+		keyboard->lock_mask |= (uint32_t)1 << lock_idx;
+	}
+	lock_idx = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_NUM);
+	if (lock_idx != XKB_MOD_INVALID) {
+		keyboard->lock_mask |= (uint32_t)1 << lock_idx;
+	}
 	wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
 	/* Here we set up listeners for keyboard events. */
@@ -377,10 +643,15 @@ static struct amber_toplevel *desktop_toplevel_at(
 
 	*surface = scene_surface->surface;
 	/* Find the node corresponding to the amber_toplevel at the root of this
-	 * surface tree, it is the only one for which we set the data field. */
+	 * surface tree, it is the only one for which we set the data field.
+	 * Layer surfaces have no amber_toplevel ancestor; stop at the tree
+	 * root instead of walking past it (NULL). */
 	struct wlr_scene_tree *tree = node->parent;
 	while (tree != NULL && tree->node.data == NULL) {
 		tree = tree->node.parent;
+	}
+	if (tree == NULL) {
+		return NULL;
 	}
 	return tree->node.data;
 }
@@ -392,11 +663,13 @@ static void reset_cursor_mode(struct amber_server *server) {
 }
 
 static void process_cursor_move(struct amber_server *server) {
-	/* Move the grabbed toplevel to the new position. */
+	/* Move the grabbed toplevel to the new position. Scene node
+	 * positions are local to the workspace tree, which sits at the
+	 * output's origin, so convert cursor layout coords -> local. */
 	struct amber_toplevel *toplevel = server->grabbed_toplevel;
 	wlr_scene_node_set_position(&toplevel->scene_tree->node,
-		server->cursor->x - server->grab_x,
-		server->cursor->y - server->grab_y);
+		server->cursor->x - toplevel->output->layout_box.x - server->grab_x,
+		server->cursor->y - toplevel->output->layout_box.y - server->grab_y);
 }
 
 static void process_cursor_resize(struct amber_server *server) {
@@ -411,8 +684,8 @@ static void process_cursor_resize(struct amber_server *server) {
 	 * size, then commit any movement that was prepared.
 	 */
 	struct amber_toplevel *toplevel = server->grabbed_toplevel;
-	double border_x = server->cursor->x - server->grab_x;
-	double border_y = server->cursor->y - server->grab_y;
+	double border_x = server->cursor->x - toplevel->output->layout_box.x - server->grab_x;
+	double border_y = server->cursor->y - toplevel->output->layout_box.y - server->grab_y;
 	int new_left = server->grab_geobox.x;
 	int new_right = server->grab_geobox.x + server->grab_geobox.width;
 	int new_top = server->grab_geobox.y;
@@ -451,6 +724,21 @@ static void process_cursor_resize(struct amber_server *server) {
 }
 
 static void process_cursor_motion(struct amber_server *server, uint32_t time) {
+	/* Track which output the cursor is on; new windows, workspace
+	 * switches and cycling all target it. Cheap: one layout walk per
+	 * motion event, only when the pointer actually moves. */
+	struct wlr_output *wlr_output = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (wlr_output != NULL) {
+		struct amber_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			if (output->wlr_output == wlr_output) {
+				server->active_output = output;
+				break;
+			}
+		}
+	}
+
 	/* If the mode is non-passthrough, delegate to those functions. */
 	if (server->cursor_mode == AMBER_CURSOR_MOVE) {
 		process_cursor_move(server);
@@ -570,6 +858,9 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
+static void arrange_layers(struct amber_output *output);
+static void output_update_geometry(struct amber_output *output);
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -594,6 +885,7 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	struct amber_output *output = wl_container_of(listener, output, request_state);
 	const struct wlr_output_event_request_state *event = data;
 	wlr_output_commit_state(output->wlr_output, event->state);
+	output_update_geometry(output);
 }
 
 static void output_destroy(struct wl_listener *listener, void *data) {
@@ -604,6 +896,182 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
 	free(output);
+}
+
+/*
+ * Layer shell.
+ *
+ * Bars, launchers and wallpapers live here. Each surface is a child of its
+ * output's per-layer scene tree; arrangement is delegated to
+ * wlr_scene_layer_surface_v1_configure(), which also folds exclusive zones
+ * into the usable area we will later tile windows into.
+ */
+
+static void arrange_layers(struct amber_output *output) {
+	struct wlr_box full = {0};
+	wlr_output_effective_resolution(output->wlr_output,
+		&full.width, &full.height);
+
+	/* Pass 1: exclusive surfaces shrink the usable area. */
+	struct wlr_box usable = full;
+	for (int i = 0; i < 4; i++) {
+		struct amber_layer_surface *layer;
+		wl_list_for_each(layer, &output->layers[i], link) {
+			if (layer->layer_surface->current.exclusive_zone > 0) {
+				wlr_scene_layer_surface_v1_configure(
+					layer->scene_layer, &full, &usable);
+			}
+		}
+	}
+	output->usable_area = usable;
+
+	/* Pass 2: everything else positions within the final usable area. */
+	for (int i = 0; i < 4; i++) {
+		struct amber_layer_surface *layer;
+		wl_list_for_each(layer, &output->layers[i], link) {
+			if (layer->layer_surface->current.exclusive_zone > 0) {
+				continue;
+			}
+			struct wlr_box bounds = usable;
+			struct wlr_box unused = usable;
+			wlr_scene_layer_surface_v1_configure(
+				layer->scene_layer, &bounds, &unused);
+		}
+	}
+
+	/* TODO(phase-2): retile windows into the new usable area. */
+}
+
+static void focus_layer_surface(struct amber_server *server,
+		struct amber_layer_surface *layer) {
+	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+	server->focused_toplevel = NULL;
+	if (keyboard != NULL) {
+		wlr_seat_keyboard_notify_enter(server->seat,
+			layer->layer_surface->surface,
+			keyboard->keycodes, keyboard->num_keycodes,
+			&keyboard->modifiers);
+	}
+}
+
+static void layer_surface_handle_map(struct wl_listener *listener, void *data) {
+	struct amber_layer_surface *layer =
+		wl_container_of(listener, layer, map);
+	layer->mapped = true;
+	arrange_layers(layer->output);
+
+	/* Launchers/lock screens ask for keyboard interactivity; hand them
+	 * focus on map. Regular bars never set this, so they can't steal it. */
+	if (layer->layer_surface->current.keyboard_interactive !=
+			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
+		focus_layer_surface(layer->server, layer);
+	}
+}
+
+static void layer_surface_handle_unmap(struct wl_listener *listener,
+		void *data) {
+	struct amber_layer_surface *layer =
+		wl_container_of(listener, layer, unmap);
+	layer->mapped = false;
+	if (layer->server->focused_toplevel == NULL) {
+		struct amber_output *output = active_output(layer->server);
+		if (output != NULL) {
+			focus_workspace_topmost(layer->server,
+				&output->workspaces[output->active_workspace]);
+		}
+	}
+}
+
+static void layer_surface_handle_commit(struct wl_listener *listener,
+		void *data) {
+	struct amber_layer_surface *layer =
+		wl_container_of(listener, layer, commit);
+	struct wlr_layer_surface_v1 *layer_surface = layer->layer_surface;
+
+	if (layer_surface->initial_commit) {
+		/* The compositor must configure the surface before it can
+		 * map; arrange_layers() does this for every layer surface. */
+		arrange_layers(layer->output);
+		return;
+	}
+
+	/* `current.committed` is non-zero while the client has un-acked
+	 * state, which prevents configure<->commit ping-pong loops. */
+	if (!layer_surface->current.committed) {
+		return;
+	}
+
+	arrange_layers(layer->output);
+}
+
+static void layer_surface_handle_destroy(struct wl_listener *listener,
+		void *data) {
+	struct amber_layer_surface *layer =
+		wl_container_of(listener, layer, destroy);
+
+	wl_list_remove(&layer->link);
+	wl_list_remove(&layer->map.link);
+	wl_list_remove(&layer->unmap.link);
+	wl_list_remove(&layer->commit.link);
+	wl_list_remove(&layer->destroy.link);
+	free(layer);
+}
+
+static void server_new_layer_surface(struct wl_listener *listener,
+		void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, new_layer_surface);
+	struct wlr_layer_surface_v1 *layer_surface = data;
+
+	/* Clients may not know which output they want (e.g. launchers);
+	 * default to the active one. */
+	if (layer_surface->output == NULL) {
+		struct amber_output *output = active_output(server);
+		if (output == NULL && !wl_list_empty(&server->outputs)) {
+			output = wl_container_of(server->outputs.next,
+				output, link);
+		}
+		if (output == NULL) {
+			wlr_layer_surface_v1_destroy(layer_surface);
+			return;
+		}
+		layer_surface->output = output->wlr_output;
+	}
+	struct amber_output *output = NULL;
+	struct amber_output *candidate;
+	wl_list_for_each(candidate, &server->outputs, link) {
+		if (candidate->wlr_output == layer_surface->output) {
+			output = candidate;
+			break;
+		}
+	}
+	if (output == NULL) {
+		wlr_layer_surface_v1_destroy(layer_surface);
+		return;
+	}
+
+	struct amber_layer_surface *layer = calloc(1, sizeof(*layer));
+	layer->server = server;
+	layer->output = output;
+	layer->layer_surface = layer_surface;
+
+	/* Parent into this output's tree for the requested layer. Layer is
+	 * read from pending: clients set it before their first commit. */
+	layer->scene_layer = wlr_scene_layer_surface_v1_create(
+		output->layer_trees[layer_surface->pending.layer],
+		layer_surface);
+
+	layer->map.notify = layer_surface_handle_map;
+	wl_signal_add(&layer_surface->surface->events.map, &layer->map);
+	layer->unmap.notify = layer_surface_handle_unmap;
+	wl_signal_add(&layer_surface->surface->events.unmap, &layer->unmap);
+	layer->commit.notify = layer_surface_handle_commit;
+	wl_signal_add(&layer_surface->surface->events.commit, &layer->commit);
+	layer->destroy.notify = layer_surface_handle_destroy;
+	wl_signal_add(&layer_surface->events.destroy, &layer->destroy);
+
+	wl_list_insert(&output->layers[layer_surface->pending.layer],
+		&layer->link);
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {
@@ -640,6 +1108,14 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	struct amber_output *output = calloc(1, sizeof(*output));
 	output->wlr_output = wlr_output;
 	output->server = server;
+	output->active_workspace = 0;
+	for (int i = 0; i < 4; i++) {
+		wl_list_init(&output->layers[i]);
+	}
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		output->workspaces[i].tree = NULL;
+		wl_list_init(&output->workspaces[i].toplevels);
+	}
 
 	/* Sets up a listener for the frame event. */
 	output->frame.notify = output_frame;
@@ -668,13 +1144,76 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_output);
 	struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+
+	/* Per-output subtrees live directly under the scene root and are
+	 * kept positioned at the output's layout origin (see
+	 * output_update_geometry). Creation order defines stacking:
+	 * background < bottom < workspaces < top < overlay. */
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND] =
+		wlr_scene_tree_create(&server->scene->tree);
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM] =
+		wlr_scene_tree_create(&server->scene->tree);
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		output->workspaces[i].tree =
+			wlr_scene_tree_create(&server->scene->tree);
+		wlr_scene_node_set_enabled(&output->workspaces[i].tree->node,
+			i == output->active_workspace);
+	}
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] =
+		wlr_scene_tree_create(&server->scene->tree);
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY] =
+		wlr_scene_tree_create(&server->scene->tree);
+
+	output_update_geometry(output);
+}
+
+static void output_update_geometry(struct amber_output *output) {
+	/* Cache where this output sits in layout coordinates; every
+	 * conversion between global cursor coords and window-local node
+	 * coords goes through this. Also re-anchor all of this output's
+	 * subtree roots at the output origin, since they live directly
+	 * under the scene root. */
+	wlr_output_layout_get_box(output->server->output_layout,
+		output->wlr_output, &output->layout_box);
+
+	struct wlr_scene_node *nodes[13] = {
+		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]->node,
+		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM]->node,
+	};
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		nodes[2 + i] = &output->workspaces[i].tree->node;
+	}
+	nodes[11] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP]->node;
+	nodes[12] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]->node;
+	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+		if (nodes[i] != NULL) {
+			wlr_scene_node_set_position(nodes[i],
+				output->layout_box.x, output->layout_box.y);
+		}
+	}
+
+	arrange_layers(output);
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	struct amber_toplevel *toplevel = wl_container_of(listener, toplevel, map);
+	struct amber_server *server = toplevel->server;
 
-	wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
+	/* Windows land on the active workspace of the active output. */
+	struct amber_output *output = active_output(server);
+	if (output == NULL && !wl_list_empty(&server->outputs)) {
+		output = wl_container_of(server->outputs.next, output, link);
+	}
+	if (output != NULL) {
+		toplevel->output = output;
+		toplevel->workspace = output->active_workspace;
+		struct amber_workspace *workspace =
+			&output->workspaces[toplevel->workspace];
+		wlr_scene_node_reparent(&toplevel->scene_tree->node,
+			workspace->tree);
+		wl_list_insert(&workspace->toplevels, &toplevel->link);
+	}
 
 	focus_toplevel(toplevel);
 }
@@ -686,6 +1225,9 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	/* Reset the cursor mode if the grabbed toplevel was unmapped. */
 	if (toplevel == toplevel->server->grabbed_toplevel) {
 		reset_cursor_mode(toplevel->server);
+	}
+	if (toplevel->server->focused_toplevel == toplevel) {
+		toplevel->server->focused_toplevel = NULL;
 	}
 
 	wl_list_remove(&toplevel->link);
@@ -717,6 +1259,10 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&toplevel->request_maximize.link);
 	wl_list_remove(&toplevel->request_fullscreen.link);
 
+	/* Destroy the container tree (and any popup subtrees with it);
+	 * tinywl leaked this per window open/close cycle. */
+	wlr_scene_node_destroy(&toplevel->scene_tree->node);
+
 	free(toplevel);
 }
 
@@ -731,8 +1277,10 @@ static void begin_interactive(struct amber_toplevel *toplevel,
 	server->cursor_mode = mode;
 
 	if (mode == AMBER_CURSOR_MOVE) {
-		server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
-		server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+		server->grab_x = server->cursor->x -
+			toplevel->output->layout_box.x - toplevel->scene_tree->node.x;
+		server->grab_y = server->cursor->y -
+			toplevel->output->layout_box.y - toplevel->scene_tree->node.y;
 	} else {
 		struct wlr_box *geo_box = &toplevel->xdg_toplevel->base->geometry;
 
@@ -885,7 +1433,10 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 }
 
 int main(int argc, char *argv[]) {
-	wlr_log_init(WLR_DEBUG, NULL);
+	/* Debug logging in hot paths is measurable overhead; default to
+	 * errors only, opt back in with AMBERWM_DEBUG=1. */
+	wlr_log_init(getenv("AMBERWM_DEBUG") != NULL ? WLR_DEBUG : WLR_ERROR,
+		NULL);
 	char *startup_cmd = NULL;
 
 	int c;
@@ -975,12 +1526,32 @@ int main(int argc, char *argv[]) {
 	 * used for application windows. For more detail on shells, refer to
 	 * https://drewdevault.com/2018/07/29/Wayland-shells.html.
 	 */
-	wl_list_init(&server.toplevels);
 	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
 	server.new_xdg_toplevel.notify = server_new_xdg_toplevel;
 	wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
 	server.new_xdg_popup.notify = server_new_xdg_popup;
 	wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
+
+	/* Layer shell: bars, launchers, wallpapers (wlr-layer-shell). */
+	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+	server.new_layer_surface.notify = server_new_layer_surface;
+	wl_signal_add(&server.layer_shell->events.new_surface,
+		&server.new_layer_surface);
+
+	/* One xkb context shared by every keyboard that ever connects. */
+	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+
+	/* Reap spawned children automatically (no zombies). */
+	signal(SIGCHLD, SIG_IGN);
+
+	/* Terminal used by the keybinding; overridable without recompiling. */
+	server.terminal_cmd = getenv("AMBER_TERMINAL");
+	if (server.terminal_cmd == NULL) {
+		server.terminal_cmd = getenv("TERMINAL");
+	}
+	if (server.terminal_cmd == NULL) {
+		server.terminal_cmd = "alacritty";
+	}
 
 	/*
 	 * Creates a cursor, which is a wlroots utility for tracking the cursor
@@ -1057,9 +1628,7 @@ int main(int argc, char *argv[]) {
 	 * startup command if requested. */
 	setenv("WAYLAND_DISPLAY", socket, true);
 	if (startup_cmd) {
-		if (fork() == 0) {
-			execl("/bin/sh", "/bin/sh", "-c", startup_cmd, (void *)NULL);
-		}
+		spawn(startup_cmd);
 	}
 	/* Run the Wayland event loop. This does not return until you exit the
 	 * compositor. Starting the backend rigged up all of the necessary event
@@ -1076,6 +1645,7 @@ int main(int argc, char *argv[]) {
 
 	wl_list_remove(&server.new_xdg_toplevel.link);
 	wl_list_remove(&server.new_xdg_popup.link);
+	wl_list_remove(&server.new_layer_surface.link);
 
 	wl_list_remove(&server.cursor_motion.link);
 	wl_list_remove(&server.cursor_motion_absolute.link);
@@ -1096,6 +1666,7 @@ int main(int argc, char *argv[]) {
 	wlr_allocator_destroy(server.allocator);
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);
+	xkb_context_unref(server.xkb_context);
 	wl_display_destroy(server.wl_display);
 	return 0;
 }
