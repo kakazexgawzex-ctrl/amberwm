@@ -26,10 +26,16 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
+#include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
 #define AMBER_WORKSPACE_COUNT 9
+
+/* Layout tuning defaults (amberwm.cfg overrides these). */
+#define AMBER_DEFAULT_GAPS 8
+#define AMBER_DEFAULT_MIN_COLUMN_WIDTH 240
+#define AMBER_DEFAULT_COLUMN_FRACTION 0.5
 
 enum amber_cursor_mode {
 	AMBER_CURSOR_PASSTHROUGH,
@@ -42,7 +48,12 @@ struct amber_workspace {
 	 * workspace is a single node disable: hidden subtrees produce no
 	 * damage and cost zero render time. */
 	struct wlr_scene_tree *tree;
+	struct amber_output *output;
+
+	/* Scrollable strip: tiles ordered left-to-right (floating windows
+	 * live in the same list but are skipped by arrangement). */
 	struct wl_list toplevels; // amber_toplevel.link
+	double view_offset;       // px scrolled rightward, >= 0
 };
 
 struct amber_server {
@@ -52,6 +63,14 @@ struct amber_server {
 	struct wlr_allocator *allocator;
 	struct wlr_scene *scene;
 	struct wlr_scene_output_layout *scene_layout;
+
+	/* Config (amberwm.cfg, see config.c section below). */
+	char *terminal_cmd;
+	int gaps;
+	int min_column_width;
+	double default_column_fraction;
+	struct amber_binding *bindings;
+	size_t binding_count;
 
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
@@ -65,7 +84,6 @@ struct amber_server {
 
 	struct amber_toplevel *focused_toplevel;
 	struct amber_output *active_output;
-	const char *terminal_cmd;
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
@@ -120,6 +138,15 @@ struct amber_toplevel {
 	int workspace; // index into output->workspaces
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_scene_tree *scene_tree;
+
+	/* Layout state. */
+	bool floating;   // not part of the scrollable strip
+	bool fullscreen; // tile covering the whole usable area
+	int col_width;   // desired column width, px (tiles only)
+	int sent_w, sent_h; // last configured size (skip duplicate configures)
+	int tile_x, tile_w; // arrangement cache (local coords)
+	struct wlr_box pre_fs_box; // float geometry before fullscreen
+
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -232,11 +259,9 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 		}
 	}
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-	/* Move the toplevel to the front */
+	/* Raise above overlapping floats, but never reorder the strip:
+	 * tiling order is user-controlled (niri rule). */
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
-	wl_list_remove(&toplevel->link);
-	wl_list_insert(&toplevel_workspace(toplevel)->toplevels, &toplevel->link);
-	/* Activate the new surface */
 	server->focused_toplevel = toplevel;
 	wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
 	/*
@@ -265,6 +290,239 @@ static void focus_workspace_topmost(struct amber_server *server,
 	}
 }
 
+/*
+ * Scrollable-tiling layout engine (niri-style).
+ *
+ * Tiles form a horizontal strip per workspace; a new window is inserted
+ * to the right of the focused one and existing windows are NEVER resized.
+ * The view (ws->view_offset) scrolls minimally so the focused column
+ * stays visible. Floating windows live outside all of this.
+ */
+
+static struct amber_workspace *active_workspace(struct amber_server *server) {
+	struct amber_output *output = active_output(server);
+	return output ? &output->workspaces[output->active_workspace] : NULL;
+}
+
+static void workspace_update_top_layer(struct amber_output *output);
+
+/* Send a size configure only when it actually differs: xdg-shell
+ * round-trips aren't free and clients shouldn't re-render needlessly. */
+static void toplevel_configure_size(struct amber_toplevel *t,
+		int width, int height) {
+	if (t->sent_w == width && t->sent_h == height) {
+		return;
+	}
+	t->sent_w = width;
+	t->sent_h = height;
+	wlr_xdg_toplevel_set_size(t->xdg_toplevel, width, height);
+}
+
+static int toplevel_effective_width(struct amber_toplevel *t,
+		const struct wlr_box *usable) {
+	int max = usable->width - 2 * t->server->gaps;
+	if (t->fullscreen) {
+		return max;
+	}
+	int w = t->col_width;
+	if (w < t->server->min_column_width) {
+		w = t->server->min_column_width;
+	}
+	if (w > max) {
+		w = max;
+	}
+	return w;
+}
+
+static void workspace_arrange(struct amber_workspace *ws) {
+	const struct wlr_box *u = &ws->output->usable_area;
+	const int gap = ws->output->server->gaps;
+
+	/* Pass 1: walk the strip assigning effective widths and local x
+	 * positions; find the focused window's extent. */
+	int count_tiled = 0;
+	struct amber_toplevel *t;
+	wl_list_for_each(t, &ws->toplevels, link) {
+		if (!t->floating) {
+			count_tiled++;
+		}
+	}
+
+	int x = u->x + gap;
+	int fx0 = 0, fx1 = 0;
+	bool have_focus_extent = false;
+	wl_list_for_each(t, &ws->toplevels, link) {
+		if (t->floating) {
+			continue;
+		}
+		int w = toplevel_effective_width(t, u);
+		if (count_tiled == 1) {
+			w = u->width - 2 * gap;
+		}
+		t->tile_x = x;
+		t->tile_w = w;
+		x += w + gap;
+		if (t == ws->output->server->focused_toplevel) {
+			fx0 = t->tile_x;
+			fx1 = x - gap;
+			have_focus_extent = true;
+		}
+	}
+
+	/* Scroll so the focused column is fully visible (minimal shift). */
+	double offset = ws->view_offset;
+	if (have_focus_extent) {
+		int view_right = u->x + u->width - gap;
+		int view_left = u->x + gap;
+		if (fx1 - offset > view_right) {
+			offset = fx1 - view_right;
+		}
+		if (fx0 - offset < view_left) {
+			offset = fx0 - view_left;
+		}
+	}
+	double max_offset = x - gap - (u->x + u->width);
+	if (max_offset < 0) {
+		max_offset = 0;
+	}
+	if (offset > max_offset) {
+		offset = max_offset;
+	}
+	if (offset < 0) {
+		offset = 0;
+	}
+	ws->view_offset = offset;
+
+	/* Pass 2: apply positions and sizes. */
+	int height = u->height - 2 * gap;
+	wl_list_for_each(t, &ws->toplevels, link) {
+		if (t->floating) {
+			continue;
+		}
+		wlr_scene_node_set_position(&t->scene_tree->node,
+			t->tile_x - (int)offset, u->y + gap);
+		toplevel_configure_size(t, t->tile_w, height);
+	}
+}
+
+static bool modifier_held(struct amber_server *server, uint32_t mod) {
+	struct amber_keyboard *k;
+	wl_list_for_each(k, &server->keyboards, link) {
+		uint32_t mods = wlr_keyboard_get_modifiers(k->wlr_keyboard);
+		mods &= ~k->lock_mask;
+		if (mods & mod) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Turn a tiled window into a floating one, keeping its on-screen box. */
+static void toplevel_to_floating(struct amber_toplevel *t) {
+	if (t->floating) {
+		return;
+	}
+	t->floating = true;
+	wlr_scene_node_raise_to_top(&t->scene_tree->node);
+	workspace_arrange(toplevel_workspace(t));
+}
+
+/* Insert a floating window back into the strip, next to focus. */
+static void toplevel_to_tiled(struct amber_toplevel *t) {
+	if (!t->floating) {
+		return;
+	}
+	t->fullscreen = false;
+	struct amber_workspace *ws = toplevel_workspace(t);
+	struct wlr_box *geo = &t->xdg_toplevel->base->geometry;
+	t->col_width = geo->width > 0 ? geo->width
+		: (int)(ws->output->usable_area.width
+			* AMBER_DEFAULT_COLUMN_FRACTION);
+
+	struct wl_list *anchor = ws->toplevels.prev; // rightmost by default
+	struct amber_server *server = t->server;
+	if (server->focused_toplevel != NULL &&
+			server->focused_toplevel != t &&
+			server->focused_toplevel->output == t->output &&
+			server->focused_toplevel->workspace == t->workspace) {
+		anchor = &server->focused_toplevel->link;
+	} else if (server->focused_toplevel == t) {
+		anchor = &t->link; // keep own slot
+	}
+	wl_list_remove(&t->link);
+	wl_list_insert(anchor, &t->link); // after anchor = right of it
+	t->floating = false;
+	workspace_arrange(ws);
+}
+
+static void toplevel_set_fullscreen(struct amber_toplevel *t,
+		bool fullscreen);
+
+static void toplevel_toggle_float(struct amber_toplevel *t) {
+	if (t->fullscreen) {
+		toplevel_set_fullscreen(t, false);
+	}
+	if (t->floating) {
+		toplevel_to_tiled(t);
+	} else {
+		toplevel_to_floating(t);
+	}
+}
+
+static void cycle_focus(struct amber_server *server, int dir) {
+	struct amber_workspace *ws = active_workspace(server);
+	if (ws == NULL || wl_list_length(&ws->toplevels) < 2) {
+		return;
+	}
+	struct wl_list *head = &ws->toplevels;
+	struct wl_list *pos = head;
+	if (server->focused_toplevel != NULL &&
+			server->focused_toplevel->workspace ==
+				ws - ws->output->workspaces &&
+			server->focused_toplevel->output == ws->output) {
+		pos = &server->focused_toplevel->link;
+	}
+	struct wl_list *target = dir > 0 ? pos->next : pos->prev;
+	while (target == head) { // wrap past the list head
+		target = dir > 0 ? target->next : target->prev;
+	}
+	struct amber_toplevel *next;
+	next = wl_container_of(target, next, link);
+	focus_toplevel(next);
+}
+
+/* Move the focused tile left/right within the strip. */
+static void move_focused_column(struct amber_server *server, int dir) {
+	struct amber_toplevel *f = server->focused_toplevel;
+	if (f == NULL || f->floating) {
+		return;
+	}
+	struct amber_workspace *ws = toplevel_workspace(f);
+	struct wl_list *head = &ws->toplevels;
+	struct wl_list *a = &f->link;
+	struct wl_list *b = dir > 0 ? a->next : a->prev;
+	if (b == head || b == a) {
+		return; // nothing on that side
+	}
+	wl_list_remove(a);
+	if (dir > 0) {
+		wl_list_insert(b, a);      // a takes b's slot (right of it)
+	} else {
+		wl_list_insert(b->prev, a); // a goes directly before b
+	}
+	workspace_arrange(ws);
+}
+
+static void resize_focused_column(struct amber_server *server, int delta) {
+	struct amber_toplevel *f = server->focused_toplevel;
+	if (f == NULL || f->floating) {
+		return;
+	}
+	struct amber_workspace *ws = toplevel_workspace(f);
+	f->col_width += delta;
+	workspace_arrange(ws);
+}
+
 static void keyboard_handle_modifiers(
 		struct wl_listener *listener, void *data) {
 	/* This event is raised when a modifier key, such as shift or alt, is
@@ -283,34 +541,6 @@ static void keyboard_handle_modifiers(
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-static void cycle_focus(struct amber_server *server, int dir) {
-	struct amber_output *output = active_output(server);
-	if (output == NULL) {
-		return;
-	}
-	struct amber_workspace *workspace =
-		&output->workspaces[output->active_workspace];
-	if (wl_list_length(&workspace->toplevels) < 2) {
-		return;
-	}
-	/* toplevels list is newest-first; walk one entry away from the
-	 * focused window, skipping the list head when wrapping around. */
-	struct wl_list *pos = &workspace->toplevels;
-	if (server->focused_toplevel != NULL &&
-			server->focused_toplevel->output == output &&
-			server->focused_toplevel->workspace ==
-				output->active_workspace) {
-		pos = &server->focused_toplevel->link;
-	}
-	struct wl_list *target = dir > 0 ? pos->prev : pos->next;
-	if (target == &workspace->toplevels) {
-		target = dir > 0 ? target->prev : target->next;
-	}
-	struct amber_toplevel *next;
-	next = wl_container_of(target, next, link);
-	focus_toplevel(next);
-}
-
 static void workspace_switch(struct amber_output *output, int index) {
 	if (index < 0 || index >= AMBER_WORKSPACE_COUNT ||
 			index == output->active_workspace) {
@@ -324,6 +554,8 @@ static void workspace_switch(struct amber_output *output, int index) {
 	wlr_scene_node_set_enabled(&old->tree->node, false);
 	wlr_scene_node_set_enabled(&new->tree->node, true);
 	output->active_workspace = index;
+	workspace_arrange(new);
+	workspace_update_top_layer(output);
 	focus_workspace_topmost(output->server, new);
 }
 
@@ -338,13 +570,73 @@ static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
 	bool was_focused = toplevel->server->focused_toplevel == toplevel;
 
 	wl_list_remove(&toplevel->link);
-	wl_list_insert(&output->workspaces[index].toplevels, &toplevel->link);
+	wl_list_insert(&output->workspaces[index].toplevels,
+		&toplevel->link); // rightmost slot
 	wlr_scene_node_reparent(&toplevel->scene_tree->node,
 		output->workspaces[index].tree);
 	toplevel->workspace = index;
 
+	workspace_arrange(src);
+	workspace_arrange(&output->workspaces[index]);
 	if (was_focused && index != output->active_workspace) {
 		focus_workspace_topmost(toplevel->server, src);
+	}
+}
+
+/* While the focused window is a fullscreen tile, hide the top layer
+ * (bars) like niri does; anything else brings it back. */
+static void workspace_update_top_layer(struct amber_output *output) {
+	bool hide_top = false;
+	struct amber_toplevel *f =
+		output->server->focused_toplevel;
+	if (f != NULL && f->fullscreen && f->output == output &&
+			f->workspace == output->active_workspace) {
+		hide_top = true;
+	}
+	wlr_scene_node_set_enabled(
+		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP]->node,
+		!hide_top);
+}
+
+static void toplevel_set_fullscreen(struct amber_toplevel *t,
+		bool fullscreen) {
+	if (t->fullscreen == fullscreen) {
+		return;
+	}
+	struct amber_output *output = t->output;
+	if (output == NULL) {
+		return;
+	}
+
+	if (fullscreen) {
+		t->pre_fs_box.width = t->xdg_toplevel->base->geometry.width;
+		t->pre_fs_box.height = t->xdg_toplevel->base->geometry.height;
+	}
+	t->fullscreen = fullscreen;
+	/* Hint the client so it can drop shadows/CSD chrome if it wants. */
+	wlr_xdg_toplevel_set_fullscreen(t->xdg_toplevel, fullscreen);
+
+	if (!t->floating) {
+		workspace_arrange(toplevel_workspace(t));
+	} else if (fullscreen) {
+		/* Fullscreened floats become tiles (niri behavior): keeps
+		 * them inside the strip and restore is trivial. */
+		toplevel_to_tiled(t);
+	}
+	workspace_update_top_layer(output);
+}
+
+static void toggle_focused_fullscreen(struct amber_server *server) {
+	struct amber_toplevel *f = server->focused_toplevel;
+	if (f != NULL) {
+		toplevel_set_fullscreen(f, !f->fullscreen);
+	}
+}
+
+static void toggle_focused_float(struct amber_server *server) {
+	struct amber_toplevel *f = server->focused_toplevel;
+	if (f != NULL) {
+		toplevel_toggle_float(f);
 	}
 }
 
@@ -352,9 +644,14 @@ enum amber_binding_id {
 	AMBER_BINDING_QUIT,
 	AMBER_BINDING_CLOSE,
 	AMBER_BINDING_TERMINAL,
+	AMBER_BINDING_EXEC,
 	AMBER_BINDING_CYCLE_FOCUS,
 	AMBER_BINDING_WORKSPACE,
 	AMBER_BINDING_MOVE_TO_WORKSPACE,
+	AMBER_BINDING_MOVE_COLUMN,
+	AMBER_BINDING_COLUMN_WIDTH,
+	AMBER_BINDING_TOGGLE_FLOAT,
+	AMBER_BINDING_TOGGLE_FULLSCREEN,
 };
 
 struct amber_binding {
@@ -362,51 +659,314 @@ struct amber_binding {
 	xkb_keysym_t sym;
 	enum amber_binding_id id;
 	int arg;
+	char *cmd; // AMBER_BINDING_EXEC only
 };
 
-/* Default bindings. This table is what a future config parser will fill
- * in; matching stays O(bindings), which for realistic sizes (< 100) is
- * far cheaper per keypress than any fancier data structure. */
-static const struct amber_binding amber_default_bindings[] = {
-	{ WLR_MODIFIER_LOGO, XKB_KEY_Return, AMBER_BINDING_TERMINAL, 0 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_Q,
-		AMBER_BINDING_CLOSE, 0 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_E,
-		AMBER_BINDING_QUIT, 0 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_Tab, AMBER_BINDING_CYCLE_FOCUS, 1 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_Tab,
-		AMBER_BINDING_CYCLE_FOCUS, -1 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_1, AMBER_BINDING_WORKSPACE, 0 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_2, AMBER_BINDING_WORKSPACE, 1 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_3, AMBER_BINDING_WORKSPACE, 2 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_4, AMBER_BINDING_WORKSPACE, 3 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_5, AMBER_BINDING_WORKSPACE, 4 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_6, AMBER_BINDING_WORKSPACE, 5 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_7, AMBER_BINDING_WORKSPACE, 6 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_8, AMBER_BINDING_WORKSPACE, 7 },
-	{ WLR_MODIFIER_LOGO, XKB_KEY_9, AMBER_BINDING_WORKSPACE, 8 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_1,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 0 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_2,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 1 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_3,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 2 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_4,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 3 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_5,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 4 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_6,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 5 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_7,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 6 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_8,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 7 },
-	{ WLR_MODIFIER_LOGO | WLR_MODIFIER_SHIFT, XKB_KEY_9,
-		AMBER_BINDING_MOVE_TO_WORKSPACE, 8 },
+/*
+ * Configuration: ~/.config/amberwm/amberwm.cfg
+ *
+ *   # comments
+ *   terminal=foot
+ *   gaps=8
+ *   min-column-width=240
+ *   default-column-width=0.5
+ *   bind=SUPER+SHIFT+Q,close
+ *   bind=SUPER+1,workspace 1
+ *   bind=SUPER+T,exec foot -e btop
+ *
+ * Missing file falls back to the built-in defaults below.
+ */
+
+/* Defaults written when no config exists; also the built-in fallback. */
+struct amber_binding_defaults {
+	const char *combo;
+	enum amber_binding_id id;
+	int arg;
 };
 
-#define AMBER_BINDING_COUNT \
+static const struct amber_binding_defaults amber_default_bindings[] = {
+	{ "SUPER+RETURN", AMBER_BINDING_TERMINAL, 0 },
+	{ "SUPER+SHIFT+Q", AMBER_BINDING_CLOSE, 0 },
+	{ "SUPER+SHIFT+E", AMBER_BINDING_QUIT, 0 },
+	{ "SUPER+TAB", AMBER_BINDING_CYCLE_FOCUS, 1 },
+	{ "SUPER+SHIFT+TAB", AMBER_BINDING_CYCLE_FOCUS, -1 },
+	{ "SUPER+1", AMBER_BINDING_WORKSPACE, 0 },
+	{ "SUPER+2", AMBER_BINDING_WORKSPACE, 1 },
+	{ "SUPER+3", AMBER_BINDING_WORKSPACE, 2 },
+	{ "SUPER+4", AMBER_BINDING_WORKSPACE, 3 },
+	{ "SUPER+5", AMBER_BINDING_WORKSPACE, 4 },
+	{ "SUPER+6", AMBER_BINDING_WORKSPACE, 5 },
+	{ "SUPER+7", AMBER_BINDING_WORKSPACE, 6 },
+	{ "SUPER+8", AMBER_BINDING_WORKSPACE, 7 },
+	{ "SUPER+9", AMBER_BINDING_WORKSPACE, 8 },
+	{ "SUPER+SHIFT+1", AMBER_BINDING_MOVE_TO_WORKSPACE, 0 },
+	{ "SUPER+SHIFT+2", AMBER_BINDING_MOVE_TO_WORKSPACE, 1 },
+	{ "SUPER+SHIFT+3", AMBER_BINDING_MOVE_TO_WORKSPACE, 2 },
+	{ "SUPER+SHIFT+4", AMBER_BINDING_MOVE_TO_WORKSPACE, 3 },
+	{ "SUPER+SHIFT+5", AMBER_BINDING_MOVE_TO_WORKSPACE, 4 },
+	{ "SUPER+SHIFT+6", AMBER_BINDING_MOVE_TO_WORKSPACE, 5 },
+	{ "SUPER+SHIFT+7", AMBER_BINDING_MOVE_TO_WORKSPACE, 6 },
+	{ "SUPER+SHIFT+8", AMBER_BINDING_MOVE_TO_WORKSPACE, 7 },
+	{ "SUPER+SHIFT+9", AMBER_BINDING_MOVE_TO_WORKSPACE, 8 },
+	/* Scrollable-tiling navigation (niri-style). */
+	{ "SUPER+H", AMBER_BINDING_CYCLE_FOCUS, -1 },
+	{ "SUPER+L", AMBER_BINDING_CYCLE_FOCUS, 1 },
+	{ "SUPER+LEFT", AMBER_BINDING_CYCLE_FOCUS, -1 },
+	{ "SUPER+RIGHT", AMBER_BINDING_CYCLE_FOCUS, 1 },
+	{ "SUPER+SHIFT+H", AMBER_BINDING_MOVE_COLUMN, -1 },
+	{ "SUPER+SHIFT+L", AMBER_BINDING_MOVE_COLUMN, 1 },
+	{ "SUPER+SHIFT+LEFT", AMBER_BINDING_MOVE_COLUMN, -1 },
+	{ "SUPER+SHIFT+RIGHT", AMBER_BINDING_MOVE_COLUMN, 1 },
+	{ "SUPER+MINUS", AMBER_BINDING_COLUMN_WIDTH, -1 },
+	{ "SUPER+EQUAL", AMBER_BINDING_COLUMN_WIDTH, 1 },
+	{ "SUPER+V", AMBER_BINDING_TOGGLE_FLOAT, 0 },
+	{ "SUPER+F", AMBER_BINDING_TOGGLE_FULLSCREEN, 0 },
+};
+
+#define AMBER_DEFAULT_BINDING_COUNT \
 	(sizeof(amber_default_bindings) / sizeof(amber_default_bindings[0]))
+
+static uint32_t parse_modifier(const char *name) {
+	if (strcmp(name, "SUPER") == 0 || strcmp(name, "LOGO") == 0 ||
+			strcmp(name, "MOD4") == 0) {
+		return WLR_MODIFIER_LOGO;
+	}
+	if (strcmp(name, "SHIFT") == 0) {
+		return WLR_MODIFIER_SHIFT;
+	}
+	if (strcmp(name, "CTRL") == 0 || strcmp(name, "CONTROL") == 0) {
+		return WLR_MODIFIER_CTRL;
+	}
+	if (strcmp(name, "ALT") == 0) {
+		return WLR_MODIFIER_ALT;
+	}
+	return 0;
+}
+
+/* Parse "SUPER+SHIFT+RETURN" into mods + keysym. */
+static bool parse_combo(char *combo, uint32_t *mods, xkb_keysym_t *sym) {
+	*mods = 0;
+	*sym = XKB_KEY_NoSymbol;
+
+	char *saveptr = NULL;
+	char *token = strtok_r(combo, "+", &saveptr);
+	char *key_name = NULL;
+	while (token != NULL) {
+		uint32_t mod = parse_modifier(token);
+		if (mod != 0) {
+			*mods |= mod;
+		} else {
+			key_name = token; // last non-modifier token is the key
+		}
+		token = strtok_r(NULL, "+", &saveptr);
+	}
+	if (key_name == NULL) {
+		return false;
+	}
+	*sym = xkb_keysym_from_name(key_name, XKB_KEYSYM_CASE_INSENSITIVE);
+	return *sym != XKB_KEY_NoSymbol;
+}
+
+/* Parse an action spec like "workspace 3" or "exec foot -e btop". */
+static bool parse_action(struct amber_server *server,
+		struct amber_binding *b, const char *spec) {
+	while (*spec == ' ') {
+		spec++;
+	}
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%s", spec);
+	char *sp = strchr(buf, ' ');
+	if (sp != NULL) {
+		*sp = '\0';
+	}
+
+	if (strcmp(buf, "quit") == 0) {
+		b->id = AMBER_BINDING_QUIT;
+	} else if (strcmp(buf, "close") == 0) {
+		b->id = AMBER_BINDING_CLOSE;
+	} else if (strcmp(buf, "terminal") == 0) {
+		b->id = AMBER_BINDING_TERMINAL;
+	} else if (strcmp(buf, "focus-next") == 0) {
+		b->id = AMBER_BINDING_CYCLE_FOCUS;
+		b->arg = 1;
+	} else if (strcmp(buf, "focus-prev") == 0) {
+		b->id = AMBER_BINDING_CYCLE_FOCUS;
+		b->arg = -1;
+	} else if (strcmp(buf, "move-left") == 0) {
+		b->id = AMBER_BINDING_MOVE_COLUMN;
+		b->arg = -1;
+	} else if (strcmp(buf, "move-right") == 0) {
+		b->id = AMBER_BINDING_MOVE_COLUMN;
+		b->arg = 1;
+	} else if (strcmp(buf, "width-dec") == 0) {
+		b->id = AMBER_BINDING_COLUMN_WIDTH;
+		b->arg = -1;
+	} else if (strcmp(buf, "width-inc") == 0) {
+		b->id = AMBER_BINDING_COLUMN_WIDTH;
+		b->arg = 1;
+	} else if (strcmp(buf, "toggle-float") == 0) {
+		b->id = AMBER_BINDING_TOGGLE_FLOAT;
+	} else if (strcmp(buf, "toggle-fullscreen") == 0) {
+		b->id = AMBER_BINDING_TOGGLE_FULLSCREEN;
+	} else if (strcmp(buf, "workspace") == 0 || strcmp(buf,
+				"move-to-workspace") == 0) {
+		int n = sp ? atoi(sp + 1) : 0;
+		if (n < 1 || n > AMBER_WORKSPACE_COUNT) {
+			return false;
+		}
+		b->id = strcmp(buf, "workspace") == 0
+			? AMBER_BINDING_WORKSPACE : AMBER_BINDING_MOVE_TO_WORKSPACE;
+		b->arg = n - 1;
+	} else if (strcmp(buf, "exec") == 0) {
+		if (sp == NULL || *(sp + 1) == '\0') {
+			return false;
+		}
+		b->id = AMBER_BINDING_EXEC;
+		b->cmd = strdup(sp + 1);
+	} else {
+		return false;
+	}
+	(void)server;
+	return true;
+}
+
+enum { AMBER_CONFIG_OK, AMBER_CONFIG_ERROR };
+
+/* Append one parsed "bind=" line to server->bindings. */
+static int config_add_binding(struct amber_server *server,
+		const char *value) {
+	char buf[512];
+	snprintf(buf, sizeof(buf), "%s", value);
+	char *comma = strchr(buf, ',');
+	if (comma == NULL) {
+		wlr_log(WLR_ERROR, "config: bad bind '%s'", value);
+		return AMBER_CONFIG_ERROR;
+	}
+	*comma = '\0';
+
+	struct amber_binding b = {0};
+	if (!parse_combo(buf, &b.mods, &b.sym)) {
+		wlr_log(WLR_ERROR, "config: bad key combo in '%s'", value);
+		return AMBER_CONFIG_ERROR;
+	}
+	if (!parse_action(server, &b, comma + 1)) {
+		wlr_log(WLR_ERROR, "config: unknown action in '%s'", value);
+		return AMBER_CONFIG_ERROR;
+	}
+
+	struct amber_binding *grown = realloc(server->bindings,
+		(server->binding_count + 1) * sizeof(b));
+	if (grown == NULL) {
+		free(b.cmd);
+		return AMBER_CONFIG_ERROR;
+	}
+	server->bindings = grown;
+	server->bindings[server->binding_count++] = b;
+	return AMBER_CONFIG_OK;
+}
+
+static void config_set_defaults(struct amber_server *server) {
+	for (size_t i = 0; i < AMBER_DEFAULT_BINDING_COUNT; i++) {
+		const struct amber_binding_defaults *d =
+			&amber_default_bindings[i];
+		char combo[64];
+		snprintf(combo, sizeof(combo), "%s", d->combo);
+		struct amber_binding b = {0};
+		if (!parse_combo(combo, &b.mods, &b.sym)) {
+			continue;
+		}
+		b.id = d->id;
+		b.arg = d->arg;
+		struct amber_binding *grown = realloc(server->bindings,
+			(server->binding_count + 1) * sizeof(b));
+		if (grown == NULL) {
+			break;
+		}
+		server->bindings = grown;
+		server->bindings[server->binding_count++] = b;
+	}
+}
+
+static void config_load(struct amber_server *server) {
+	/* Non-binding defaults. */
+	server->gaps = AMBER_DEFAULT_GAPS;
+	server->min_column_width = AMBER_DEFAULT_MIN_COLUMN_WIDTH;
+	server->default_column_fraction = AMBER_DEFAULT_COLUMN_FRACTION;
+
+	const char *override = getenv("AMBER_CONFIG");
+	char path[512];
+	FILE *f = NULL;
+	if (override != NULL) {
+		f = fopen(override, "r");
+	} else {
+		const char *xdg = getenv("XDG_CONFIG_HOME");
+		const char *home = getenv("HOME");
+		if (xdg != NULL) {
+			snprintf(path, sizeof(path),
+				"%s/amberwm/amberwm.cfg", xdg);
+			f = fopen(path, "r");
+		}
+		if (f == NULL && home != NULL) {
+			snprintf(path, sizeof(path),
+				"%s/.config/amberwm/amberwm.cfg", home);
+			f = fopen(path, "r");
+		}
+	}
+	if (f == NULL) {
+		config_set_defaults(server);
+		wlr_log(WLR_INFO, "no config found, using defaults");
+		return;
+	}
+
+	char line[1024];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		/* Strip comment and trailing newline. */
+		char *hash = strchr(line, '#');
+		if (hash != NULL) {
+			*hash = '\0';
+		}
+		line[strcspn(line, "\r\n")] = '\0';
+
+		char *eq = strchr(line, '=');
+		if (eq == NULL) {
+			continue;
+		}
+		*eq = '\0';
+		char *key = line;
+		char *value = eq + 1;
+		while (*value == ' ') {
+			value++;
+		}
+
+		if (strcmp(key, "bind") == 0) {
+			config_add_binding(server, value);
+		} else if (strcmp(key, "terminal") == 0) {
+			free(server->terminal_cmd);
+			server->terminal_cmd = strdup(value);
+		} else if (strcmp(key, "gaps") == 0) {
+			server->gaps = atoi(value);
+			if (server->gaps < 0) {
+				server->gaps = 0;
+			}
+		} else if (strcmp(key, "min-column-width") == 0) {
+			int v = atoi(value);
+			server->min_column_width = v > 0 ? v
+				: AMBER_DEFAULT_MIN_COLUMN_WIDTH;
+		} else if (strcmp(key, "default-column-width") == 0) {
+			double v = atof(value);
+			if (v > 0.05 && v <= 1.0) {
+				server->default_column_fraction = v;
+			}
+		} else if (strlen(key) > 0) {
+			wlr_log(WLR_ERROR, "config: unknown key '%s'", key);
+		}
+	}
+	fclose(f);
+
+	if (server->binding_count == 0) {
+		config_set_defaults(server);
+	}
+}
 
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
@@ -423,6 +983,9 @@ static void binding_exec(struct amber_server *server,
 	case AMBER_BINDING_TERMINAL:
 		spawn(server->terminal_cmd);
 		break;
+	case AMBER_BINDING_EXEC:
+		spawn(binding->cmd);
+		break;
 	case AMBER_BINDING_CYCLE_FOCUS:
 		cycle_focus(server, binding->arg);
 		break;
@@ -438,6 +1001,22 @@ static void binding_exec(struct amber_server *server,
 			toplevel_move_to_workspace(server->focused_toplevel,
 				binding->arg);
 		}
+		break;
+	case AMBER_BINDING_MOVE_COLUMN:
+		move_focused_column(server, binding->arg);
+		break;
+	case AMBER_BINDING_COLUMN_WIDTH: {
+		struct amber_output *output = active_output(server);
+		int step = output ? output->usable_area.width / 10 : 100;
+		resize_focused_column(server,
+			binding->arg >= 0 ? step : -step);
+		break;
+	}
+	case AMBER_BINDING_TOGGLE_FLOAT:
+		toggle_focused_float(server);
+		break;
+	case AMBER_BINDING_TOGGLE_FULLSCREEN:
+		toggle_focused_fullscreen(server);
 		break;
 	}
 }
@@ -464,9 +1043,9 @@ static void keyboard_handle_key(
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
 		for (int i = 0; i < nsyms && !handled; i++) {
-			for (size_t j = 0; j < AMBER_BINDING_COUNT; j++) {
+			for (size_t j = 0; j < server->binding_count; j++) {
 				const struct amber_binding *binding =
-					&amber_default_bindings[j];
+					&server->bindings[j];
 				if (binding->mods == modifiers &&
 						binding->sym == syms[i]) {
 					binding_exec(server, binding);
@@ -813,26 +1392,88 @@ static void server_cursor_motion_absolute(
 	process_cursor_motion(server, event->time_msec);
 }
 
+static void begin_interactive(struct amber_toplevel *toplevel,
+		enum amber_cursor_mode mode, uint32_t edges);
+
 static void server_cursor_button(struct wl_listener *listener, void *data) {
 	/* This event is forwarded by the cursor when a pointer emits a button
 	 * event. */
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
+
+	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+		if (server->cursor_mode != AMBER_CURSOR_PASSTHROUGH) {
+			/* The matching press was swallowed by us; swallow the
+			 * release too so clients never see a half-click. */
+			reset_cursor_mode(server);
+			return;
+		}
+		wlr_seat_pointer_notify_button(server->seat,
+				event->time_msec, event->button, event->state);
+		return;
+	}
+
+	double sx, sy;
+	struct wlr_surface *surface = NULL;
+	struct amber_toplevel *toplevel = desktop_toplevel_at(server,
+			server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+
+	bool logo = modifier_held(server, WLR_MODIFIER_LOGO);
+	if (logo && toplevel != NULL && (event->button == BTN_LEFT ||
+			event->button == BTN_RIGHT)) {
+		/* Compositor drag: focus, then move/resize ourselves without
+		 * the client ever seeing this press. */
+		focus_toplevel(toplevel);
+
+		if (!toplevel->floating) {
+			/* Dragging a tiled window floats it, Hyprland-style. */
+			toplevel_to_floating(toplevel);
+			struct wlr_box *geo =
+				&toplevel->xdg_toplevel->base->geometry;
+			wlr_scene_node_set_position(&toplevel->scene_tree->node,
+				(int)(server->cursor->x -
+					toplevel->output->layout_box.x
+					- geo->width / 2.0),
+				(int)(server->cursor->y -
+					toplevel->output->layout_box.y
+					- geo->height / 2.0));
+		}
+
+		if (event->button == BTN_LEFT) {
+			begin_interactive(toplevel, AMBER_CURSOR_MOVE, 0);
+		} else {
+			/* Pick resize edges from which quadrant of the window
+			 * the drag started in (dwl trick). */
+			struct wlr_box *geo =
+				&toplevel->xdg_toplevel->base->geometry;
+			double lx = server->cursor->x -
+				toplevel->output->layout_box.x -
+				toplevel->scene_tree->node.x;
+			double ly = server->cursor->y -
+				toplevel->output->layout_box.y -
+				toplevel->scene_tree->node.y;
+			uint32_t edges = 0;
+			if (lx < geo->width / 2.0) {
+				edges |= WLR_EDGE_LEFT;
+			} else {
+				edges |= WLR_EDGE_RIGHT;
+			}
+			if (ly < geo->height / 2.0) {
+				edges |= WLR_EDGE_TOP;
+			} else {
+				edges |= WLR_EDGE_BOTTOM;
+			}
+			begin_interactive(toplevel, AMBER_CURSOR_RESIZE, edges);
+		}
+		return;
+	}
+
 	/* Notify the client with pointer focus that a button press has occurred */
 	wlr_seat_pointer_notify_button(server->seat,
 			event->time_msec, event->button, event->state);
-	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		/* If you released any buttons, we exit interactive move/resize mode. */
-		reset_cursor_mode(server);
-	} else {
-		/* Focus that client if the button was _pressed_ */
-		double sx, sy;
-		struct wlr_surface *surface = NULL;
-		struct amber_toplevel *toplevel = desktop_toplevel_at(server,
-				server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-		focus_toplevel(toplevel);
-	}
+	/* Focus that client if the button was _pressed_ */
+	focus_toplevel(toplevel);
 }
 
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -939,7 +1580,10 @@ static void arrange_layers(struct amber_output *output) {
 		}
 	}
 
-	/* TODO(phase-2): retile windows into the new usable area. */
+	/* Keep the strip in sync with reserved space: when a bar maps,
+	 * unmaps or resizes, tiles must respect the new usable area. */
+	workspace_arrange(&output->workspaces[output->active_workspace]);
+	workspace_update_top_layer(output);
 }
 
 static void focus_layer_surface(struct amber_server *server,
@@ -1114,6 +1758,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	}
 	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
 		output->workspaces[i].tree = NULL;
+		output->workspaces[i].output = output;
 		wl_list_init(&output->workspaces[i].toplevels);
 	}
 
@@ -1212,10 +1857,27 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 			&output->workspaces[toplevel->workspace];
 		wlr_scene_node_reparent(&toplevel->scene_tree->node,
 			workspace->tree);
-		wl_list_insert(&workspace->toplevels, &toplevel->link);
+
+		/* niri rule: insert right of the focused window; existing
+		 * windows never move or resize. */
+		struct wl_list *anchor = workspace->toplevels.prev;
+		struct amber_toplevel *f = server->focused_toplevel;
+		if (f != NULL && f != toplevel && f->output == output &&
+				f->workspace == toplevel->workspace) {
+			anchor = &f->link;
+		}
+		wl_list_insert(anchor, &toplevel->link);
+
+		toplevel->floating = false;
+		toplevel->col_width = (int)(output->usable_area.width *
+			server->default_column_fraction);
 	}
 
 	focus_toplevel(toplevel);
+	if (toplevel->output != NULL) {
+		/* Arrange after focusing: the scroll follows the new focus. */
+		workspace_arrange(toplevel_workspace(toplevel));
+	}
 }
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
@@ -1229,8 +1891,16 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	if (toplevel->server->focused_toplevel == toplevel) {
 		toplevel->server->focused_toplevel = NULL;
 	}
+	if (toplevel->fullscreen) {
+		toplevel->fullscreen = false;
+		if (toplevel->output != NULL) {
+			workspace_update_top_layer(toplevel->output);
+		}
+	}
 
+	struct amber_workspace *ws = toplevel_workspace(toplevel);
 	wl_list_remove(&toplevel->link);
+	workspace_arrange(ws);
 }
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
@@ -1340,12 +2010,15 @@ static void xdg_toplevel_request_maximize(
 
 static void xdg_toplevel_request_fullscreen(
 		struct wl_listener *listener, void *data) {
-	/* Just as with request_maximize, we must send a configure here. */
+	/* Honor what the client asked for instead of ignoring it: a
+	 * fullscreen tile is just a normal tile with bigger width. */
 	struct amber_toplevel *toplevel =
 		wl_container_of(listener, toplevel, request_fullscreen);
-	if (toplevel->xdg_toplevel->base->initialized) {
-		wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+	if (!toplevel->xdg_toplevel->base->initialized) {
+		return;
 	}
+	toplevel_set_fullscreen(toplevel,
+		toplevel->xdg_toplevel->requested.fullscreen);
 }
 
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
@@ -1357,6 +2030,8 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	struct amber_toplevel *toplevel = calloc(1, sizeof(*toplevel));
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_toplevel;
+	toplevel->sent_w = -1; // force the first real configure through
+	toplevel->sent_h = -1;
 	toplevel->scene_tree =
 		wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
 	toplevel->scene_tree->node.data = toplevel;
@@ -1544,13 +2219,15 @@ int main(int argc, char *argv[]) {
 	/* Reap spawned children automatically (no zombies). */
 	signal(SIGCHLD, SIG_IGN);
 
-	/* Terminal used by the keybinding; overridable without recompiling. */
-	server.terminal_cmd = getenv("AMBER_TERMINAL");
+	/* User config: ~/.config/amberwm/amberwm.cfg (or $AMBER_CONFIG). */
+	server.terminal_cmd = NULL;
+	config_load(&server);
 	if (server.terminal_cmd == NULL) {
-		server.terminal_cmd = getenv("TERMINAL");
-	}
-	if (server.terminal_cmd == NULL) {
-		server.terminal_cmd = "foot";
+		const char *env = getenv("AMBER_TERMINAL");
+		if (env == NULL) {
+			env = getenv("TERMINAL");
+		}
+		server.terminal_cmd = strdup(env != NULL ? env : "foot");
 	}
 
 	/*
@@ -1667,6 +2344,11 @@ int main(int argc, char *argv[]) {
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);
 	xkb_context_unref(server.xkb_context);
+	for (size_t i = 0; i < server.binding_count; i++) {
+		free(server.bindings[i].cmd);
+	}
+	free(server.bindings);
+	free(server.terminal_cmd);
 	wl_display_destroy(server.wl_display);
 	return 0;
 }
