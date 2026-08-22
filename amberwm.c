@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <drm_fourcc.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -11,6 +12,7 @@
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
+#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
@@ -18,6 +20,16 @@
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_server_decoration.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_ONLY_BMP
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#include "vendor/stb_image.h"
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
@@ -74,12 +86,26 @@ struct amber_server {
 	char **autostart; // commands spawned once the socket is up
 	size_t autostart_count;
 
+	/* Built-in wallpaper: decoded once, uploaded once, rendered as a
+	 * static background scene node (zero per-frame cost). */
+	enum amber_wallpaper_mode {
+		AMBER_WALLPAPER_COVER,
+		AMBER_WALLPAPER_CONTAIN,
+		AMBER_WALLPAPER_CENTER,
+		AMBER_WALLPAPER_STRETCH,
+	} wallpaper_mode;
+	char *wallpaper_path;
+	struct wlr_buffer *wallpaper_buffer;
+
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
 
 	struct wlr_layer_shell_v1 *layer_shell;
 	struct wl_listener new_layer_surface;
+
+	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_mgr;
+	struct wl_listener new_toplevel_decoration;
 
 	/* One shared xkb context for all keyboards (created once). */
 	struct xkb_context *xkb_context;
@@ -127,6 +153,7 @@ struct amber_output {
 	struct wl_list layers[4]; // amber_layer_surface.link, per zwlr_layer_shell_v1_layer
 	struct amber_workspace workspaces[AMBER_WORKSPACE_COUNT];
 	int active_workspace;
+	struct wlr_scene_buffer *wallpaper_node;
 
 	struct wl_listener frame;
 	struct wl_listener request_state;
@@ -832,6 +859,21 @@ static bool parse_action(struct amber_server *server,
 	return true;
 }
 
+/* Expand a leading ~ to $HOME; returns a malloc'd string. */
+static char *expand_path(const char *path) {
+	if (path[0] != '~' || (path[1] != '/' && path[1] != '\0')) {
+		return strdup(path);
+	}
+	const char *home = getenv("HOME");
+	if (home == NULL) {
+		return strdup(path);
+	}
+	size_t len = strlen(home) + strlen(path); // '~' replaced by home
+	char *out = malloc(len);
+	snprintf(out, len, "%s%s", home, path + 1);
+	return out;
+}
+
 enum { AMBER_CONFIG_OK, AMBER_CONFIG_ERROR };
 
 /* Append one parsed "bind=" line to server->bindings. */
@@ -955,6 +997,24 @@ static void config_load(struct amber_server *server) {
 				server->autostart = grown;
 				server->autostart[server->autostart_count++] =
 					strdup(value);
+			}
+		} else if (strcmp(key, "wallpaper") == 0) {
+			free(server->wallpaper_path);
+			server->wallpaper_path = *value == '\0'
+				? NULL : expand_path(value);
+		} else if (strcmp(key, "wallpaper-mode") == 0) {
+			if (strcmp(value, "cover") == 0) {
+				server->wallpaper_mode = AMBER_WALLPAPER_COVER;
+			} else if (strcmp(value, "contain") == 0) {
+				server->wallpaper_mode = AMBER_WALLPAPER_CONTAIN;
+			} else if (strcmp(value, "center") == 0) {
+				server->wallpaper_mode = AMBER_WALLPAPER_CENTER;
+			} else if (strcmp(value, "stretch") == 0) {
+				server->wallpaper_mode = AMBER_WALLPAPER_STRETCH;
+			} else {
+				wlr_log(WLR_ERROR,
+					"config: unknown wallpaper-mode '%s'",
+					value);
 			}
 		} else if (strcmp(key, "gaps") == 0) {
 			server->gaps = atoi(value);
@@ -1515,6 +1575,138 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 static void arrange_layers(struct amber_output *output);
 static void output_update_geometry(struct amber_output *output);
 
+/*
+ * Built-in wallpaper.
+ *
+ * The image is decoded once at startup and wrapped in a wlr_buffer; every
+ * output gets a static scene buffer node on its background layer. After
+ * the initial upload the per-frame cost is zero: damage tracking only
+ * touches it when something actually changes, and nothing renders below.
+ */
+
+struct amber_wallpaper_buffer {
+	struct wlr_buffer base;
+	void *data;
+	int width, height;
+};
+
+static const struct wlr_buffer_impl wallpaper_buffer_impl;
+
+static bool wallpaper_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buf,
+		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
+	struct amber_wallpaper_buffer *buf =
+		wl_container_of(wlr_buf, buf, base);
+	*data = buf->data;
+	*format = DRM_FORMAT_ABGR8888;
+	*stride = (size_t)buf->width * 4;
+	return true;
+}
+
+static void wallpaper_buffer_end_data_ptr_access(struct wlr_buffer *wlr_buf) {
+	/* Pixels are plain heap memory; nothing to unmap. */
+}
+
+static void wallpaper_buffer_destroy(struct wlr_buffer *wlr_buf) {
+	struct amber_wallpaper_buffer *buf =
+		wl_container_of(wlr_buf, buf, base);
+	free(buf->data);
+	free(buf);
+}
+
+static const struct wlr_buffer_impl wallpaper_buffer_impl = {
+	.destroy = wallpaper_buffer_destroy,
+	.begin_data_ptr_access = wallpaper_buffer_begin_data_ptr_access,
+	.end_data_ptr_access = wallpaper_buffer_end_data_ptr_access,
+};
+
+/* Decode an image file into a wlr_buffer (once, at startup). */
+static struct wlr_buffer *wallpaper_load(const char *path) {
+	int iw, ih;
+	stbi_uc *pixels = stbi_load(path, &iw, &ih, NULL, 4);
+	if (pixels == NULL) {
+		wlr_log(WLR_ERROR, "wallpaper: failed to load '%s'", path);
+		return NULL;
+	}
+	if (iw <= 0 || ih <= 0 || iw > 16384 || ih > 16384) {
+		wlr_log(WLR_ERROR, "wallpaper: bad dimensions %dx%d", iw, ih);
+		stbi_image_free(pixels);
+		return NULL;
+	}
+	wlr_log(WLR_INFO, "wallpaper: loaded %s (%dx%d)", path, iw, ih);
+	struct amber_wallpaper_buffer *buf = calloc(1, sizeof(*buf));
+	if (buf == NULL) {
+		stbi_image_free(pixels);
+		return NULL;
+	}
+	wlr_buffer_init(&buf->base, &wallpaper_buffer_impl, iw, ih);
+	buf->data = pixels;
+	buf->width = iw;
+	buf->height = ih;
+	return &buf->base;
+}
+
+/* (Re)create this output's background node for the current mode. */
+static void output_attach_wallpaper(struct amber_output *output) {
+	struct amber_server *server = output->server;
+
+	if (output->wallpaper_node != NULL) {
+		wlr_scene_node_destroy(&output->wallpaper_node->node);
+		output->wallpaper_node = NULL;
+	}
+	struct wlr_buffer *img = server->wallpaper_buffer;
+	if (img == NULL || !output->wlr_output->enabled) {
+		return;
+	}
+	const int W = output->layout_box.width;
+	const int H = output->layout_box.height;
+	if (W <= 0 || H <= 0) {
+		return;
+	}
+	const int iw = img->width;
+	const int ih = img->height;
+
+	struct wlr_scene_buffer *sb =
+		wlr_scene_buffer_create(output->
+			layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND],
+			img);
+
+	switch (server->wallpaper_mode) {
+	case AMBER_WALLPAPER_STRETCH:
+		wlr_scene_buffer_set_dest_size(sb, W, H);
+		wlr_scene_node_set_position(&sb->node, 0, 0);
+		break;
+	case AMBER_WALLPAPER_COVER: {
+		double scale = fmax((double)W / iw, (double)H / ih);
+		double src_w = W / scale, src_h = H / scale;
+		struct wlr_fbox crop = {
+			.x = (iw - src_w) / 2.0,
+			.y = (ih - src_h) / 2.0,
+			.width = src_w,
+			.height = src_h,
+		};
+		wlr_scene_buffer_set_source_box(sb, &crop);
+		wlr_scene_buffer_set_dest_size(sb, W, H);
+		wlr_scene_node_set_position(&sb->node, 0, 0);
+		break;
+	}
+	case AMBER_WALLPAPER_CONTAIN:
+	case AMBER_WALLPAPER_CENTER: {
+		double scale = fmin((double)W / iw, (double)H / ih);
+		if (server->wallpaper_mode == AMBER_WALLPAPER_CENTER &&
+				scale > 1.0) {
+			scale = 1.0; // never upscale in center mode
+		}
+		int dw = (int)(iw * scale);
+		int dh = (int)(ih * scale);
+		wlr_scene_buffer_set_dest_size(sb, dw, dh);
+		wlr_scene_node_set_position(&sb->node, (W - dw) / 2,
+			(H - dh) / 2);
+		break;
+	}
+	}
+	output->wallpaper_node = sb;
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -1851,6 +2043,7 @@ static void output_update_geometry(struct amber_output *output) {
 	}
 
 	arrange_layers(output);
+	output_attach_wallpaper(output);
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
@@ -2120,11 +2313,26 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
+static void server_new_toplevel_decoration(struct wl_listener *listener,
+		void *data) {
+	/* Every client that asks about decorations is told "the compositor
+	 * decorates" — and we then draw nothing. Result: borderless windows
+	 * with no CSD titlebars wherever the toolkit cooperates. */
+	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+	wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
+		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
 int main(int argc, char *argv[]) {
 	/* Debug logging in hot paths is measurable overhead; default to
 	 * errors only, opt back in with AMBERWM_DEBUG=1. */
 	wlr_log_init(getenv("AMBERWM_DEBUG") != NULL ? WLR_DEBUG : WLR_ERROR,
 		NULL);
+
+	/* Prefer server-side decoration in toolkits that only honor env
+	 * (GTK apps spawned by us inherit this). */
+	setenv("GTK_CSD", "0", true);
+
 	char *startup_cmd = NULL;
 
 	int c;
@@ -2226,6 +2434,19 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.layer_shell->events.new_surface,
 		&server.new_layer_surface);
 
+	/* Decoration negotiation: answer both protocols with "server-side",
+	 * then decorate with nothing (no titlebars, no CSD). */
+	struct wlr_server_decoration_manager *legacy_decor =
+		wlr_server_decoration_manager_create(server.wl_display);
+	wlr_server_decoration_manager_set_default_mode(legacy_decor,
+		WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+	server.xdg_decoration_mgr = wlr_xdg_decoration_manager_v1_create(
+		server.wl_display);
+	server.new_toplevel_decoration.notify = server_new_toplevel_decoration;
+	wl_signal_add(
+		&server.xdg_decoration_mgr->events.new_toplevel_decoration,
+		&server.new_toplevel_decoration);
+
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
@@ -2241,6 +2462,12 @@ int main(int argc, char *argv[]) {
 			env = getenv("TERMINAL");
 		}
 		server.terminal_cmd = strdup(env != NULL ? env : "foot");
+	}
+
+	/* Decode the wallpaper before the backend starts; the scene graph
+	 * uploads it to a texture lazily on first render. */
+	if (server.wallpaper_path != NULL) {
+		server.wallpaper_buffer = wallpaper_load(server.wallpaper_path);
 	}
 
 	/*
@@ -2339,6 +2566,7 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.new_xdg_toplevel.link);
 	wl_list_remove(&server.new_xdg_popup.link);
 	wl_list_remove(&server.new_layer_surface.link);
+	wl_list_remove(&server.new_toplevel_decoration.link);
 
 	wl_list_remove(&server.cursor_motion.link);
 	wl_list_remove(&server.cursor_motion_absolute.link);
@@ -2369,6 +2597,10 @@ int main(int argc, char *argv[]) {
 	}
 	free(server.autostart);
 	free(server.terminal_cmd);
+	free(server.wallpaper_path);
+	if (server.wallpaper_buffer != NULL) {
+		wlr_buffer_drop(server.wallpaper_buffer);
+	}
 	wl_display_destroy(server.wl_display);
 	return 0;
 }
