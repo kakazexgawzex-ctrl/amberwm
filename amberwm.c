@@ -219,6 +219,13 @@ struct amber_keyboard {
 	struct wl_listener destroy;
 };
 
+/* A toplevel is "alive" (safe to send state to) only while its xdg
+ * surface is initialized. wlroots resets that flag on unmap, and
+ * sending any set_* to a reset surface trips an assertion. */
+static bool toplevel_alive(struct amber_toplevel *t) {
+	return t != NULL && t->xdg_toplevel->base->initialized;
+}
+
 static void spawn(const char *cmd) {
 	/* SIGCHLD is ignored (see main), so children are reaped by the
 	 * kernel automatically and never become zombies. */
@@ -249,11 +256,11 @@ static struct amber_output *active_output(struct amber_server *server) {
 }
 
 static void deactivate_focused(struct amber_server *server) {
-	if (server->focused_toplevel != NULL) {
+	if (toplevel_alive(server->focused_toplevel)) {
 		wlr_xdg_toplevel_set_activated(
 			server->focused_toplevel->xdg_toplevel, false);
-		server->focused_toplevel = NULL;
 	}
+	server->focused_toplevel = NULL;
 	wlr_seat_keyboard_clear_focus(server->seat);
 }
 
@@ -279,11 +286,12 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 		/*
 		 * Deactivate the previously focused surface. This lets the client know
 		 * it no longer has focus and the client will repaint accordingly, e.g.
-		 * stop displaying a caret.
+		 * stop displaying a caret. The surface may be mid-unmap (its xdg
+		 * state already reset), so only talk to it if still alive.
 		 */
 		struct wlr_xdg_toplevel *prev_toplevel =
 			wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
-		if (prev_toplevel != NULL) {
+		if (prev_toplevel != NULL && prev_toplevel->base->initialized) {
 			wlr_xdg_toplevel_set_activated(prev_toplevel, false);
 		}
 	}
@@ -291,8 +299,10 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Raise above overlapping floats, but never reorder the strip:
 	 * tiling order is user-controlled (niri rule). */
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
-	server->focused_toplevel = toplevel;
-	wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+	if (toplevel_alive(toplevel)) {
+		server->focused_toplevel = toplevel;
+		wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+	}
 	/*
 	 * Tell the seat to have the keyboard enter this surface. wlroots will keep
 	 * track of this and automatically send key events to the appropriate
@@ -344,7 +354,9 @@ static void toplevel_configure_size(struct amber_toplevel *t,
 	}
 	t->sent_w = width;
 	t->sent_h = height;
-	wlr_xdg_toplevel_set_size(t->xdg_toplevel, width, height);
+	if (toplevel_alive(t)) {
+		wlr_xdg_toplevel_set_size(t->xdg_toplevel, width, height);
+	}
 }
 
 static int toplevel_effective_width(struct amber_toplevel *t,
@@ -643,7 +655,9 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 	}
 	t->fullscreen = fullscreen;
 	/* Hint the client so it can drop shadows/CSD chrome if it wants. */
-	wlr_xdg_toplevel_set_fullscreen(t->xdg_toplevel, fullscreen);
+	if (toplevel_alive(t)) {
+		wlr_xdg_toplevel_set_fullscreen(t->xdg_toplevel, fullscreen);
+	}
 
 	if (!t->floating) {
 		workspace_arrange(toplevel_workspace(t));
@@ -1372,7 +1386,10 @@ static void process_cursor_resize(struct amber_server *server) {
 
 	int new_width = new_right - new_left;
 	int new_height = new_bottom - new_top;
-	wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, new_width, new_height);
+	if (toplevel_alive(toplevel)) {
+		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+			new_width, new_height);
+	}
 }
 
 static void process_cursor_motion(struct amber_server *server, uint32_t time) {
