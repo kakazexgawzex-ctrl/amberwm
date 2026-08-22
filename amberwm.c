@@ -226,6 +226,23 @@ static bool toplevel_alive(struct amber_toplevel *t) {
 	return t != NULL && t->xdg_toplevel->base->initialized;
 }
 
+/* Force SERVER_SIDE mode on every decoration object of a toplevel.
+ * Called from initial-commit where sending a configure is legal. */
+static void apply_server_decoration_mode(struct amber_toplevel *toplevel) {
+	struct wlr_xdg_decoration_manager_v1 *mgr =
+		toplevel->server->xdg_decoration_mgr;
+	if (mgr == NULL) {
+		return;
+	}
+	struct wlr_xdg_toplevel_decoration_v1 *deco;
+	wl_list_for_each(deco, &mgr->decorations, link) {
+		if (deco->toplevel == toplevel->xdg_toplevel) {
+			wlr_xdg_toplevel_decoration_v1_set_mode(deco,
+				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		}
+	}
+}
+
 static void spawn(const char *cmd) {
 	/* SIGCHLD is ignored (see main), so children are reaped by the
 	 * kernel automatically and never become zombies. */
@@ -2136,6 +2153,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		 * configures the xdg_toplevel with 0,0 size to let the client pick the
 		 * dimensions itself. */
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
+		apply_server_decoration_mode(toplevel);
 	}
 }
 
@@ -2330,12 +2348,21 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
+static void apply_server_decoration_mode(struct amber_toplevel *toplevel);
+
 static void server_new_toplevel_decoration(struct wl_listener *listener,
 		void *data) {
 	/* Every client that asks about decorations is told "the compositor
 	 * decorates" — and we then draw nothing. Result: borderless windows
-	 * with no CSD titlebars wherever the toolkit cooperates. */
+	 * with no CSD titlebars wherever the toolkit cooperates.
+	 *
+	 * Clients may create the decoration object before their first
+	 * commit, where sending a configure would trip wlroots' assertion;
+	 * defer those to the initial-commit hook. */
 	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+	if (!decoration->toplevel->base->initialized) {
+		return;
+	}
 	wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
 		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 }
