@@ -71,6 +71,8 @@ struct amber_server {
 	double default_column_fraction;
 	struct amber_binding *bindings;
 	size_t binding_count;
+	char **autostart; // commands spawned once the socket is up
+	size_t autostart_count;
 
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
@@ -943,6 +945,17 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "terminal") == 0) {
 			free(server->terminal_cmd);
 			server->terminal_cmd = strdup(value);
+		} else if (strcmp(key, "autostart") == 0) {
+			if (*value == '\0') {
+				continue;
+			}
+			char **grown = realloc(server->autostart,
+				(server->autostart_count + 1) * sizeof(*grown));
+			if (grown != NULL) {
+				server->autostart = grown;
+				server->autostart[server->autostart_count++] =
+					strdup(value);
+			}
 		} else if (strcmp(key, "gaps") == 0) {
 			server->gaps = atoi(value);
 			if (server->gaps < 0) {
@@ -2301,9 +2314,12 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	/* Set the WAYLAND_DISPLAY environment variable to our socket and run the
-	 * startup command if requested. */
+	/* Set the WAYLAND_DISPLAY environment variable to our socket and run
+	 * autostart commands (in config order), then the -s command. */
 	setenv("WAYLAND_DISPLAY", socket, true);
+	for (size_t i = 0; i < server.autostart_count; i++) {
+		spawn(server.autostart[i]);
+	}
 	if (startup_cmd) {
 		spawn(startup_cmd);
 	}
@@ -2348,6 +2364,10 @@ int main(int argc, char *argv[]) {
 		free(server.bindings[i].cmd);
 	}
 	free(server.bindings);
+	for (size_t i = 0; i < server.autostart_count; i++) {
+		free(server.autostart[i]);
+	}
+	free(server.autostart);
 	free(server.terminal_cmd);
 	wl_display_destroy(server.wl_display);
 	return 0;
