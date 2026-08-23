@@ -3317,6 +3317,16 @@ static int ipc_hup_reload(int signal, void *data) {
 	return 0;
 }
 
+/* SIGTERM/SIGINT: run the full teardown path (clients, animations,
+ * scene) instead of dying mid-frame — logind sends TERM at session
+ * end, and an abrupt death there skips buffer/frame cleanup. */
+static int ipc_term_quit(int signal, void *data) {
+	struct amber_server *server = data;
+	wlr_log(WLR_INFO, "signal %d: shutting down", signal);
+	wl_display_terminate(server->wl_display);
+	return 0;
+}
+
 /* ========================= Open animations =============================== */
 
 static int64_t anim_now_usec(void) {
@@ -5256,6 +5266,10 @@ int main(int argc, char *argv[]) {
 	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
 	wl_event_loop_add_signal(anim_loop, SIGHUP,
 		ipc_hup_reload, &server);
+	wl_event_loop_add_signal(anim_loop, SIGTERM,
+		ipc_term_quit, &server);
+	wl_event_loop_add_signal(anim_loop, SIGINT,
+		ipc_term_quit, &server);
 
 	for (size_t i = 0; i < server.autostart_count; i++) {
 		spawn(server.autostart[i]);
