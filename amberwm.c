@@ -276,10 +276,13 @@ struct amber_server {
 	 * Ctrl+C copies, Space saves to file, Esc cancels). */
 	bool shot_active;
 	bool shot_dragging;
+	bool shot_has_sel; // rectangle drawn and committed (survives release)
+	struct wlr_box shot_box; // committed selection, output-local coords
 	double shot_sx, shot_sy; // selection start, layout coords
 	struct amber_output *shot_output;
 	struct wlr_scene_rect *shot_dim;
 	struct wlr_scene_rect *shot_borders[4];
+	struct wlr_scene_buffer *shot_freeze; // frozen frame under the dim
 	char *screenshot_dir; // config override, NULL = default
 	struct amber_toplevel *grabbed_toplevel;
 	double grab_x, grab_y;
@@ -1897,11 +1900,39 @@ static void binding_exec(struct amber_server *server,
 }
 
 /* ==================== Built-in screenshots (niri-style) ==================
- * Print enters region mode: drag a rectangle, then
+ * Print enters region mode niri-style: the frame freezes under a dim
+ * layer, nothing is selected until you drag, and the rectangle stays
+ * after release. Then
  *   Ctrl+C  copy the image to the clipboard (image/png)
  *   Space / Enter  save to ~/Pictures/Screenshots and copy
  *   Esc / right click  cancel
  * Shift+Print captures the whole screen instantly. */
+
+/* RGBA pixel memory wrapped as a wlr_buffer; shared by the built-in
+ * wallpaper and the screenshot freeze-frame. */
+struct amber_wallpaper_buffer {
+	struct wlr_buffer base;
+	void *data;
+	int width, height;
+};
+
+static const struct wlr_buffer_impl wallpaper_buffer_impl;
+
+/* Wrap freshly allocated RGBA pixels into a buffer. Pixel ownership moves
+ * into the buffer and is released when its last reference dies. */
+static struct wlr_buffer *rgba_buffer_take(int width, int height,
+		unsigned char *pixels) {
+	struct amber_wallpaper_buffer *buf = calloc(1, sizeof(*buf));
+	if (buf == NULL) {
+		free(pixels);
+		return NULL;
+	}
+	wlr_buffer_init(&buf->base, &wallpaper_buffer_impl, width, height);
+	buf->data = pixels;
+	buf->width = width;
+	buf->height = height;
+	return &buf->base;
+}
 
 struct amber_png_mem {
 	unsigned char *data;
@@ -1967,10 +1998,19 @@ static void clipboard_send(struct wlr_data_source *source,
 	close(fd);
 }
 
+/* Only tears down the source object. The PNG payload lives in
+ * shot_clipboard and is owned by clipboard_set(): replacing the selection
+ * on a second copy destroys this source while the NEW payload must stay
+ * alive, so freeing data here would kill the fresh image (and later
+ * double-free it in clipboard_set). */
 static void clipboard_destroy(struct wlr_data_source *source) {
-	free(shot_clipboard.data);
-	shot_clipboard.data = NULL;
-	shot_clipboard.len = 0;
+	/* wlroots 0.20 exports no source-finish helper: release the mime
+	 * strings and array ourselves, mirroring its internal cleanup. */
+	char **mime;
+	wl_array_for_each(mime, &source->mime_types) {
+		free(*mime);
+	}
+	wl_array_release(&source->mime_types);
 	free(source);
 }
 
@@ -1985,12 +2025,21 @@ static void clipboard_set(struct amber_server *server,
 	shot_clipboard = png;
 
 	struct wlr_data_source *source = calloc(1, sizeof(*source));
-	source->impl = &clipboard_impl;
+	if (source == NULL) {
+		return;
+	}
+	/* Mandatory: leaves events.destroy as a zeroed wl_list otherwise,
+	 * and wl_list_insert into it segfaults when the seat swaps sources
+	 * on the next copy (observed crash). */
+	wlr_data_source_init(source, &clipboard_impl);
 	const char *mime = "image/png";
 	char *copy = strdup(mime);
-	char **slot = wl_array_add(&source->mime_types, sizeof(copy));
+	char **slot = copy != NULL
+		? wl_array_add(&source->mime_types, sizeof(copy)) : NULL;
 	if (slot != NULL) {
 		*slot = copy;
+	} else {
+		free(copy);
 	}
 
 	wlr_seat_set_selection(server->seat, source,
@@ -2119,8 +2168,13 @@ static void screenshot_hide_ui(struct amber_server *server) {
 			server->shot_borders[i] = NULL;
 		}
 	}
+	if (server->shot_freeze != NULL) {
+		wlr_scene_node_destroy(&server->shot_freeze->node);
+		server->shot_freeze = NULL;
+	}
 	server->shot_active = false;
 	server->shot_dragging = false;
+	server->shot_has_sel = false;
 	server->shot_output = NULL;
 	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
 		server->cursor_mode = AMBER_CURSOR_PASSTHROUGH;
@@ -2161,7 +2215,19 @@ static void screenshot_ui_update(struct amber_server *server) {
 	if (!server->shot_active || server->shot_output == NULL) {
 		return;
 	}
-	struct wlr_box sel = screenshot_selection_box(server);
+	/* Armed state: nothing is drawn until the user starts a drag. */
+	if (!server->shot_has_sel) {
+		for (int i = 0; i < 4; i++) {
+			wlr_scene_node_set_enabled(
+				&server->shot_borders[i]->node, false);
+		}
+		return;
+	}
+	/* While dragging the box tracks the cursor; after release it must
+	 * stay put, so the committed box is used instead. */
+	struct wlr_box sel = server->shot_dragging
+		? screenshot_selection_box(server)
+		: server->shot_box;
 	if (sel.width < 1) {
 		for (int i = 0; i < 4; i++) {
 			wlr_scene_node_set_enabled(
@@ -2169,7 +2235,7 @@ static void screenshot_ui_update(struct amber_server *server) {
 		}
 		return;
 	}
-	float border[4] = {1.00f, 0.70f, 0.13f, 0.9f}; // amber
+	float border[4] = {1.00f, 1.00f, 1.00f, 0.95f}; // white outline
 	int bw = 2;
 	struct wlr_scene_rect *r[4] = {
 		server->shot_borders[0], server->shot_borders[1],
@@ -2203,16 +2269,45 @@ static void screenshot_start_region(struct amber_server *server) {
 		screenshot_cancel(server); // re-press restarts cleanly
 	}
 	server->shot_output = output;
-	server->shot_sx = server->cursor->x - output->layout_box.x;
-	server->shot_sy = server->cursor->y - output->layout_box.y;
-	server->shot_dragging = true;
+	server->shot_dragging = false;
+	server->shot_has_sel = false;
+	server->shot_box = (struct wlr_box){0};
+
+	/* Freeze the live frame into a static scene buffer so windows
+	 * cannot move mid-selection; created before the dim rect so the
+	 * image renders beneath it. */
+	int ow = output->wlr_output->width;
+	int oh = output->wlr_output->height;
+	unsigned char *frame = ow > 0 && oh > 0
+		? screenshot_capture(server, output,
+			(struct wlr_box){ .width = ow, .height = oh })
+		: NULL;
+	if (frame != NULL) {
+		struct wlr_buffer *buf = rgba_buffer_take(ow, oh, frame);
+		if (buf != NULL) {
+			struct wlr_scene_buffer *node =
+				wlr_scene_buffer_create(output->layer_trees[
+					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+					buf);
+			if (node != NULL) {
+				server->shot_freeze = node;
+				wlr_scene_node_set_position(&node->node, 0, 0);
+				wlr_scene_buffer_set_dest_size(node,
+					output->layout_box.width,
+					output->layout_box.height);
+			}
+			/* The scene holds its own reference once attached;
+			 * dropping ours also cleans up failed attaches. */
+			wlr_buffer_unlock(buf);
+		}
+	}
 
 	float dim[4] = {0, 0, 0, 0.35f};
 	server->shot_dim = wlr_scene_rect_create(
 		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
 		output->layout_box.width, output->layout_box.height, dim);
 
-	float invisible[4] = {1.00f, 0.70f, 0.13f, 0.9f};
+	float invisible[4] = {1.00f, 1.00f, 1.00f, 0.95f};
 	for (int i = 0; i < 4; i++) {
 		server->shot_borders[i] = wlr_scene_rect_create(
 			output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
@@ -2221,8 +2316,8 @@ static void screenshot_start_region(struct amber_server *server) {
 	server->shot_active = true;
 	server->cursor_mode = AMBER_CURSOR_SCREENSHOT;
 	screenshot_ui_update(server);
-	wlr_log(WLR_INFO, "screenshot: drag to select — Ctrl+C copy, "
-		"Space save, Esc cancel");
+	wlr_log(WLR_INFO, "screenshot: screen frozen — drag to select, "
+		"Ctrl+C copy, Space save, Esc cancel");
 }
 
 static void screenshot_full_screen(struct amber_server *server) {
@@ -2263,8 +2358,8 @@ static void screenshot_full_screen(struct amber_server *server) {
 }
 
 static void screenshot_finish(struct amber_server *server, bool save_file) {
-	struct wlr_box sel = screenshot_selection_box(server);
-	if (sel.width < 1 || sel.height < 1) {
+	struct wlr_box sel = server->shot_box;
+	if (!server->shot_has_sel || sel.width < 1 || sel.height < 1) {
 		screenshot_cancel(server);
 		return;
 	}
@@ -2311,15 +2406,20 @@ static void screenshot_button(struct amber_server *server,
 		const struct wlr_pointer_button_event *event) {
 	if (event->button == BTN_LEFT) {
 		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-			/* Start a fresh selection where the cursor sits. */
+			/* A rectangle appears only on an explicit drag. */
 			server->shot_sx = server->cursor->x -
 				server->shot_output->layout_box.x;
 			server->shot_sy = server->cursor->y -
 				server->shot_output->layout_box.y;
 			server->shot_dragging = true;
+			server->shot_has_sel = true;
 			screenshot_ui_update(server);
-		} else {
+		} else if (server->shot_dragging) {
 			server->shot_dragging = false;
+			/* Freeze the rectangle where the drag ended so it
+			 * stays put while the mouse keeps moving. */
+			server->shot_box = screenshot_selection_box(server);
+			screenshot_ui_update(server);
 		}
 	} else if (event->button == BTN_RIGHT) {
 		screenshot_cancel(server);
@@ -2335,14 +2435,16 @@ static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 			return true;
 		}
 		bool ctrl = modifiers & WLR_MODIFIER_CTRL;
+		/* Act only once a rectangle exists and no drag is running;
+		 * without this, Space before any drag would save a 1x1 box. */
+		bool ready = server->shot_has_sel && !server->shot_dragging;
 		if ((ctrl && (sym == XKB_KEY_c || sym == XKB_KEY_C)) &&
-				server->shot_dragging == false) {
+				ready) {
 			screenshot_finish(server, false);
 			return true;
 		}
 		if ((sym == XKB_KEY_space || sym == XKB_KEY_Return ||
-				sym == XKB_KEY_KP_Enter) &&
-				server->shot_dragging == false) {
+				sym == XKB_KEY_KP_Enter) && ready) {
 			screenshot_finish(server, true);
 			return true;
 		}
@@ -4082,14 +4184,6 @@ void animation_wobble_release(struct amber_toplevel *toplevel) {
  * the initial upload the per-frame cost is zero: damage tracking only
  * touches it when something actually changes, and nothing renders below.
  */
-
-struct amber_wallpaper_buffer {
-	struct wlr_buffer base;
-	void *data;
-	int width, height;
-};
-
-static const struct wlr_buffer_impl wallpaper_buffer_impl;
 
 static bool wallpaper_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buf,
 		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
