@@ -81,6 +81,19 @@ enum amber_cursor_mode {
 	AMBER_CURSOR_SCREENSHOT,
 };
 
+/* Per-app window rule from the config:
+ *   rule=<app-id> blur=yes,no corner-radius=N
+ * An empty app-id ("rule= blur=yes") matches every window. Later
+ * rules override earlier ones; rules override the global settings. */
+struct amber_window_rule {
+	struct wl_list link;
+	char *app_id; // NULL matches all
+	bool has_blur;
+	bool blur;
+	bool has_corner;
+	int corner_radius;
+};
+
 struct amber_workspace {
 	/* Scene tree holding every toplevel on this workspace. Hiding a
 	 * workspace is a single node disable: hidden subtrees produce no
@@ -172,6 +185,9 @@ struct amber_server {
 	struct wl_listener request_set_selection;
 	struct wl_list keyboards;
 	enum amber_cursor_mode cursor_mode;
+	/* Per-app window rules (config "rule=" lines). Matched by app-id;
+	 * a rule with empty app_id matches every window. */
+	struct wl_list window_rules; // amber_window_rule.link
 	/* Interactive region screenshot state (niri-style: drag to select,
 	 * Ctrl+C copies, Space saves to file, Esc cancels). */
 	bool shot_active;
@@ -765,19 +781,117 @@ static void fx_corner_cb(struct wlr_scene_buffer *buffer,
 	wlr_scene_buffer_set_corner_radius(buffer, radius);
 }
 
-/* (Re)apply per-window effects: rounded corners on every buffer of the
- * window tree and a right-sized optimized-blur node behind the content.
- * The blur node lives inside the window's own tree, so it follows moves
- * for free; only resizes and fullscreen toggles need us here. */
+/* Resolve effective effects for a window: global defaults, then the
+ * first matching rule wins for each property (later rules override). */
+static void rule_resolve(struct amber_server *server,
+		struct amber_toplevel *toplevel, bool *blur_out,
+		int *radius_out) {
+	const char *app_id = toplevel->xdg_toplevel->app_id;
+	bool blur = server->blur_enabled;
+	int radius = server->corner_radius;
+
+	struct amber_window_rule *rule;
+	wl_list_for_each(rule, &server->window_rules, link) {
+		if (rule->app_id != NULL && (app_id == NULL ||
+				strcmp(rule->app_id, app_id) != 0)) {
+			continue;
+		}
+		if (rule->has_blur) {
+			blur = rule->blur;
+		}
+		if (rule->has_corner) {
+			radius = rule->corner_radius;
+		}
+	}
+	*blur_out = blur;
+	*radius_out = radius < 0 ? 0 : radius;
+}
+
+static bool parse_rule_bool(const char *v, bool *out) {
+	if (strcmp(v, "yes") == 0 || strcmp(v, "true") == 0) {
+		*out = true;
+	} else if (strcmp(v, "no") == 0 || strcmp(v, "false") == 0) {
+		*out = false;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+/* Parse "rule=<app-id> opt=val,opt=val" (app-id may be empty). */
+static void parse_window_rule(struct amber_server *server,
+		const char *value) {
+	struct amber_window_rule *rule = calloc(1, sizeof(*rule));
+	if (rule == NULL) {
+		return;
+	}
+
+	while (*value == ' ' || *value == '\t') {
+		value++;
+	}
+	const char *opts = strchr(value, ' ');
+	if (opts == NULL) {
+		opts = value + strlen(value);
+	}
+	size_t id_len = (size_t)(opts - value);
+	if (id_len > 0) {
+		rule->app_id = strndup(value, id_len);
+	}
+
+	while (*opts != '\0') {
+		while (*opts == ' ' || *opts == '\t' || *opts == ',') {
+			opts++;
+		}
+		const char *eq = strchr(opts, '=');
+		if (eq == NULL) {
+			break;
+		}
+		const char *end = eq + 1;
+		while (*end != '\0' && *end != ',') {
+			end++;
+		}
+		char key[32], val[64];
+		size_t klen = (size_t)(eq - opts);
+		size_t vlen = (size_t)(end - eq - 1);
+		if (klen < sizeof(key) && vlen < sizeof(val)) {
+			memcpy(key, opts, klen);
+			key[klen] = '\0';
+			memcpy(val, eq + 1, vlen);
+			val[vlen] = '\0';
+			if (strcmp(key, "blur") == 0) {
+				rule->has_blur =
+					parse_rule_bool(val, &rule->blur);
+			} else if (strcmp(key, "corner-radius") == 0) {
+				rule->corner_radius = atoi(val);
+				rule->has_corner = true;
+				if (rule->corner_radius < 0) {
+					rule->corner_radius = 0;
+				}
+			}
+			/* Unknown keys are ignored. */
+		}
+		opts = end;
+	}
+
+	wl_list_insert(server->window_rules.prev, &rule->link);
+}
+
 static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
 	struct amber_server *server = toplevel->server;
 	bool fullscreen = toplevel->fullscreen;
 
-	int radius = fullscreen ? 0 : server->corner_radius;
+	bool blur;
+	int radius;
+	if (fullscreen) {
+		blur = false;
+		radius = 0;
+	} else {
+		rule_resolve(server, toplevel, &blur, &radius);
+	}
 	wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
 		fx_corner_cb, &radius);
 
-	if (!server->blur_enabled || fullscreen) {
+	if (!blur) {
 		if (toplevel->blur_node != NULL) {
 			wlr_scene_node_set_enabled(
 				&toplevel->blur_node->node, false);
@@ -1092,6 +1206,7 @@ static void config_load(struct amber_server *server) {
 	server->corner_radius = 8;
 	server->blur_enabled = false;
 	server->blur_radius = 5;
+	wl_list_init(&server->window_rules);
 
 	const char *override = getenv("AMBER_CONFIG");
 	char path[512];
@@ -1174,6 +1289,8 @@ static void config_load(struct amber_server *server) {
 			if (server->blur_radius < 0) {
 				server->blur_radius = 5;
 			}
+		} else if (strcmp(key, "rule") == 0) {
+			parse_window_rule(server, value);
 		} else if (strcmp(key, "wallpaper-mode") == 0) {
 			if (strcmp(value, "cover") == 0) {
 				server->wallpaper_mode = AMBER_WALLPAPER_COVER;
