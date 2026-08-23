@@ -3395,41 +3395,23 @@ static float lamp_bezier(float p0, float p1, float p2, float p3, float t) {
  * bezier with an outward bow plus a smoothstep pinch into the target. */
 static void animation_lamp_tick(struct amber_animation *anim, float p) {
 	const float pi = 3.14159265f;
-	/* Per-row helpers: progress exponent, smoothstep squeeze, and the
-	 * bowed bezier Y for a given normalized row position fy. */
+	/* Per-row helpers: progress exponent and smoothstep squeeze for a
+	 * normalized row position fy. */
 #define LAMP_T(fy) powf(p, 1.8f - 1.2f * (fy))
-	/* Horizontal: ONE shared left/right edge pair for all strips,
-	 * driven by the near-bottom row's progress (fy=0.9, the fastest).
-	 * Per-strip widths would stair-step into the "connected cubes"
-	 * artifact; coupling the shared squeeze to the slow midline instead
-	 * made the effect read as a plain slide-down (wide sheet landing
-	 * first). The bottom row's clock keeps the funnel in sync with the
-	 * descent while every strip's edges stay on identical vertical
-	 * lines. */
-	float tc = LAMP_T(0.9f);
-	if (tc > 1.0f) {
-		tc = 1.0f;
-	}
-	float sc = tc * tc * (3.0f - 2.0f * tc);
-	float bow = sinf(tc * pi) * 0.35f * anim->win_w;
-	float xc = anim->win_x + anim->win_w * 0.5f;
-	float bxc = lamp_bezier(xc, xc + bow,
-		anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
-	bxc += (anim->tgt_x - bxc) * sc;
-	int w = (int)(anim->win_w * (1.0f - sc));
-	if (w < 1) {
-		w = 1;
-	}
-	int x = (int)bxc - w / 2;
 
 	for (int i = 0; i < anim->strip_count; i++) {
 		float fy0 = (float)i / anim->strip_count;
 		float fy1 = (float)(i + 1) / anim->strip_count;
+		float fyc = 0.5f * (fy0 + fy1);
 
 		float t0 = LAMP_T(fy0);
 		float t1 = LAMP_T(fy1);
+		float tc = LAMP_T(fyc);
 		if (t0 > 1.0f) t0 = 1.0f;
 		if (t1 > 1.0f) t1 = 1.0f;
+		if (tc > 1.0f) tc = 1.0f;
+		float s1 = t1 * t1 * (3.0f - 2.0f * t1);
+		float sc = tc * tc * (3.0f - 2.0f * tc);
 
 		/* Vertical edges: bezier Y of each row boundary. Strip i's
 		 * bottom edge equals strip i+1's top edge by construction. */
@@ -3449,9 +3431,24 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 			h = 1;
 		}
 
+		/* Horizontal: per-row squeeze (the funnel feel — bottom rows
+		 * pinch first). At 24 strips the width jumps between neighbors
+		 * reached ~15px, reading as "connected cubes" on the sides;
+		 * at 192 strips steps stay ~2px, lost in the motion. */
+		float bow = sinf(tc * pi) * 0.35f * anim->win_w;
+		float xc = anim->win_x + anim->win_w * 0.5f;
+		float bxc = lamp_bezier(xc, xc + bow,
+			anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
+		bxc += (anim->tgt_x - bxc) * sc;
+		int w = (int)(anim->win_w * (1.0f - s1));
+		if (w < 1) {
+			w = 1;
+		}
+
 		struct wlr_scene_buffer *s = anim->strips[i];
 		wlr_scene_buffer_set_dest_size(s, w, h);
-		wlr_scene_node_set_position(&s->node, x, top);
+		wlr_scene_node_set_position(&s->node,
+			(int)bxc - w / 2, top);
 	}
 #undef LAMP_T
 }
@@ -3651,7 +3648,7 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
  * no matter how the client dies), slice it into horizontal strips as
  * scene buffers above every layer, and let animation_lamp_tick drive
  * each strip along the bezier path to the bottom-center target. */
-#define LAMP_STRIP_COUNT 24 // dense enough to look curved, cheap on CPU
+#define LAMP_STRIP_COUNT 192 // dense: per-row side steps stay ~2px
 
 static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	struct amber_server *server = toplevel->server;
@@ -4064,7 +4061,8 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	struct amber_animation *anim, *tmp;
 	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
 		if ((anim->kind == ANIM_LAMP_CLOSE ||
-					anim->kind == ANIM_WS_SLIDE) &&
+					anim->kind == ANIM_WS_SLIDE ||
+					anim->kind == ANIM_WOBBLE) &&
 				anim->output == output) {
 			animation_destroy(server, anim, false);
 		}
@@ -5205,6 +5203,13 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.request_set_selection.link);
 
 	wl_list_remove(&server.new_output.link);
+
+	/* Animations hold scene nodes; drain them before the scene goes
+	 * away so nothing can touch freed nodes during teardown. */
+	struct amber_animation *anim, *anim_tmp;
+	wl_list_for_each_safe(anim, anim_tmp, &server.animations, link) {
+		animation_destroy(&server, anim, false);
+	}
 
 	wlr_scene_node_destroy(&server.scene->tree.node);
 	wlr_xcursor_manager_destroy(server.cursor_mgr);
