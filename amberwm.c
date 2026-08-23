@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <sys/inotify.h>
 #include <wlr/types/wlr_data_device.h>
@@ -103,17 +104,35 @@ struct amber_ipc_watcher {
 	struct wl_event_source *source;
 };
 
-/* Open animation: fade + slide-in from the usable area's right edge.
- * A single event-loop timer drives every active animation at frame rate
+enum amber_anim_kind {
+	ANIM_OPEN,       // fade + slide-in of a live window
+	ANIM_LAMP_CLOSE, // magic-lamp suck-in of a closing window's snapshot
+	ANIM_WS_SLIDE    // horizontal slide between two workspace trees
+};
+
+/* A single event-loop timer drives every active animation at frame rate
  * and disarms itself when the list drains (no idle wakeups). */
 struct amber_animation {
 	struct wl_list link;
-	struct amber_toplevel *toplevel; // canceled on unmap/destroy
+	enum amber_anim_kind kind;
+	int64_t start_usec;
+	uint32_t duration_ms;
+	/* ANIM_OPEN: tracks a live window (canceled on unmap/moves). */
+	struct amber_toplevel *toplevel;
 	struct wlr_scene_tree *tree;
 	int base_x, base_y; // final layout position (parent-local px)
 	int from_dx;        // horizontal offset applied at progress 0
-	int64_t start_usec;
-	uint32_t duration_ms;
+	/* ANIM_LAMP_CLOSE: owns a locked snapshot + detached strip nodes. */
+	struct wlr_buffer *snapshot;   // locked at unmap, ours until done
+	struct wlr_scene_buffer **strips; // live in output->fx_tree
+	int strip_count;
+	struct amber_output *output;
+	int win_x, win_y, win_w, win_h; // window rect at unmap (output-local)
+	int tgt_x, tgt_y;               // lamp target (bottom-center)
+	/* ANIM_WS_SLIDE: two workspace trees sliding horizontally. */
+	struct amber_workspace *ws_from, *ws_to;
+	int slide_dir;    // +1 = toward higher index (content moves left)
+	int origin_x, origin_y; // layout origin to restore
 };
 
 struct amber_workspace {
@@ -221,6 +240,10 @@ struct amber_server {
 	/* Animations. */
 	bool animations_enabled;
 	uint32_t animation_duration_ms;
+	bool lamp_close_enabled; // KDE magic-lamp close effect
+	uint32_t lamp_close_duration_ms;
+	bool ws_slide_enabled; // workspace-switch horizontal slide
+	uint32_t ws_slide_duration_ms;
 	struct wl_list animations; // amber_animation.link
 	struct wl_event_source *anim_source;
 	bool anim_timer_armed;
@@ -262,6 +285,9 @@ struct amber_output {
 	struct amber_workspace workspaces[AMBER_WORKSPACE_COUNT];
 	int active_workspace;
 	struct wlr_scene_buffer *wallpaper_node;
+	/* Animation overlay: lamp-close snapshots + workspace slides render
+	 * here, above every layer. Created last => stacked on top. */
+	struct wlr_scene_tree *fx_tree;
 
 	struct wl_listener frame;
 	struct wl_listener request_state;
@@ -421,6 +447,11 @@ static void focus_toplevel(struct amber_toplevel *toplevel);
 static void ipc_broadcast(struct amber_server *server);
 void animation_cancel_for(struct amber_toplevel *toplevel);
 static void toplevel_apply_fx(struct amber_toplevel *toplevel);
+struct amber_animation;
+static void animation_destroy(struct amber_server *server,
+	struct amber_animation *anim, bool restore);
+static int64_t anim_now_usec(void);
+static void animations_kick(struct amber_server *server);
 
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -760,18 +791,63 @@ static void workspace_switch(struct amber_output *output, int index) {
 			index == output->active_workspace) {
 		return;
 	}
+	struct amber_server *server = output->server;
+	/* Finish any in-flight slide instantly so rapid switches chain. */
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind == ANIM_WS_SLIDE &&
+				anim->output == output) {
+			animation_destroy(server, anim, true);
+		}
+	}
+
+	int old_index = output->active_workspace;
 	struct amber_workspace *old =
-		&output->workspaces[output->active_workspace];
+		&output->workspaces[old_index];
 	struct amber_workspace *new = &output->workspaces[index];
+	output->active_workspace = index;
+	workspace_arrange(new);
+	workspace_update_top_layer(output);
+	focus_workspace_topmost(server, new);
+
+	bool animate = server->animations_enabled &&
+		server->ws_slide_enabled &&
+		server->ws_slide_duration_ms > 0 &&
+		output->layout_box.width > 0;
+	if (animate) {
+		struct amber_animation *a = calloc(1, sizeof(*a));
+		if (a != NULL) {
+			a->kind = ANIM_WS_SLIDE;
+			a->output = output;
+			a->ws_from = old;
+			a->ws_to = new;
+			a->origin_x = output->layout_box.x;
+			a->origin_y = output->layout_box.y;
+			a->slide_dir = index > old_index ? 1 : -1;
+			a->start_usec = anim_now_usec();
+			a->duration_ms = server->ws_slide_duration_ms;
+			/* Hidden workspaces cost nothing when idle, but
+			 * both trees render during the slide; raise the
+			 * incoming one so lower-index trees don't hide
+			 * underneath (sibling z-order is creation order). */
+			wlr_scene_node_set_enabled(&old->tree->node, true);
+			wlr_scene_node_set_enabled(&new->tree->node, true);
+			wlr_scene_node_raise_to_top(&new->tree->node);
+			wlr_scene_node_set_position(&new->tree->node,
+				a->origin_x + a->slide_dir *
+					output->layout_box.width,
+				a->origin_y); // start just off-screen
+			wl_list_insert(server->animations.prev, &a->link);
+			animations_kick(server);
+			ipc_broadcast(server);
+			return;
+		}
+	}
 	/* Hidden workspaces cost nothing: a disabled subtree produces no
 	 * damage and is skipped entirely by the scene renderer. */
 	wlr_scene_node_set_enabled(&old->tree->node, false);
 	wlr_scene_node_set_enabled(&new->tree->node, true);
-	output->active_workspace = index;
-	workspace_arrange(new);
-	workspace_update_top_layer(output);
-	focus_workspace_topmost(output->server, new);
-	ipc_broadcast(output->server);
+	ipc_broadcast(server);
 }
 
 static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
@@ -1394,6 +1470,10 @@ static void config_load(struct amber_server *server) {
 	server->shadows_enabled = false;
 	server->animations_enabled = true;
 	server->animation_duration_ms = 150;
+	server->lamp_close_enabled = true;
+	server->lamp_close_duration_ms = 350; // KDE's ~350ms feel
+	server->ws_slide_enabled = true;
+	server->ws_slide_duration_ms = 250;
 	wl_list_init(&server->animations);
 	wl_list_init(&server->window_rules);
 
@@ -1490,6 +1570,20 @@ static void config_load(struct amber_server *server) {
 			int v = atoi(value);
 			server->animation_duration_ms =
 				v > 0 && v <= 1000 ? (uint32_t)v : 150;
+		} else if (strcmp(key, "close-animation") == 0) {
+			server->lamp_close_enabled =
+				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "close-animation-duration") == 0) {
+			int v = atoi(value);
+			server->lamp_close_duration_ms =
+				v > 0 && v <= 1000 ? (uint32_t)v : 350;
+		} else if (strcmp(key, "workspace-animation") == 0) {
+			server->ws_slide_enabled =
+				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "workspace-animation-duration") == 0) {
+			int v = atoi(value);
+			server->ws_slide_duration_ms =
+				v > 0 && v <= 1000 ? (uint32_t)v : 250;
 		} else if (strcmp(key, "blur-radius") == 0) {
 			server->blur_radius = atoi(value);
 			if (server->blur_radius < 0) {
@@ -3180,12 +3274,51 @@ static void animation_tree_set_opacity(struct wlr_scene_tree *tree,
 	wlr_scene_node_for_each_buffer(&tree->node, fx_opacity_cb, &ctx);
 }
 
+static void animation_lamp_cleanup(struct amber_animation *anim) {
+	if (anim->strips != NULL) {
+		for (int i = 0; i < anim->strip_count; i++) {
+			if (anim->strips[i] != NULL) {
+				wlr_scene_node_destroy(&anim->strips[i]->node);
+				anim->strips[i] = NULL;
+			}
+		}
+		free(anim->strips);
+		anim->strips = NULL;
+		anim->strip_count = 0;
+	}
+	if (anim->snapshot != NULL) {
+		wlr_buffer_unlock(anim->snapshot);
+		anim->snapshot = NULL;
+	}
+}
+
 static void animation_destroy(struct amber_server *server,
 		struct amber_animation *anim, bool restore) {
-	if (restore && anim->tree != NULL) {
-		wlr_scene_node_set_position(&anim->tree->node,
-			anim->base_x, anim->base_y);
-		animation_tree_set_opacity(anim->tree, 1.0f);
+	switch (anim->kind) {
+	case ANIM_OPEN:
+		if (restore && anim->tree != NULL) {
+			wlr_scene_node_set_position(&anim->tree->node,
+				anim->base_x, anim->base_y);
+			animation_tree_set_opacity(anim->tree, 1.0f);
+		}
+		break;
+	case ANIM_LAMP_CLOSE:
+		animation_lamp_cleanup(anim);
+		break;
+	case ANIM_WS_SLIDE:
+		if (anim->ws_from != NULL && anim->ws_from->tree != NULL) {
+			wlr_scene_node_set_position(&anim->ws_from->tree->node,
+				anim->origin_x, anim->origin_y);
+			wlr_scene_node_set_enabled(&anim->ws_from->tree->node,
+				false); // end state: old workspace hidden
+		}
+		if (anim->ws_to != NULL && anim->ws_to->tree != NULL) {
+			wlr_scene_node_set_position(&anim->ws_to->tree->node,
+				anim->origin_x, anim->origin_y);
+			wlr_scene_node_set_enabled(&anim->ws_to->tree->node,
+				true);
+		}
+		break;
 	}
 	wl_list_remove(&anim->link);
 	free(anim);
@@ -3203,6 +3336,55 @@ void animation_cancel_for(struct amber_toplevel *toplevel) {
 	}
 }
 
+/* Cubic bezier scalar component (the user's shader math, on CPU). */
+static float lamp_bezier(float p0, float p1, float p2, float p3, float t) {
+	float u = 1.0f - t;
+	return u*u*u*p0 + 3.0f*u*u*t*p1 + 3.0f*u*t*t*p2 + t*t*t*p3;
+}
+
+/* One frame of the magic lamp: each strip follows the same bezier path
+ * its vertex row would in the KDE shader — bottom rows pull ahead
+ * (lower exponent), control points bow the window outward mid-flight,
+ * and a smoothstep squeeze pinches everything into the target point.
+ * Pure position/dest-size updates: no texture work, no shaders. */
+static void animation_lamp_tick(struct amber_animation *anim, float p) {
+	for (int i = 0; i < anim->strip_count; i++) {
+		float fy = (i + 0.5f) / anim->strip_count; // 0 top .. 1 bottom
+		/* vertexTime = pow(progress, mix(1.8, 0.6, y)). */
+		float t = powf(p, 1.8f - 1.2f * fy);
+		if (t > 1.0f) {
+			t = 1.0f;
+		}
+		float squeeze = t * t * (3.0f - 2.0f * t); // smoothstep
+
+		float x0 = anim->win_x + anim->win_w * 0.5f;
+		float y0 = anim->win_y + fy * anim->win_h;
+		float bow = sinf(t * 3.14159265f) * 0.35f * anim->win_w;
+		float c1x = x0 + bow;
+		float c1y = y0 + (anim->tgt_y - y0) * 0.33f;
+		float c2x = anim->tgt_x + bow * 0.5f;
+		float c2y = y0 + (anim->tgt_y - y0) * 0.66f;
+
+		float bx = lamp_bezier(x0, c1x, c2x, anim->tgt_x, t);
+		float by = lamp_bezier(y0, c1y, c2y, anim->tgt_y, t);
+		bx += (anim->tgt_x - bx) * squeeze;
+
+		float shrink = 1.0f - squeeze * squeeze; // pinch into the point
+		int w = (int)(anim->win_w * shrink);
+		int h = (int)((float)anim->win_h / anim->strip_count * shrink);
+		if (w < 1) {
+			w = 1;
+		}
+		if (h < 1) {
+			h = 1;
+		}
+		struct wlr_scene_buffer *s = anim->strips[i];
+		wlr_scene_buffer_set_dest_size(s, w, h);
+		wlr_scene_node_set_position(&s->node,
+			(int)bx - w / 2, (int)by - h / 2);
+	}
+}
+
 static int animation_tick(void *data) {
 	struct amber_server *server = data;
 	int64_t now = anim_now_usec();
@@ -3216,13 +3398,38 @@ static int animation_tick(void *data) {
 			animation_destroy(server, anim, true);
 			continue;
 		}
-		/* Cubic ease-out: fast start, gentle landing. */
-		float eased = 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
-		float inv = 1.0f - eased;
-		wlr_scene_node_set_position(&anim->tree->node,
-			anim->base_x + (int)(anim->from_dx * inv),
-			anim->base_y);
-		animation_tree_set_opacity(anim->tree, 0.25f + 0.75f * eased);
+		switch (anim->kind) {
+		case ANIM_OPEN: {
+			/* Cubic ease-out: fast start, gentle landing. */
+			float eased = 1.0f - (1.0f - p) * (1.0f - p)
+				* (1.0f - p);
+			float inv = 1.0f - eased;
+			wlr_scene_node_set_position(&anim->tree->node,
+				anim->base_x + (int)(anim->from_dx * inv),
+				anim->base_y);
+			animation_tree_set_opacity(anim->tree,
+				0.25f + 0.75f * eased);
+		} break;
+		case ANIM_LAMP_CLOSE:
+			animation_lamp_tick(anim, p);
+			break;
+		case ANIM_WS_SLIDE: {
+			/* Cubic ease-in-out: smooth departure AND arrival. */
+			float e = p < 0.5f ? 4.0f * p * p * p
+				: 1.0f - powf(-2.0f * p + 2.0f, 3.0f) / 2.0f;
+			int width = anim->output != NULL
+				? anim->output->layout_box.width : 0;
+			wlr_scene_node_set_position(
+				&anim->ws_from->tree->node,
+				anim->origin_x - (int)(anim->slide_dir *
+					width * e),
+				anim->origin_y);
+			wlr_scene_node_set_position(&anim->ws_to->tree->node,
+				anim->origin_x + (int)(anim->slide_dir *
+					width * (1.0f - e)),
+				anim->origin_y);
+		} break;
+		}
 		active = true;
 	}
 	server->anim_timer_armed = active;
@@ -3251,6 +3458,7 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
 	}
 	/* workspace_arrange has already placed the node at its final
 	 * spot; capture it and slide in from the usable area's right. */
+	anim->kind = ANIM_OPEN;
 	anim->toplevel = toplevel;
 	anim->tree = toplevel->scene_tree;
 	anim->base_x = toplevel->scene_tree->node.x;
@@ -3263,6 +3471,95 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
 	}
 	anim->start_usec = anim_now_usec();
 	anim->duration_ms = server->animation_duration_ms;
+
+	wl_list_insert(server->animations.prev, &anim->link);
+	animations_kick(server);
+}
+
+#define LAMP_STRIP_COUNT 24 // dense enough to look curved, cheap on CPU
+
+/* KDE magic-lamp close effect. wlroots emits surface::unmap BEFORE
+ * swapping in the empty commit, so the last displayed buffer + logical
+ * size are still valid right here: lock the buffer (keeps pixels alive
+ * no matter how the client dies), slice it into horizontal strips as
+ * scene buffers above every layer, and let animation_lamp_tick drive
+ * each strip along the bezier path to the bottom-center target. */
+static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	struct amber_output *output = toplevel->output;
+	if (!server->animations_enabled || !server->lamp_close_enabled ||
+			server->lamp_close_duration_ms == 0 ||
+			output == NULL || output->fx_tree == NULL ||
+			toplevel->workspace != output->active_workspace) {
+		return;
+	}
+	if (toplevel->scene_tree == NULL) {
+		return;
+	}
+	/* The window's node x/y are output-local: every parent tree sits
+	 * at the output's layout origin. */
+	int win_x = toplevel->scene_tree->node.x;
+	int win_y = toplevel->scene_tree->node.y;
+
+	struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+	if (surface == NULL || surface->current.buffer == NULL ||
+			surface->current.width < 1 ||
+			surface->current.height < 1) {
+		return; // nothing worth animating (empty/dead buffer)
+	}
+
+	struct amber_animation *anim = calloc(1, sizeof(*anim));
+	if (anim == NULL) {
+		return;
+	}
+	anim->kind = ANIM_LAMP_CLOSE;
+	anim->output = output;
+	anim->win_x = win_x;
+	anim->win_y = win_y;
+	anim->win_w = surface->current.width;
+	anim->win_h = surface->current.height;
+	anim->tgt_x = output->usable_area.x +
+		output->usable_area.width / 2;
+	anim->tgt_y = output->usable_area.y +
+		output->usable_area.height;
+	anim->start_usec = anim_now_usec();
+	anim->duration_ms = server->lamp_close_duration_ms;
+
+	anim->snapshot = surface->current.buffer;
+	wlr_buffer_lock(anim->snapshot);
+
+	anim->strip_count = LAMP_STRIP_COUNT;
+	anim->strips = calloc(LAMP_STRIP_COUNT,
+		sizeof(*anim->strips));
+	if (anim->strips == NULL) {
+		animation_destroy(server, anim, false);
+		return;
+	}
+	float buf_w = anim->snapshot->width;
+	float buf_h = anim->snapshot->height;
+	for (int i = 0; i < LAMP_STRIP_COUNT; i++) {
+		struct wlr_scene_buffer *s =
+			wlr_scene_buffer_create(output->fx_tree,
+				anim->snapshot);
+		if (s == NULL) {
+			anim->strip_count = i; // only destroy what exists
+			animation_destroy(server, anim, false);
+			return;
+		}
+		struct wlr_fbox src = {
+			.x = 0,
+			.y = (double)i * buf_h / LAMP_STRIP_COUNT,
+			.width = buf_w,
+			.height = buf_h / LAMP_STRIP_COUNT,
+		};
+		wlr_scene_buffer_set_source_box(s, &src);
+		wlr_scene_buffer_set_dest_size(s,
+			anim->win_w, anim->win_h / LAMP_STRIP_COUNT);
+		wlr_scene_node_set_position(&s->node, win_x,
+			win_y + (int)((double)i * anim->win_h /
+				LAMP_STRIP_COUNT));
+		anim->strips[i] = s;
+	}
 
 	wl_list_insert(server->animations.prev, &anim->link);
 	animations_kick(server);
@@ -3429,6 +3726,18 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 
 static void output_destroy(struct wl_listener *listener, void *data) {
 	struct amber_output *output = wl_container_of(listener, output, destroy);
+
+	/* Lamp/slide animations hold this output pointer; finish them
+	 * before it is freed. */
+	struct amber_server *server = output->server;
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if ((anim->kind == ANIM_LAMP_CLOSE ||
+					anim->kind == ANIM_WS_SLIDE) &&
+				anim->output == output) {
+			animation_destroy(server, anim, false);
+		}
+	}
 
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
@@ -3706,6 +4015,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_scene_tree_create(&server->scene->tree);
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY] =
 		wlr_scene_tree_create(&server->scene->tree);
+	output->fx_tree = wlr_scene_tree_create(&server->scene->tree);
 
 	output_update_geometry(output);
 }
@@ -3719,7 +4029,7 @@ static void output_update_geometry(struct amber_output *output) {
 	wlr_output_layout_get_box(output->server->output_layout,
 		output->wlr_output, &output->layout_box);
 
-	struct wlr_scene_node *nodes[13] = {
+	struct wlr_scene_node *nodes[14] = {
 		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]->node,
 		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM]->node,
 	};
@@ -3728,6 +4038,7 @@ static void output_update_geometry(struct amber_output *output) {
 	}
 	nodes[11] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP]->node;
 	nodes[12] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]->node;
+	nodes[13] = output->fx_tree != NULL ? &output->fx_tree->node : NULL;
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
 		if (nodes[i] != NULL) {
 			wlr_scene_node_set_position(nodes[i],
@@ -3962,6 +4273,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	}
 
 	struct amber_workspace *ws = toplevel_workspace(toplevel);
+	animation_start_lamp_close(toplevel); // snapshot before teardown
 	animation_cancel_for(toplevel); // node is about to be destroyed
 	toplevel_foreign_destroy(toplevel);
 	wl_list_remove(&toplevel->link);
