@@ -3348,47 +3348,69 @@ static float lamp_bezier(float p0, float p1, float p2, float p3, float t) {
 	return u*u*u*p0 + 3.0f*u*u*t*p1 + 3.0f*u*t*t*p2 + t*t*t*p3;
 }
 
-/* One frame of the magic lamp: each strip follows the same bezier path
- * its vertex row would in the KDE shader — bottom rows pull ahead
- * (lower exponent), control points bow the window outward mid-flight,
- * and a smoothstep squeeze pinches everything into the target point.
- * Pure position/dest-size updates: no texture work, no shaders. */
+/* One frame of the magic lamp. Each strip's TOP and BOTTOM edges are
+ * driven independently through the same bezier the KDE shader applies
+ * per-vertex (bottom rows pull ahead: exponent 1.8 -> 0.6 down the
+ * window), so neighboring strips always share an exact edge — no gaps
+ * or overlapping "cut blocks" mid-flight. X follows the center-line
+ * bezier with an outward bow plus a smoothstep pinch into the target. */
 static void animation_lamp_tick(struct amber_animation *anim, float p) {
+	const float pi = 3.14159265f;
+	/* Per-row helpers: progress exponent, smoothstep squeeze, and the
+	 * bowed bezier Y for a given normalized row position fy. */
+#define LAMP_T(fy) powf(p, 1.8f - 1.2f * (fy))
+	float bow = sinf(LAMP_T(0.5f) * pi) * 0.35f * anim->win_w;
+
 	for (int i = 0; i < anim->strip_count; i++) {
-		float fy = (i + 0.5f) / anim->strip_count; // 0 top .. 1 bottom
-		/* vertexTime = pow(progress, mix(1.8, 0.6, y)). */
-		float t = powf(p, 1.8f - 1.2f * fy);
-		if (t > 1.0f) {
-			t = 1.0f;
-		}
-		float squeeze = t * t * (3.0f - 2.0f * t); // smoothstep
+		float fy0 = (float)i / anim->strip_count;
+		float fy1 = (float)(i + 1) / anim->strip_count;
+		float fyc = 0.5f * (fy0 + fy1);
 
-		float x0 = anim->win_x + anim->win_w * 0.5f;
-		float y0 = anim->win_y + fy * anim->win_h;
-		float bow = sinf(t * 3.14159265f) * 0.35f * anim->win_w;
-		float c1x = x0 + bow;
-		float c1y = y0 + (anim->tgt_y - y0) * 0.33f;
-		float c2x = anim->tgt_x + bow * 0.5f;
-		float c2y = y0 + (anim->tgt_y - y0) * 0.66f;
+		float t0 = LAMP_T(fy0);
+		float t1 = LAMP_T(fy1);
+		float tc = LAMP_T(fyc);
+		if (t0 > 1.0f) t0 = 1.0f;
+		if (t1 > 1.0f) t1 = 1.0f;
+		if (tc > 1.0f) tc = 1.0f;
+		float s0 = t0 * t0 * (3.0f - 2.0f * t0);
+		float s1 = t1 * t1 * (3.0f - 2.0f * t1);
+		float sc = tc * tc * (3.0f - 2.0f * tc);
 
-		float bx = lamp_bezier(x0, c1x, c2x, anim->tgt_x, t);
-		float by = lamp_bezier(y0, c1y, c2y, anim->tgt_y, t);
-		bx += (anim->tgt_x - bx) * squeeze;
-
-		float shrink = 1.0f - squeeze * squeeze; // pinch into the point
-		int w = (int)(anim->win_w * shrink);
-		int h = (int)((float)anim->win_h / anim->strip_count * shrink);
-		if (w < 1) {
-			w = 1;
-		}
+		/* Vertical edges: bezier Y of each row boundary. Strip i's
+		 * bottom edge equals strip i+1's top edge by construction. */
+		float y0o = anim->win_y + fy0 * anim->win_h;
+		float y1o = anim->win_y + fy1 * anim->win_h;
+		float ny0 = lamp_bezier(y0o,
+			y0o + (anim->tgt_y - y0o) * 0.33f,
+			y0o + (anim->tgt_y - y0o) * 0.66f,
+			anim->tgt_y, t0);
+		float ny1 = lamp_bezier(y1o,
+			y1o + (anim->tgt_y - y1o) * 0.33f,
+			y1o + (anim->tgt_y - y1o) * 0.66f,
+			anim->tgt_y, t1);
+		int top = (int)ny0;
+		int h = (int)ny1 - top;
 		if (h < 1) {
 			h = 1;
 		}
+
+		/* Horizontal: center-line bezier + pinch, width collapses
+		 * with the row's own squeeze. */
+		float xc = anim->win_x + anim->win_w * 0.5f;
+		float bxc = lamp_bezier(xc, xc + bow,
+			anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
+		bxc += (anim->tgt_x - bxc) * sc;
+		int w = (int)(anim->win_w * (1.0f - s1));
+		if (w < 1) {
+			w = 1;
+		}
+
 		struct wlr_scene_buffer *s = anim->strips[i];
 		wlr_scene_buffer_set_dest_size(s, w, h);
 		wlr_scene_node_set_position(&s->node,
-			(int)bx - w / 2, (int)by - h / 2);
+			(int)bxc - w / 2, top);
 	}
+#undef LAMP_T
 }
 
 static int animation_tick(void *data) {
