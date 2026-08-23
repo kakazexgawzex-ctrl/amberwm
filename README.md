@@ -47,3 +47,6 @@ inspired by great projects:
 - **[wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)** (MIT) and
   **[scenefx](https://github.com/wlrfx/scenefx)** (MIT) — the foundations
   everything here runs on.
+- **[Noctalia](https://github.com/noctalia-dev/noctalia)** — highly
+  recommended bar/shell to pair with amberwm; the default `SUPER+TAB`
+  window-switcher binding talks to it via `noctalia msg window-switcher`.
