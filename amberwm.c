@@ -20,6 +20,9 @@
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_gamma_control_v1.h>
+#include <wlr/types/wlr_foreign_toplevel_management_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
@@ -27,11 +30,14 @@
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_security_context_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
+#include <wlr/types/wlr_session_lock_v1.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_xdg_activation_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/types/wlr_xdg_toplevel_icon_v1.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
@@ -120,6 +126,17 @@ struct amber_server {
 	struct wl_listener cursor_shape_request;
 	struct wl_listener xdg_activation_request;
 
+	/* Foreign toplevel (taskbars/docks enumerate + control windows). */
+	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_mgr;
+
+	/* Session lock (swaylock & friends). */
+	struct wlr_session_lock_v1 *active_lock;
+	struct wl_list lock_surfaces; // amber_lock_surface.link
+	struct wl_listener session_lock_new_lock;
+	struct wl_listener session_lock_new_surface;
+	struct wl_listener session_lock_unlock;
+	struct wl_listener session_lock_dead;
+
 	/* One shared xkb context for all keyboards (created once). */
 	struct xkb_context *xkb_context;
 
@@ -189,6 +206,12 @@ struct amber_toplevel {
 	int tile_x, tile_w; // arrangement cache (local coords)
 	struct wlr_box pre_fs_box; // float geometry before fullscreen
 
+	/* Foreign toplevel handle for bars/docks. */
+	struct wlr_foreign_toplevel_handle_v1 *foreign_handle;
+	struct wl_listener foreign_activate;
+	struct wl_listener foreign_close;
+	char *foreign_title;
+
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -216,6 +239,14 @@ struct amber_layer_surface {
 struct amber_popup {
 	struct wlr_xdg_popup *xdg_popup;
 	struct wl_listener commit;
+	struct wl_listener destroy;
+};
+
+struct amber_lock_surface {
+	struct wl_list link;
+	struct amber_output *output;
+	struct wlr_session_lock_surface_v1 *lock_surface;
+	struct wlr_scene_tree *scene_tree;
 	struct wl_listener destroy;
 };
 
@@ -2129,6 +2160,166 @@ static void output_update_geometry(struct amber_output *output) {
 	output_attach_wallpaper(output);
 }
 
+/*
+ * Foreign toplevel management: bars/docks enumerate windows and can
+ * focus or close them (noctalia's taskbar/dock needs this).
+ */
+
+static void foreign_handle_activate(struct wl_listener *listener, void *data) {
+	struct amber_toplevel *toplevel =
+		wl_container_of(listener, toplevel, foreign_activate);
+	focus_toplevel(toplevel);
+}
+
+static void foreign_handle_close(struct wl_listener *listener, void *data) {
+	struct amber_toplevel *toplevel =
+		wl_container_of(listener, toplevel, foreign_close);
+	if (toplevel_alive(toplevel)) {
+		wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
+	}
+}
+
+static void toplevel_foreign_init(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	if (server->foreign_toplevel_mgr == NULL) {
+		return;
+	}
+	toplevel->foreign_handle = wlr_foreign_toplevel_handle_v1_create(
+		server->foreign_toplevel_mgr);
+	wlr_foreign_toplevel_handle_v1_set_app_id(toplevel->foreign_handle,
+		toplevel->xdg_toplevel->app_id);
+	const char *title = toplevel->xdg_toplevel->title;
+	if (title != NULL) {
+		wlr_foreign_toplevel_handle_v1_set_title(
+			toplevel->foreign_handle, title);
+		toplevel->foreign_title = strdup(title);
+	}
+	toplevel->foreign_activate.notify = foreign_handle_activate;
+	wl_signal_add(&toplevel->foreign_handle->events.request_activate,
+		&toplevel->foreign_activate);
+	toplevel->foreign_close.notify = foreign_handle_close;
+	wl_signal_add(&toplevel->foreign_handle->events.request_close,
+		&toplevel->foreign_close);
+}
+
+static void toplevel_foreign_destroy(struct amber_toplevel *toplevel) {
+	if (toplevel->foreign_handle == NULL) {
+		return;
+	}
+	wl_list_remove(&toplevel->foreign_activate.link);
+	wl_list_remove(&toplevel->foreign_close.link);
+	free(toplevel->foreign_title);
+	toplevel->foreign_title = NULL;
+	wlr_foreign_toplevel_handle_v1_destroy(toplevel->foreign_handle);
+	toplevel->foreign_handle = NULL;
+}
+
+/* Push title changes to taskbars, deduplicated: terminals commit every
+ * frame and set_title is a broadcast to every bar client. */
+static void toplevel_foreign_update_title(struct amber_toplevel *toplevel) {
+	if (toplevel->foreign_handle == NULL) {
+		return;
+	}
+	const char *title = toplevel->xdg_toplevel->title;
+	if (title == NULL || (toplevel->foreign_title != NULL &&
+			strcmp(toplevel->foreign_title, title) == 0)) {
+		return;
+	}
+	wlr_foreign_toplevel_handle_v1_set_title(
+		toplevel->foreign_handle, title);
+	free(toplevel->foreign_title);
+	toplevel->foreign_title = strdup(title);
+}
+
+/*
+ * Session lock: lock screens render above everything on their output.
+ */
+
+static void session_lock_remove_surfaces(struct amber_server *server) {
+	struct amber_lock_surface *surface, *tmp;
+	wl_list_for_each_safe(surface, tmp, &server->lock_surfaces, link) {
+		wl_list_remove(&surface->destroy.link);
+		wl_list_remove(&surface->link);
+		wlr_scene_node_destroy(&surface->scene_tree->node);
+		free(surface);
+	}
+}
+
+static void lock_surface_destroy(struct wl_listener *listener, void *data) {
+	struct amber_lock_surface *surface =
+		wl_container_of(listener, surface, destroy);
+	wl_list_remove(&surface->destroy.link);
+	wl_list_remove(&surface->link);
+	wlr_scene_node_destroy(&surface->scene_tree->node);
+	free(surface);
+}
+
+static void session_lock_new_surface(struct wl_listener *listener,
+		void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, session_lock_new_surface);
+	struct wlr_session_lock_surface_v1 *lock_surface = data;
+
+	struct amber_output *output = NULL;
+	struct amber_output *candidate;
+	wl_list_for_each(candidate, &server->outputs, link) {
+		if (candidate->wlr_output == lock_surface->output) {
+			output = candidate;
+			break;
+		}
+	}
+	if (output == NULL) {
+		return;
+	}
+
+	wlr_session_lock_surface_v1_configure(lock_surface,
+		output->layout_box.width, output->layout_box.height);
+
+	struct amber_lock_surface *surface = calloc(1, sizeof(*surface));
+	surface->output = output;
+	surface->lock_surface = lock_surface;
+	surface->scene_tree = wlr_scene_tree_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]);
+	wlr_scene_subsurface_tree_create(surface->scene_tree,
+		lock_surface->surface);
+
+	surface->destroy.notify = lock_surface_destroy;
+	wl_signal_add(&lock_surface->events.destroy, &surface->destroy);
+	wl_list_insert(&server->lock_surfaces, &surface->link);
+}
+
+static void session_lock_unlocked(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, session_lock_unlock);
+	session_lock_remove_surfaces(server);
+	server->active_lock = NULL;
+}
+
+static void session_lock_destroyed(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, session_lock_dead);
+	session_lock_remove_surfaces(server);
+	server->active_lock = NULL;
+}
+
+static void session_lock_new_lock(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, session_lock_new_lock);
+	struct wlr_session_lock_v1 *lock = data;
+
+	server->active_lock = lock;
+	session_lock_remove_surfaces(server); // stale surfaces, just in case
+	server->session_lock_new_surface.notify = session_lock_new_surface;
+	wl_signal_add(&lock->events.new_surface,
+		&server->session_lock_new_surface);
+	server->session_lock_unlock.notify = session_lock_unlocked;
+	wl_signal_add(&lock->events.unlock, &server->session_lock_unlock);
+	server->session_lock_dead.notify = session_lock_destroyed;
+	wl_signal_add(&lock->events.destroy, &server->session_lock_dead);
+
+	wlr_session_lock_v1_send_locked(lock);
+}
+
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	struct amber_toplevel *toplevel = wl_container_of(listener, toplevel, map);
@@ -2167,6 +2358,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 		/* Arrange after focusing: the scroll follows the new focus. */
 		workspace_arrange(toplevel_workspace(toplevel));
 	}
+	toplevel_foreign_init(toplevel);
 }
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
@@ -2188,6 +2380,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	}
 
 	struct amber_workspace *ws = toplevel_workspace(toplevel);
+	toplevel_foreign_destroy(toplevel);
 	wl_list_remove(&toplevel->link);
 	workspace_arrange(ws);
 }
@@ -2203,6 +2396,8 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		 * dimensions itself. */
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
 		apply_server_decoration_mode(toplevel);
+	} else {
+		toplevel_foreign_update_title(toplevel);
 	}
 }
 
@@ -2565,6 +2760,24 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&activation->events.request_activate,
 		&server.xdg_activation_request);
 
+	/* Idle reporting (idle behaviors in bars) + inhibition (video
+	 * players keep the screen awake). */
+	wlr_idle_notifier_v1_create(server.wl_display);
+	wlr_idle_inhibit_v1_create(server.wl_display);
+
+	/* Taskbar/dock window listing and control. */
+	server.foreign_toplevel_mgr = wlr_foreign_toplevel_manager_v1_create(
+		server.wl_display);
+	wlr_xdg_toplevel_icon_manager_v1_create(server.wl_display, 1);
+
+	/* Session lock: lock screens render above all outputs. */
+	wl_list_init(&server.lock_surfaces);
+	struct wlr_session_lock_manager_v1 *lock_mgr =
+		wlr_session_lock_manager_v1_create(server.wl_display);
+	server.session_lock_new_lock.notify = session_lock_new_lock;
+	wl_signal_add(&lock_mgr->events.new_lock,
+		&server.session_lock_new_lock);
+
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
@@ -2687,6 +2900,7 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.new_toplevel_decoration.link);
 	wl_list_remove(&server.cursor_shape_request.link);
 	wl_list_remove(&server.xdg_activation_request.link);
+	wl_list_remove(&server.session_lock_new_lock.link);
 
 	wl_list_remove(&server.cursor_motion.link);
 	wl_list_remove(&server.cursor_motion_absolute.link);
