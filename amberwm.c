@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <getopt.h>
@@ -94,6 +95,13 @@ struct amber_window_rule {
 	int corner_radius;
 };
 
+/* Persistent IPC connection receiving state pushes (mango-IPC style). */
+struct amber_ipc_watcher {
+	struct wl_list link;
+	int fd;
+	struct wl_event_source *source;
+};
+
 struct amber_workspace {
 	/* Scene tree holding every toplevel on this workspace. Hiding a
 	 * workspace is a single node disable: hidden subtrees produce no
@@ -185,6 +193,12 @@ struct amber_server {
 	struct wl_listener request_set_selection;
 	struct wl_list keyboards;
 	enum amber_cursor_mode cursor_mode;
+	/* IPC (mango-compatible JSON-line socket): watch clients + state. */
+	struct wl_list ipc_watchers; // amber_ipc_watcher.link
+	struct wl_event_source *ipc_source;
+	char *ipc_path;
+	long ipc_next_id;
+	char *last_focused_title;
 	/* Per-app window rules (config "rule=" lines). Matched by app-id;
 	 * a rule with empty app_id matches every window. */
 	struct wl_list window_rules; // amber_window_rule.link
@@ -246,6 +260,8 @@ struct amber_toplevel {
 	/* SceneFX: optimized-blur node behind this window's content, living
 	 * inside the window tree so it follows moves for free. */
 	struct wlr_scene_optimized_blur *blur_node;
+	/* Stable numeric id exposed over IPC (mango-style client ids). */
+	long ipc_id;
 	int tile_x, tile_w; // arrangement cache (local coords)
 	struct wlr_box pre_fs_box; // float geometry before fullscreen
 
@@ -372,6 +388,9 @@ static void focus_nothing(struct amber_server *server) {
 	deactivate_focused(server);
 }
 
+static void focus_toplevel(struct amber_toplevel *toplevel);
+static void ipc_broadcast(struct amber_server *server);
+
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
 	if (toplevel == NULL) {
@@ -416,6 +435,7 @@ static void focus_toplevel(struct amber_toplevel *toplevel) {
 		wlr_seat_keyboard_notify_enter(seat, surface,
 			keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
 	}
+	ipc_broadcast(server);
 }
 
 /* Focus the most recently focused window of a workspace, or nothing. */
@@ -702,6 +722,7 @@ static void workspace_switch(struct amber_output *output, int index) {
 	workspace_arrange(new);
 	workspace_update_top_layer(output);
 	focus_workspace_topmost(output->server, new);
+	ipc_broadcast(output->server);
 }
 
 static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
@@ -726,6 +747,7 @@ static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
 	if (was_focused && index != output->active_workspace) {
 		focus_workspace_topmost(toplevel->server, src);
 	}
+	ipc_broadcast(toplevel->server);
 }
 
 /* While the focused window is a fullscreen tile, hide the top layer
@@ -925,6 +947,7 @@ static void toggle_focused_float(struct amber_server *server) {
 	struct amber_toplevel *f = server->focused_toplevel;
 	if (f != NULL) {
 		toplevel_toggle_float(f);
+		ipc_broadcast(server); // occupancy unchanged, float state is
 	}
 }
 
@@ -1328,6 +1351,47 @@ static void config_load(struct amber_server *server) {
 	if (server->binding_count == 0) {
 		config_set_defaults(server);
 	}
+}
+
+/* Re-read amberwm.cfg live (IPC "reload" / SIGHUP). Autostart commands
+ * are NOT re-run; bindings, rules, layout and effects apply immediately. */
+static void config_reload(struct amber_server *server) {
+	struct amber_window_rule *rule, *rule_tmp;
+	wl_list_for_each_safe(rule, rule_tmp, &server->window_rules, link) {
+		wl_list_remove(&rule->link);
+		free(rule->app_id);
+		free(rule);
+	}
+	for (size_t i = 0; i < server->autostart_count; i++) {
+		free(server->autostart[i]);
+	}
+	free(server->autostart);
+	server->autostart = NULL;
+	server->autostart_count = 0;
+	free(server->bindings);
+	server->bindings = NULL;
+	server->binding_count = 0;
+
+	config_load(server);
+
+	wlr_scene_set_blur_data(server->scene, 3, server->blur_radius,
+		0.02f, 0.90f, 0.90f, 1.10f);
+
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+			if (i == output->active_workspace) {
+				workspace_arrange(&output->workspaces[i]);
+			}
+			struct amber_toplevel *t;
+			wl_list_for_each(t,
+					&output->workspaces[i].toplevels,
+					link) {
+				toplevel_apply_fx(t);
+			}
+		}
+	}
+	wlr_log(WLR_INFO, "config reloaded");
 }
 
 static void screenshot_start_region(struct amber_server *server);
@@ -2385,6 +2449,459 @@ static void screenshot_button(struct amber_server *server,
 	const struct wlr_pointer_button_event *event);
 static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 	const xkb_keysym_t *syms, int nsyms);
+static void config_reload(struct amber_server *server);
+
+/* ==================== IPC (mango-compatible JSON lines) ===================
+ *
+ * Line protocol over a Unix socket, wire-compatible with Mango's IPC so
+ * noctalia's workspace widget works natively:
+ *   - discovery: $MANGO_INSTANCE_SIGNATURE holds the socket path (we
+ *     setenv it before spawning anything)
+ *   - "watch all-monitors\n"  → persistent conn; we push one JSON line
+ *     per state change: {"monitors":[...]}
+ *   - "get all-clients\n"     → {"clients":[...]} (one-shot)
+ *   - "dispatch view,N\n" /
+ *     "dispatch viewcrossmon,N,<out>\n" /
+ *     "dispatch focusid client,<id>\n" → {"success":bool}
+ * Plus amber-native extras: reload, workspace/focus/close/quit/status. */
+
+#include <sys/socket.h>
+#include <sys/un.h>
+
+static size_t json_escape(char *dst, size_t dstlen, const char *src) {
+	size_t o = 0;
+	for (const unsigned char *p = (const unsigned char *)src;
+			p != NULL && *p != '\0' && o + 8 < dstlen; p++) {
+		unsigned char c = *p;
+		if (c == '"' || c == '\\') {
+			dst[o++] = '\\';
+			dst[o++] = c;
+		} else if (c == '\n') {
+			o += (size_t)snprintf(dst + o, dstlen - o, "\\n");
+		} else if (c == '\t') {
+			o += (size_t)snprintf(dst + o, dstlen - o, "\\t");
+		} else if (c < 0x20) {
+			o += (size_t)snprintf(dst + o, dstlen - o,
+				"\\u%04x", c);
+		} else {
+			dst[o++] = c;
+		}
+	}
+	dst[o] = '\0';
+	return o;
+}
+
+static int ipc_count_windows(struct amber_workspace *ws) {
+	int n = 0;
+	struct amber_toplevel *t;
+	wl_list_for_each(t, &ws->toplevels, link) {
+		n++;
+	}
+	return n;
+}
+
+/* {"name":..,"active":bool,"x":..,"y":..,"width":..,"height":..,
+ *  "active_client":{...}|absent,"tags":[...],"active_tags":[n]} */
+static size_t ipc_monitor_json(struct amber_server *server,
+		struct amber_output *output, char *buf, size_t len) {
+	struct amber_workspace *active_ws =
+		&output->workspaces[output->active_workspace];
+	struct amber_toplevel *focused = server->focused_toplevel;
+
+	char title[256], appid[128];
+	json_escape(title, sizeof(title),
+		focused != NULL &&
+		focused->output == output &&
+		focused->xdg_toplevel->title != NULL
+			? focused->xdg_toplevel->title : "");
+	json_escape(appid, sizeof(appid),
+		focused != NULL && focused->output == output &&
+		focused->xdg_toplevel->app_id != NULL
+			? focused->xdg_toplevel->app_id : "");
+
+	size_t o = (size_t)snprintf(buf, len,
+		"{\"name\":\"%s\",\"active\":%s,"
+		"\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d,",
+		output->wlr_output->name,
+		server->active_output == output ? "true" : "false",
+		output->layout_box.x, output->layout_box.y,
+		output->layout_box.width, output->layout_box.height);
+	if (title[0] != '\0' || appid[0] != '\0') {
+		o += (size_t)snprintf(buf + o, len - o,
+			"\"active_client\":{\"id\":\"%ld\",\"title\":\"%s\","
+			"\"appid\":\"%s\"},",
+			focused != NULL ? focused->ipc_id : 0,
+			title, appid);
+	}
+	o += (size_t)snprintf(buf + o, len - o, "\"tags\":[");
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		int count = ipc_count_windows(&output->workspaces[i]);
+		o += (size_t)snprintf(buf + o, len - o,
+			"%s{\"index\":%d,\"is_active\":%s,"
+			"\"is_urgent\":false,\"client_count\":%d}",
+			i > 0 ? "," : "", i + 1,
+			i == output->active_workspace ? "true" : "false",
+			count);
+	}
+	o += (size_t)snprintf(buf + o, len - o, "],\"active_tags\":[%d]}",
+		output->active_workspace + 1);
+	return o;
+}
+
+/* One JSON line describing every monitor; pushed on state changes. */
+static void ipc_broadcast(struct amber_server *server) {
+	if (wl_list_empty(&server->ipc_watchers)) {
+		return;
+	}
+	char buf[16384];
+	size_t o = (size_t)snprintf(buf, sizeof(buf), "{\"monitors\":[");
+	struct amber_output *output;
+	bool first = true;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (!first && o < sizeof(buf)) {
+			buf[o++] = ',';
+		}
+		first = false;
+		o += ipc_monitor_json(server, output, buf + o,
+			sizeof(buf) - o);
+	}
+	snprintf(buf + o, sizeof(buf) - o, "]}\n");
+	size_t line_len = strlen(buf);
+
+	struct amber_ipc_watcher *watcher, *tmp;
+	wl_list_for_each_safe(watcher, tmp, &server->ipc_watchers, link) {
+		ssize_t rc = send(watcher->fd, buf, line_len, MSG_NOSIGNAL);
+		if (rc < 0 && errno != EAGAIN && errno != EINTR) {
+			wl_list_remove(&watcher->link);
+			wl_event_source_remove(watcher->source);
+			close(watcher->fd);
+			free(watcher);
+		}
+	}
+}
+
+static int ipc_watcher_readable(int fd, uint32_t mask, void *data) {
+	struct amber_server *server = data;
+	(void)fd;
+	if ((mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) != 0 ||
+			(mask & WL_EVENT_READABLE) != 0) {
+		/* Clients never say anything after the first watch line;
+		 * any read event here means they went away. */
+		struct amber_ipc_watcher *watcher, *tmp;
+		wl_list_for_each_safe(watcher, tmp, &server->ipc_watchers,
+				link) {
+			if (watcher->fd == fd) {
+				wl_list_remove(&watcher->link);
+				wl_event_source_remove(watcher->source);
+				close(watcher->fd);
+				free(watcher);
+				break;
+			}
+		}
+		return -1;
+	}
+	return 0;
+}
+
+static struct amber_output *ipc_output_by_name(
+		struct amber_server *server, const char *name) {
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (strcmp(output->wlr_output->name, name) == 0) {
+			return output;
+		}
+	}
+	return NULL;
+}
+
+static bool ipc_parse_long(const char *s, long *out) {
+	char *end;
+	long v = strtol(s, &end, 10);
+	if (end == s || (*end != '\0' && *end != ',')) {
+		return false;
+	}
+	*out = v;
+	return true;
+}
+
+/* Handle a dispatch sub-command (after "dispatch "). Returns JSON reply
+ * written into reply buffer. */
+static void ipc_dispatch(struct amber_server *server, const char *args,
+		char *reply, size_t reply_len) {
+	bool ok = false;
+	if (strncmp(args, "view,", 5) == 0) {
+		long n;
+		if (ipc_parse_long(args + 5, &n) && n >= 1 &&
+				n <= AMBER_WORKSPACE_COUNT) {
+			struct amber_output *output = active_output(server);
+			if (output != NULL) {
+				workspace_switch(output, (int)n - 1);
+				ok = true;
+			}
+		}
+	} else if (strncmp(args, "viewcrossmon,", 13) == 0) {
+		long n;
+		const char *comma = strchr(args + 13, ',');
+		if (comma != NULL && ipc_parse_long(args + 13, &n) &&
+				n >= 1 && n <= AMBER_WORKSPACE_COUNT) {
+			struct amber_output *output =
+				ipc_output_by_name(server, comma + 1);
+			if (output == NULL) {
+				output = active_output(server);
+			}
+			if (output != NULL) {
+				workspace_switch(output, (int)n - 1);
+				ok = true;
+			}
+		}
+	} else if (strncmp(args, "focusid client,", 15) == 0) {
+		long id;
+		if (ipc_parse_long(args + 15, &id)) {
+			struct amber_output *output;
+			wl_list_for_each(output, &server->outputs, link) {
+				for (int i = 0; i < AMBER_WORKSPACE_COUNT &&
+						!ok; i++) {
+					struct amber_toplevel *t;
+					wl_list_for_each(t,
+							&output->workspaces[i]
+								.toplevels,
+							link) {
+						if (t->ipc_id == id) {
+							/* Switching to the
+							 * window's
+							 * workspace makes
+							 * it visible. */
+							workspace_switch(
+								output, i);
+							focus_toplevel(t);
+							ok = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+	snprintf(reply, reply_len, "{\"success\":%s}",
+		ok ? "true" : "false");
+}
+
+/* Respond to one-shot requests; `req` has no trailing newline. When the
+ * request is a watch, registers the connection and returns true meaning
+ * "keep the connection open". */
+static bool ipc_handle_request(struct amber_server *server, int fd,
+		char *req) {
+	char reply[4096];
+
+	if (strncmp(req, "watch ", 6) == 0) {
+		struct amber_ipc_watcher *watcher = calloc(1,
+			sizeof(*watcher));
+		if (watcher == NULL) {
+			return false;
+		}
+		watcher->fd = fd;
+		struct wl_event_loop *loop =
+			wl_display_get_event_loop(server->wl_display);
+		watcher->source = wl_event_loop_add_fd(loop, fd,
+			WL_EVENT_READABLE, ipc_watcher_readable, server);
+		wl_list_insert(server->ipc_watchers.prev, &watcher->link);
+		/* Immediate snapshot so the client starts with state. */
+		ipc_broadcast(server);
+		return true;
+	}
+
+	if (strcmp(req, "get all-clients") == 0) {
+		size_t o = (size_t)snprintf(reply, sizeof(reply),
+			"{\"clients\":[");
+		bool first = true;
+		struct amber_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+				struct amber_toplevel *t;
+				wl_list_for_each(t,
+						&output->workspaces[i]
+							.toplevels, link) {
+					char title[256], appid[128];
+					json_escape(title, sizeof(title),
+						t->xdg_toplevel->title ?
+						t->xdg_toplevel->title : "");
+					json_escape(appid, sizeof(appid),
+						t->xdg_toplevel->app_id ?
+						t->xdg_toplevel->app_id : "");
+					if (!first) {
+						o += (size_t)snprintf(reply + o,
+							sizeof(reply) - o, ",");
+					}
+					first = false;
+					o += (size_t)snprintf(reply + o,
+						sizeof(reply) - o,
+						"{\"id\":\"%ld\","
+						"\"title\":\"%s\","
+						"\"appid\":\"%s\","
+						"\"monitor\":\"%s\","
+						"\"tags\":[%d],"
+						"\"is_focused\":%s,"
+						"\"x\":%d,\"y\":%d}",
+						t->ipc_id, title, appid,
+						output->wlr_output->name,
+						i + 1,
+						server->focused_toplevel == t
+							? "true" : "false",
+						(int)t->scene_tree->node.x,
+						(int)t->scene_tree->node.y);
+				}
+			}
+		}
+		snprintf(reply + o, sizeof(reply) - o, "]}\n");
+		send(fd, reply, strlen(reply), MSG_NOSIGNAL);
+		return false;
+	}
+
+	if (strcmp(req, "get version") == 0) {
+		snprintf(reply, sizeof(reply),
+			"{\"version\":\"amberwm-0.1\"}\n");
+		send(fd, reply, strlen(reply), MSG_NOSIGNAL);
+		return false;
+	}
+
+	if (strncmp(req, "dispatch ", 9) == 0) {
+		ipc_dispatch(server, req + 9, reply, sizeof(reply));
+		size_t len = strlen(reply);
+		reply[len] = '\n';
+		send(fd, reply, len + 1, MSG_NOSIGNAL);
+		return false;
+	}
+
+	/* ---- amber-native commands ---- */
+	if (strcmp(req, "reload") == 0) {
+		config_reload(server);
+		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
+		return false;
+	}
+	if (strncmp(req, "workspace ", 10) == 0) {
+		long n;
+		struct amber_output *output = active_output(server);
+		if (output != NULL && ipc_parse_long(req + 10, &n) &&
+				n >= 1 && n <= AMBER_WORKSPACE_COUNT) {
+			workspace_switch(output, (int)n - 1);
+			send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
+		} else {
+			send(fd, "{\"success\":false}\n", 19, MSG_NOSIGNAL);
+		}
+		return false;
+	}
+	if (strcmp(req, "focus next") == 0 || strcmp(req, "focus prev") == 0) {
+		cycle_focus(server, req[6] == 'n' ? 1 : -1);
+		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
+		return false;
+	}
+	if (strcmp(req, "close") == 0) {
+		if (server->focused_toplevel != NULL) {
+			wlr_xdg_toplevel_send_close(
+				server->focused_toplevel->xdg_toplevel);
+		}
+		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
+		return false;
+	}
+	if (strcmp(req, "quit") == 0) {
+		wl_display_terminate(server->wl_display);
+		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
+		return false;
+	}
+	if (strcmp(req, "status") == 0) {
+		struct amber_output *output = active_output(server);
+		snprintf(reply, sizeof(reply),
+			"active_workspace=%d outputs=%zu\n",
+			output != NULL ? output->active_workspace + 1 : 0,
+			wl_list_length(&server->outputs));
+		send(fd, reply, strlen(reply), MSG_NOSIGNAL);
+		return false;
+	}
+
+	send(fd, "{\"error\":\"unknown command\"}\n", 29, MSG_NOSIGNAL);
+	return false;
+}
+
+static int ipc_connection_ready(int listen_fd, uint32_t mask, void *data) {
+	struct amber_server *server = data;
+	if ((mask & WL_EVENT_READABLE) == 0) {
+		return 0;
+	}
+	int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+	if (fd < 0) {
+		return 0;
+	}
+
+	/* Read one request line (clients write immediately). */
+	char req[1024];
+	size_t len = 0;
+	while (len < sizeof(req) - 1) {
+		char c;
+		ssize_t rc = recv(fd, &c, 1, 0);
+		if (rc <= 0) {
+			break;
+		}
+		if (c == '\n') {
+			break;
+		}
+		req[len++] = c;
+	}
+	req[len] = '\0';
+
+	if (len > 0 && !ipc_handle_request(server, fd, req)) {
+		shutdown(fd, SHUT_WR);
+	}
+	/* Watchers keep fd open; ownership moved to the watcher list. */
+	return 0;
+}
+
+void ipc_init(struct amber_server *server) {
+	wl_list_init(&server->ipc_watchers);
+
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime == NULL) {
+		runtime = "/tmp";
+	}
+	const char *display = getenv("WAYLAND_DISPLAY");
+	if (display == NULL) {
+		display = "wayland-0";
+	}
+	server->ipc_path = malloc(512);
+	snprintf(server->ipc_path, 512, "%s/amberwm-%s.sock",
+		runtime, display);
+	unlink(server->ipc_path);
+
+	int listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
+		SOCK_CLOEXEC, 0);
+	if (listen_fd < 0) {
+		return;
+	}
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	strncpy(addr.sun_path, server->ipc_path,
+		sizeof(addr.sun_path) - 1);
+	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+			listen(listen_fd, 16) < 0) {
+		close(listen_fd);
+		return;
+	}
+
+	struct wl_event_loop *loop =
+		wl_display_get_event_loop(server->wl_display);
+	server->ipc_source = wl_event_loop_add_fd(loop, listen_fd,
+		WL_EVENT_READABLE, ipc_connection_ready, server);
+
+	/* Mango-compatible discovery: clients spawned by us inherit this. */
+	setenv("MANGO_INSTANCE_SIGNATURE", server->ipc_path, true);
+	wlr_log(WLR_INFO, "IPC listening on %s", server->ipc_path);
+}
+
+/* ===================== end IPC =========================================== */
+
+static int ipc_hup_reload(int signal, void *data) {
+	(void)signal;
+	config_reload(data);
+	return 0;
+}
 
 /*
  * Built-in wallpaper.
@@ -3057,6 +3574,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	}
 	toplevel_apply_fx(toplevel);
 	toplevel_foreign_init(toplevel);
+	ipc_broadcast(server); // occupancy changed
 }
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
@@ -3081,6 +3599,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	toplevel_foreign_destroy(toplevel);
 	wl_list_remove(&toplevel->link);
 	workspace_arrange(ws);
+	ipc_broadcast(toplevel->server); // occupancy changed
 }
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
@@ -3100,6 +3619,24 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		if (toplevel->scene_tree != NULL &&
 				toplevel->xdg_toplevel->base->surface->mapped) {
 			toplevel_apply_fx(toplevel);
+		}
+		/* Push focused-window title updates to IPC watchers (the bar
+		 * shows it), but only when it actually changed. */
+		if (toplevel == toplevel->server->focused_toplevel) {
+			const char *title = toplevel->xdg_toplevel->title;
+			if ((title == NULL) !=
+					(toplevel->server->last_focused_title
+						== NULL) ||
+					(title != NULL &&
+						strcmp(title,
+						toplevel->server->
+							last_focused_title) !=
+							0)) {
+				free(toplevel->server->last_focused_title);
+				toplevel->server->last_focused_title =
+					title != NULL ? strdup(title) : NULL;
+				ipc_broadcast(toplevel->server);
+			}
 		}
 	}
 }
@@ -3220,6 +3757,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->xdg_toplevel = xdg_toplevel;
 	toplevel->sent_w = -1; // force the first real configure through
 	toplevel->sent_h = -1;
+	toplevel->ipc_id = ++server->ipc_next_id;
 	toplevel->scene_tree =
 		wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
 	toplevel->scene_tree->node.data = toplevel;
@@ -3582,6 +4120,14 @@ int main(int argc, char *argv[]) {
 	/* Set the WAYLAND_DISPLAY environment variable to our socket and run
 	 * autostart commands (in config order), then the -s command. */
 	setenv("WAYLAND_DISPLAY", socket, true);
+	ipc_init(&server);
+
+	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
+	struct wl_event_loop *event_loop =
+		wl_display_get_event_loop(server.wl_display);
+	wl_event_loop_add_signal(event_loop, SIGHUP,
+		ipc_hup_reload, &server);
+
 	for (size_t i = 0; i < server.autostart_count; i++) {
 		spawn(server.autostart[i]);
 	}
@@ -3600,6 +4146,11 @@ int main(int argc, char *argv[]) {
 	/* Once wl_display_run returns, we destroy all clients then shut down the
 	 * server. */
 	wl_display_destroy_clients(server.wl_display);
+
+	if (server.ipc_path != NULL) {
+		unlink(server.ipc_path);
+		free(server.ipc_path);
+	}
 
 	wl_list_remove(&server.new_xdg_toplevel.link);
 	wl_list_remove(&server.new_xdg_popup.link);
