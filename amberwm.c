@@ -57,6 +57,7 @@
 /* SceneFX provides the scene graph (drop-in wlr_scene replacement) with
  * effects: rounded corners, blur, shadows. Must replace wlr_scene.h. */
 #include <scenefx/types/wlr_scene.h>
+#include <scenefx/render/fx_renderer/fx_renderer.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -3242,7 +3243,9 @@ int main(int argc, char *argv[]) {
 	 * can also specify a renderer using the WLR_RENDERER env var.
 	 * The renderer is responsible for defining the various pixel formats it
 	 * supports for shared memory, this configures that for clients. */
-	server.renderer = wlr_renderer_autocreate(server.backend);
+	/* SceneFX replaces the GLES2 renderer with its fx_renderer; using
+	 * the stock renderer here trips scenefx's render-pass assertions. */
+	server.renderer = fx_renderer_create(server.backend);
 	if (server.renderer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
 		return 1;
