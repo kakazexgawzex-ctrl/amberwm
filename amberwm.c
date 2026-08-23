@@ -54,7 +54,9 @@
 #include "vendor/stb_image_write.h"
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
-#include <wlr/types/wlr_scene.h>
+/* SceneFX provides the scene graph (drop-in wlr_scene replacement) with
+ * effects: rounded corners, blur, shadows. Must replace wlr_scene.h. */
+#include <scenefx/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -118,6 +120,10 @@ struct amber_server {
 		AMBER_WALLPAPER_STRETCH,
 	} wallpaper_mode;
 	char *wallpaper_path;
+	/* Effects (SceneFX). Blur is expensive on old GPUs: default off. */
+	int corner_radius;
+	bool blur_enabled;
+	int blur_radius;
 	struct wlr_buffer *wallpaper_buffer;
 
 	struct wlr_xdg_shell *xdg_shell;
@@ -219,6 +225,10 @@ struct amber_toplevel {
 	bool fullscreen; // tile covering the whole usable area
 	int col_width;   // desired column width, px (tiles only)
 	int sent_w, sent_h; // last configured size (skip duplicate configures)
+
+	/* SceneFX: optimized-blur node behind this window's content, living
+	 * inside the window tree so it follows moves for free. */
+	struct wlr_scene_optimized_blur *blur_node;
 	int tile_x, tile_w; // arrangement cache (local coords)
 	struct wlr_box pre_fs_box; // float geometry before fullscreen
 
@@ -746,10 +756,53 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 	workspace_update_top_layer(output);
 }
 
+/* ========================= SceneFX effects =============================== */
+
+static void fx_corner_cb(struct wlr_scene_buffer *buffer,
+		int sx, int sy, void *data) {
+	int radius = *(int *)data;
+	wlr_scene_buffer_set_corner_radius(buffer, radius);
+}
+
+/* (Re)apply per-window effects: rounded corners on every buffer of the
+ * window tree and a right-sized optimized-blur node behind the content.
+ * The blur node lives inside the window's own tree, so it follows moves
+ * for free; only resizes and fullscreen toggles need us here. */
+static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	bool fullscreen = toplevel->fullscreen;
+
+	int radius = fullscreen ? 0 : server->corner_radius;
+	wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
+		fx_corner_cb, &radius);
+
+	if (!server->blur_enabled || fullscreen) {
+		if (toplevel->blur_node != NULL) {
+			wlr_scene_node_set_enabled(
+				&toplevel->blur_node->node, false);
+		}
+		return;
+	}
+
+	struct wlr_box geo = toplevel->xdg_toplevel->base->geometry;
+	if (geo.width < 1 || geo.height < 1) {
+		return;
+	}
+	if (toplevel->blur_node == NULL) {
+		toplevel->blur_node = wlr_scene_optimized_blur_create(
+			toplevel->scene_tree, geo.width, geo.height);
+	} else {
+		wlr_scene_optimized_blur_set_size(toplevel->blur_node,
+			geo.width, geo.height);
+	}
+	wlr_scene_node_set_enabled(&toplevel->blur_node->node, true);
+}
+
 static void toggle_focused_fullscreen(struct amber_server *server) {
 	struct amber_toplevel *f = server->focused_toplevel;
 	if (f != NULL) {
 		toplevel_set_fullscreen(f, !f->fullscreen);
+		toplevel_apply_fx(f);
 	}
 }
 
@@ -1035,6 +1088,9 @@ static void config_load(struct amber_server *server) {
 	server->gaps = AMBER_DEFAULT_GAPS;
 	server->min_column_width = AMBER_DEFAULT_MIN_COLUMN_WIDTH;
 	server->default_column_fraction = AMBER_DEFAULT_COLUMN_FRACTION;
+	server->corner_radius = 8;
+	server->blur_enabled = false;
+	server->blur_radius = 5;
 
 	const char *override = getenv("AMBER_CONFIG");
 	char path[512];
@@ -1105,6 +1161,18 @@ static void config_load(struct amber_server *server) {
 			free(server->screenshot_dir);
 			server->screenshot_dir = *value == '\0'
 				? NULL : expand_path(value);
+		} else if (strcmp(key, "corner-radius") == 0) {
+			server->corner_radius = atoi(value);
+			if (server->corner_radius < 0) {
+				server->corner_radius = 0;
+			}
+		} else if (strcmp(key, "blur") == 0) {
+			server->blur_enabled = strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "blur-radius") == 0) {
+			server->blur_radius = atoi(value);
+			if (server->blur_radius < 0) {
+				server->blur_radius = 5;
+			}
 		} else if (strcmp(key, "wallpaper-mode") == 0) {
 			if (strcmp(value, "cover") == 0) {
 				server->wallpaper_mode = AMBER_WALLPAPER_COVER;
@@ -2869,6 +2937,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 		/* Arrange after focusing: the scroll follows the new focus. */
 		workspace_arrange(toplevel_workspace(toplevel));
 	}
+	toplevel_apply_fx(toplevel);
 	toplevel_foreign_init(toplevel);
 }
 
@@ -2909,6 +2978,11 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		apply_server_decoration_mode(toplevel);
 	} else {
 		toplevel_foreign_update_title(toplevel);
+		/* Window may have resized: keep corners + blur in sync. */
+		if (toplevel->scene_tree != NULL &&
+				toplevel->xdg_toplevel->base->surface->mapped) {
+			toplevel_apply_fx(toplevel);
+		}
 	}
 }
 
@@ -3298,6 +3372,8 @@ int main(int argc, char *argv[]) {
 	/* User config: ~/.config/amberwm/amberwm.cfg (or $AMBER_CONFIG). */
 	server.terminal_cmd = NULL;
 	config_load(&server);
+	wlr_scene_set_blur_data(server.scene, 3, server.blur_radius,
+		0.02f, 0.90f, 0.90f, 1.10f);
 	if (server.terminal_cmd == NULL) {
 		const char *env = getenv("AMBER_TERMINAL");
 		if (env == NULL) {
