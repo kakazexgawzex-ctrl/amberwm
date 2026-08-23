@@ -15,13 +15,23 @@
 #include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_export_dmabuf_v1.h>
+#include <wlr/types/wlr_fractional_scale_v1.h>
+#include <wlr/types/wlr_gamma_control_v1.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_primary_selection.h>
+#include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
+#include <wlr/types/wlr_viewporter.h>
+#include <wlr/types/wlr_xdg_activation_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
+#include <wlr/types/wlr_xdg_output_v1.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
@@ -106,6 +116,9 @@ struct amber_server {
 
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_mgr;
 	struct wl_listener new_toplevel_decoration;
+
+	struct wl_listener cursor_shape_request;
+	struct wl_listener xdg_activation_request;
 
 	/* One shared xkb context for all keyboards (created once). */
 	struct xkb_context *xkb_context;
@@ -1262,6 +1275,42 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
 	}
 	wlr_seat_set_capabilities(server->seat, caps);
+}
+
+/* wp_cursor_shape-v1: clients ask us to show a named cursor shape
+ * (resize arrows, text caret...) instead of uploading their own. */
+static void handle_cursor_shape_request(struct wl_listener *listener,
+		void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, cursor_shape_request);
+	struct wlr_cursor_shape_manager_v1_request_set_shape_event *event = data;
+	/* Only honor the client that currently has pointer focus, same
+	 * vetting as seat_request_cursor. */
+	if (server->seat->pointer_state.focused_client == event->seat_client) {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			wlr_cursor_shape_v1_name(event->shape));
+	}
+}
+
+/* xdg-activation: an app with a valid launcher token asks to be shown.
+ * Used by "open link in new window" style flows; without this the window
+ * opens but never raises/focuses. */
+static void handle_xdg_activation_request(struct wl_listener *listener,
+		void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, xdg_activation_request);
+	struct wlr_xdg_activation_v1_request_activate_event *event = data;
+	if (event->surface == NULL || event->token->seat == NULL) {
+		return;
+	}
+	struct wlr_xdg_toplevel *toplevel =
+		wlr_xdg_toplevel_try_from_wlr_surface(event->surface);
+	if (toplevel == NULL || toplevel->base->data == NULL ||
+			!toplevel->base->initialized) {
+		return;
+	}
+	struct wlr_scene_tree *tree = toplevel->base->data;
+	focus_toplevel(tree->node.data);
 }
 
 static void seat_request_cursor(struct wl_listener *listener, void *data) {
@@ -2491,6 +2540,31 @@ int main(int argc, char *argv[]) {
 		&server.xdg_decoration_mgr->events.new_toplevel_decoration,
 		&server.new_toplevel_decoration);
 
+	/* Cheap protocol globals clients expect from a modern compositor:
+	 * primary selection (middle-click paste), viewporter, gamma,
+	 * screencopy + export-dmabuf (screenshots/recording), fractional
+	 * scaling advertisement, and xdg-output (bars read output info). */
+	wlr_primary_selection_v1_device_manager_create(server.wl_display);
+	wlr_viewporter_create(server.wl_display);
+	wlr_gamma_control_manager_v1_create(server.wl_display);
+	wlr_screencopy_manager_v1_create(server.wl_display);
+	wlr_export_dmabuf_manager_v1_create(server.wl_display);
+	wlr_fractional_scale_manager_v1_create(server.wl_display, 1);
+	wlr_xdg_output_manager_v1_create(server.wl_display,
+		server.output_layout);
+
+	struct wlr_cursor_shape_manager_v1 *shape_mgr =
+		wlr_cursor_shape_manager_v1_create(server.wl_display, 1);
+	server.cursor_shape_request.notify = handle_cursor_shape_request;
+	wl_signal_add(&shape_mgr->events.request_set_shape,
+		&server.cursor_shape_request);
+
+	struct wlr_xdg_activation_v1 *activation =
+		wlr_xdg_activation_v1_create(server.wl_display);
+	server.xdg_activation_request.notify = handle_xdg_activation_request;
+	wl_signal_add(&activation->events.request_activate,
+		&server.xdg_activation_request);
+
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
@@ -2611,6 +2685,8 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.new_xdg_popup.link);
 	wl_list_remove(&server.new_layer_surface.link);
 	wl_list_remove(&server.new_toplevel_decoration.link);
+	wl_list_remove(&server.cursor_shape_request.link);
+	wl_list_remove(&server.xdg_activation_request.link);
 
 	wl_list_remove(&server.cursor_motion.link);
 	wl_list_remove(&server.cursor_motion_absolute.link);
