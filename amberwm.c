@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
@@ -199,6 +200,11 @@ struct amber_server {
 	char *ipc_path;
 	long ipc_next_id;
 	char *last_focused_title;
+	/* Config hot-reload via inotify. */
+	int config_inotify_fd;
+	struct wl_event_source *config_watch_source;
+	char *config_path;
+	bool shadows_enabled;
 	/* Per-app window rules (config "rule=" lines). Matched by app-id;
 	 * a rule with empty app_id matches every window. */
 	struct wl_list window_rules; // amber_window_rule.link
@@ -253,13 +259,17 @@ struct amber_toplevel {
 
 	/* Layout state. */
 	bool floating;   // not part of the scrollable strip
-	bool fullscreen; // tile covering the whole usable area
+	bool fullscreen; // true fullscreen: whole output, above bars
+	bool maximized;  // fake fullscreen: covers usable area only
 	int col_width;   // desired column width, px (tiles only)
 	int sent_w, sent_h; // last configured size (skip duplicate configures)
 
 	/* SceneFX: optimized-blur node behind this window's content, living
 	 * inside the window tree so it follows moves for free. */
 	struct wlr_scene_optimized_blur *blur_node;
+	/* Drop shadow (floating windows only; static scene node, so it is
+	 * free once placed). */
+	struct wlr_scene_shadow *shadow_node;
 	/* Stable numeric id exposed over IPC (mango-style client ids). */
 	long ipc_id;
 	int tile_x, tile_w; // arrangement cache (local coords)
@@ -486,8 +496,8 @@ static void toplevel_configure_size(struct amber_toplevel *t,
 static int toplevel_effective_width(struct amber_toplevel *t,
 		const struct wlr_box *usable) {
 	int max = usable->width - 2 * t->server->gaps;
-	if (t->fullscreen) {
-		return max;
+	if (t->fullscreen || t->maximized) {
+		return t->maximized ? usable->width : max;
 	}
 	int w = t->col_width;
 	if (w < t->server->min_column_width) {
@@ -564,6 +574,14 @@ static void workspace_arrange(struct amber_workspace *ws) {
 		if (t->floating) {
 			continue;
 		}
+		if (t->maximized && !t->fullscreen) {
+			/* Fake fullscreen: the whole usable area, no gaps,
+			 * client unaware (keeps its own chrome). */
+			wlr_scene_node_set_position(&t->scene_tree->node,
+				u->x, u->y);
+			toplevel_configure_size(t, u->width, u->height);
+			continue;
+		}
 		wlr_scene_node_set_position(&t->scene_tree->node,
 			t->tile_x - (int)offset, u->y + gap);
 		toplevel_configure_size(t, t->tile_w, height);
@@ -598,6 +616,7 @@ static void toplevel_to_tiled(struct amber_toplevel *t) {
 		return;
 	}
 	t->fullscreen = false;
+	t->maximized = false;
 	struct amber_workspace *ws = toplevel_workspace(t);
 	struct wlr_box *geo = &t->xdg_toplevel->base->geometry;
 	t->col_width = geo->width > 0 ? geo->width
@@ -623,9 +642,16 @@ static void toplevel_to_tiled(struct amber_toplevel *t) {
 static void toplevel_set_fullscreen(struct amber_toplevel *t,
 		bool fullscreen);
 
+static void toplevel_set_fullscreen(struct amber_toplevel *t,
+		bool fullscreen);
+static void toplevel_apply_fx(struct amber_toplevel *toplevel);
+
 static void toplevel_toggle_float(struct amber_toplevel *t) {
 	if (t->fullscreen) {
 		toplevel_set_fullscreen(t, false);
+	}
+	if (t->maximized) {
+		t->maximized = false;
 	}
 	if (t->floating) {
 		toplevel_to_tiled(t);
@@ -731,6 +757,11 @@ static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
 			index == toplevel->workspace) {
 		return;
 	}
+	if (toplevel->fullscreen) {
+		/* The window's node lives in the overlay tree while
+		 * fullscreen; drop that first so the reparent is clean. */
+		toplevel_set_fullscreen(toplevel, false);
+	}
 	struct amber_output *output = toplevel->output;
 	struct amber_workspace *src = toplevel_workspace(toplevel);
 	bool was_focused = toplevel->server->focused_toplevel == toplevel;
@@ -778,11 +809,31 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 	if (fullscreen) {
 		t->pre_fs_box.width = t->xdg_toplevel->base->geometry.width;
 		t->pre_fs_box.height = t->xdg_toplevel->base->geometry.height;
+		t->maximized = false;
 	}
 	t->fullscreen = fullscreen;
 	/* Hint the client so it can drop shadows/CSD chrome if it wants. */
 	if (toplevel_alive(t)) {
 		wlr_xdg_toplevel_set_fullscreen(t->xdg_toplevel, fullscreen);
+	}
+
+	/* True fullscreen renders ABOVE the top/overlay layers (bars,
+	 * notifs): move the window's tree into the overlay tree. Both
+	 * trees share the output origin, so local coords are unchanged. */
+	if (fullscreen) {
+		wlr_scene_node_reparent(&t->scene_tree->node,
+			output->layer_trees[
+				ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]);
+		/* Overlay tree shares the workspace trees' origin, so the
+		 * window covers the whole output at local (0,0). */
+		wlr_scene_node_set_position(&t->scene_tree->node, 0, 0);
+		wlr_scene_node_raise_to_top(&t->scene_tree->node);
+		toplevel_configure_size(t,
+			output->layout_box.width, output->layout_box.height);
+	} else {
+		/* Back into its workspace tree; arrange restores geometry. */
+		wlr_scene_node_reparent(&t->scene_tree->node,
+			output->workspaces[t->workspace].tree);
 	}
 
 	if (!t->floating) {
@@ -793,6 +844,22 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 		toplevel_to_tiled(t);
 	}
 	workspace_update_top_layer(output);
+	toplevel_apply_fx(t);
+	ipc_broadcast(t->server);
+}
+
+/* Fake fullscreen: cover the usable area without telling the client. */
+static void toplevel_toggle_maximize(struct amber_toplevel *t) {
+	if (t->fullscreen) {
+		return; // fullscreen wins until it is toggled off
+	}
+	t->maximized = !t->maximized;
+	if (t->maximized && t->floating) {
+		toplevel_to_tiled(t);
+	}
+	workspace_arrange(toplevel_workspace(t));
+	toplevel_apply_fx(t);
+	ipc_broadcast(t->server);
 }
 
 /* ========================= SceneFX effects =============================== */
@@ -913,28 +980,72 @@ static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
 	wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
 		fx_corner_cb, &radius);
 
-	if (!blur) {
-		if (toplevel->blur_node != NULL) {
+	/* --- blur (backdrop) --- */
+	if (blur) {
+		struct wlr_box geo =
+			toplevel->xdg_toplevel->base->geometry;
+		if (geo.width >= 1 && geo.height >= 1) {
+			if (toplevel->blur_node == NULL) {
+				toplevel->blur_node =
+					wlr_scene_optimized_blur_create(
+						toplevel->scene_tree,
+						geo.width, geo.height);
+			} else {
+				wlr_scene_optimized_blur_set_size(
+					toplevel->blur_node,
+					geo.width, geo.height);
+			}
 			wlr_scene_node_set_enabled(
-				&toplevel->blur_node->node, false);
+				&toplevel->blur_node->node, true);
 		}
-		return;
+	} else if (toplevel->blur_node != NULL) {
+		wlr_scene_node_set_enabled(&toplevel->blur_node->node,
+			false);
 	}
 
-	struct wlr_box geo = toplevel->xdg_toplevel->base->geometry;
-	if (geo.width < 1 || geo.height < 1) {
-		return;
+	/* --- drop shadow (floating windows only; a static scene node,
+	 * so it costs nothing per frame once placed) --- */
+	bool want_shadow = server->shadows_enabled &&
+		toplevel->floating && !fullscreen;
+	if (want_shadow) {
+		struct wlr_box geo =
+			toplevel->xdg_toplevel->base->geometry;
+		int sigma = 8;
+		int margin = sigma * 2;
+		if (toplevel->shadow_node == NULL) {
+			toplevel->shadow_node = wlr_scene_shadow_create(
+				toplevel->scene_tree,
+				geo.width + margin * 2,
+				geo.height + margin * 2,
+				radius + margin / 2, sigma,
+				(float[4]){0.0f, 0.0f, 0.0f, 0.55f});
+			/* Under everything else in the window tree
+			 * (content, popups, blur). */
+			if (!wl_list_empty(&toplevel->scene_tree->children)) {
+				struct wlr_scene_node *first_child;
+				first_child = wl_container_of(
+					toplevel->scene_tree->children.next,
+					first_child, link);
+				wlr_scene_node_place_below(
+					&toplevel->shadow_node->node,
+					first_child);
+			}
+		} else {
+			wlr_scene_shadow_set_size(toplevel->shadow_node,
+				geo.width + margin * 2,
+				geo.height + margin * 2);
+			wlr_scene_shadow_set_corner_radius(
+				toplevel->shadow_node, radius + margin / 2);
+		}
+		wlr_scene_node_set_position(&toplevel->shadow_node->node,
+			geo.x - margin, geo.y - margin);
+		wlr_scene_node_set_enabled(&toplevel->shadow_node->node,
+			true);
+	} else if (toplevel->shadow_node != NULL) {
+		wlr_scene_node_set_enabled(&toplevel->shadow_node->node,
+			false);
 	}
-	if (toplevel->blur_node == NULL) {
-		toplevel->blur_node = wlr_scene_optimized_blur_create(
-			toplevel->scene_tree, geo.width, geo.height);
-	} else {
-		wlr_scene_optimized_blur_set_size(toplevel->blur_node,
-			geo.width, geo.height);
-	}
-	wlr_scene_node_set_enabled(&toplevel->blur_node->node, true);
 }
-
 static void toggle_focused_fullscreen(struct amber_server *server) {
 	struct amber_toplevel *f = server->focused_toplevel;
 	if (f != NULL) {
@@ -963,6 +1074,7 @@ enum amber_binding_id {
 	AMBER_BINDING_COLUMN_WIDTH,
 	AMBER_BINDING_TOGGLE_FLOAT,
 	AMBER_BINDING_TOGGLE_FULLSCREEN,
+	AMBER_BINDING_TOGGLE_MAXIMIZE,
 	AMBER_BINDING_SCREENSHOT,
 	AMBER_BINDING_SCREENSHOT_REGION,
 };
@@ -995,47 +1107,69 @@ struct amber_binding_defaults {
 	const char *combo;
 	enum amber_binding_id id;
 	int arg;
+	const char *cmd; // AMBER_BINDING_EXEC only
 };
 
 static const struct amber_binding_defaults amber_default_bindings[] = {
-	{ "SUPER+RETURN", AMBER_BINDING_TERMINAL, 0 },
-	{ "SUPER+SHIFT+Q", AMBER_BINDING_CLOSE, 0 },
-	{ "SUPER+SHIFT+E", AMBER_BINDING_QUIT, 0 },
-	{ "SUPER+TAB", AMBER_BINDING_CYCLE_FOCUS, 1 },
-	{ "SUPER+SHIFT+TAB", AMBER_BINDING_CYCLE_FOCUS, -1 },
-	{ "SUPER+1", AMBER_BINDING_WORKSPACE, 0 },
-	{ "SUPER+2", AMBER_BINDING_WORKSPACE, 1 },
-	{ "SUPER+3", AMBER_BINDING_WORKSPACE, 2 },
-	{ "SUPER+4", AMBER_BINDING_WORKSPACE, 3 },
-	{ "SUPER+5", AMBER_BINDING_WORKSPACE, 4 },
-	{ "SUPER+6", AMBER_BINDING_WORKSPACE, 5 },
-	{ "SUPER+7", AMBER_BINDING_WORKSPACE, 6 },
-	{ "SUPER+8", AMBER_BINDING_WORKSPACE, 7 },
-	{ "SUPER+9", AMBER_BINDING_WORKSPACE, 8 },
-	{ "SUPER+SHIFT+1", AMBER_BINDING_MOVE_TO_WORKSPACE, 0 },
-	{ "SUPER+SHIFT+2", AMBER_BINDING_MOVE_TO_WORKSPACE, 1 },
-	{ "SUPER+SHIFT+3", AMBER_BINDING_MOVE_TO_WORKSPACE, 2 },
-	{ "SUPER+SHIFT+4", AMBER_BINDING_MOVE_TO_WORKSPACE, 3 },
-	{ "SUPER+SHIFT+5", AMBER_BINDING_MOVE_TO_WORKSPACE, 4 },
-	{ "SUPER+SHIFT+6", AMBER_BINDING_MOVE_TO_WORKSPACE, 5 },
-	{ "SUPER+SHIFT+7", AMBER_BINDING_MOVE_TO_WORKSPACE, 6 },
-	{ "SUPER+SHIFT+8", AMBER_BINDING_MOVE_TO_WORKSPACE, 7 },
-	{ "SUPER+SHIFT+9", AMBER_BINDING_MOVE_TO_WORKSPACE, 8 },
+	{ "SUPER+RETURN", AMBER_BINDING_TERMINAL, 0 , NULL },
+	{ "SUPER+SHIFT+Q", AMBER_BINDING_CLOSE, 0 , NULL },
+	{ "SUPER+SHIFT+E", AMBER_BINDING_QUIT, 0 , NULL },
+	{ "SUPER+TAB", AMBER_BINDING_CYCLE_FOCUS, 1 , NULL },
+	{ "SUPER+SHIFT+TAB", AMBER_BINDING_CYCLE_FOCUS, -1 , NULL },
+	{ "SUPER+1", AMBER_BINDING_WORKSPACE, 0 , NULL },
+	{ "SUPER+2", AMBER_BINDING_WORKSPACE, 1 , NULL },
+	{ "SUPER+3", AMBER_BINDING_WORKSPACE, 2 , NULL },
+	{ "SUPER+4", AMBER_BINDING_WORKSPACE, 3 , NULL },
+	{ "SUPER+5", AMBER_BINDING_WORKSPACE, 4 , NULL },
+	{ "SUPER+6", AMBER_BINDING_WORKSPACE, 5 , NULL },
+	{ "SUPER+7", AMBER_BINDING_WORKSPACE, 6 , NULL },
+	{ "SUPER+8", AMBER_BINDING_WORKSPACE, 7 , NULL },
+	{ "SUPER+9", AMBER_BINDING_WORKSPACE, 8 , NULL },
+	{ "SUPER+SHIFT+1", AMBER_BINDING_MOVE_TO_WORKSPACE, 0 , NULL },
+	{ "SUPER+SHIFT+2", AMBER_BINDING_MOVE_TO_WORKSPACE, 1 , NULL },
+	{ "SUPER+SHIFT+3", AMBER_BINDING_MOVE_TO_WORKSPACE, 2 , NULL },
+	{ "SUPER+SHIFT+4", AMBER_BINDING_MOVE_TO_WORKSPACE, 3 , NULL },
+	{ "SUPER+SHIFT+5", AMBER_BINDING_MOVE_TO_WORKSPACE, 4 , NULL },
+	{ "SUPER+SHIFT+6", AMBER_BINDING_MOVE_TO_WORKSPACE, 5 , NULL },
+	{ "SUPER+SHIFT+7", AMBER_BINDING_MOVE_TO_WORKSPACE, 6 , NULL },
+	{ "SUPER+SHIFT+8", AMBER_BINDING_MOVE_TO_WORKSPACE, 7 , NULL },
+	{ "SUPER+SHIFT+9", AMBER_BINDING_MOVE_TO_WORKSPACE, 8 , NULL },
 	/* Scrollable-tiling navigation (niri-style). */
-	{ "SUPER+H", AMBER_BINDING_CYCLE_FOCUS, -1 },
-	{ "SUPER+L", AMBER_BINDING_CYCLE_FOCUS, 1 },
-	{ "SUPER+LEFT", AMBER_BINDING_CYCLE_FOCUS, -1 },
-	{ "SUPER+RIGHT", AMBER_BINDING_CYCLE_FOCUS, 1 },
-	{ "SUPER+SHIFT+H", AMBER_BINDING_MOVE_COLUMN, -1 },
-	{ "SUPER+SHIFT+L", AMBER_BINDING_MOVE_COLUMN, 1 },
-	{ "SUPER+SHIFT+LEFT", AMBER_BINDING_MOVE_COLUMN, -1 },
-	{ "SUPER+SHIFT+RIGHT", AMBER_BINDING_MOVE_COLUMN, 1 },
-	{ "SUPER+MINUS", AMBER_BINDING_COLUMN_WIDTH, -1 },
-	{ "SUPER+EQUAL", AMBER_BINDING_COLUMN_WIDTH, 1 },
-	{ "SUPER+V", AMBER_BINDING_TOGGLE_FLOAT, 0 },
-	{ "SUPER+F", AMBER_BINDING_TOGGLE_FULLSCREEN, 0 },
-	{ "Print", AMBER_BINDING_SCREENSHOT_REGION, 0 },
-	{ "SHIFT+Print", AMBER_BINDING_SCREENSHOT, 0 },
+	{ "SUPER+H", AMBER_BINDING_CYCLE_FOCUS, -1 , NULL },
+	{ "SUPER+L", AMBER_BINDING_CYCLE_FOCUS, 1 , NULL },
+	{ "SUPER+LEFT", AMBER_BINDING_CYCLE_FOCUS, -1 , NULL },
+	{ "SUPER+RIGHT", AMBER_BINDING_CYCLE_FOCUS, 1 , NULL },
+	{ "SUPER+SHIFT+H", AMBER_BINDING_MOVE_COLUMN, -1 , NULL },
+	{ "SUPER+SHIFT+L", AMBER_BINDING_MOVE_COLUMN, 1 , NULL },
+	{ "SUPER+SHIFT+LEFT", AMBER_BINDING_MOVE_COLUMN, -1 , NULL },
+	{ "SUPER+SHIFT+RIGHT", AMBER_BINDING_MOVE_COLUMN, 1 , NULL },
+	{ "SUPER+MINUS", AMBER_BINDING_COLUMN_WIDTH, -1 , NULL },
+	{ "SUPER+EQUAL", AMBER_BINDING_COLUMN_WIDTH, 1 , NULL },
+	{ "SUPER+V", AMBER_BINDING_TOGGLE_FLOAT, 0, NULL },
+	{ "SUPER+F", AMBER_BINDING_TOGGLE_MAXIMIZE, 0, NULL },
+	{ "SUPER+SHIFT+F", AMBER_BINDING_TOGGLE_FULLSCREEN, 0, NULL },
+	{ "SUPER+T", AMBER_BINDING_TERMINAL, 0, NULL },
+	{ "SUPER+SPACE", AMBER_BINDING_EXEC, 0,
+			"noctalia msg panel-toggle launcher" },
+	{ "Print", AMBER_BINDING_SCREENSHOT_REGION, 0, NULL },
+	{ "SHIFT+Print", AMBER_BINDING_SCREENSHOT, 0, NULL },
+	/* Noctalia-driven hardware keys (OSDs included). */
+	{ "XF86AudioRaiseVolume", AMBER_BINDING_EXEC, 0,
+			"noctalia msg volume-up" },
+	{ "XF86AudioLowerVolume", AMBER_BINDING_EXEC, 0,
+			"noctalia msg volume-down" },
+	{ "XF86AudioMute", AMBER_BINDING_EXEC, 0,
+			"noctalia msg volume-mute" },
+	{ "XF86AudioPlay", AMBER_BINDING_EXEC, 0,
+			"noctalia msg media toggle" },
+	{ "XF86AudioNext", AMBER_BINDING_EXEC, 0,
+			"noctalia msg media next" },
+	{ "XF86AudioPrev", AMBER_BINDING_EXEC, 0,
+			"noctalia msg media previous" },
+	{ "XF86MonBrightnessUp", AMBER_BINDING_EXEC, 0,
+			"noctalia msg brightness-up" },
+	{ "XF86MonBrightnessDown", AMBER_BINDING_EXEC, 0,
+			"noctalia msg brightness-down" },
 };
 
 #define AMBER_DEFAULT_BINDING_COUNT \
@@ -1123,6 +1257,8 @@ static bool parse_action(struct amber_server *server,
 		b->id = AMBER_BINDING_TOGGLE_FLOAT;
 	} else if (strcmp(buf, "toggle-fullscreen") == 0) {
 		b->id = AMBER_BINDING_TOGGLE_FULLSCREEN;
+	} else if (strcmp(buf, "toggle-maximize") == 0) {
+		b->id = AMBER_BINDING_TOGGLE_MAXIMIZE;
 	} else if (strcmp(buf, "screenshot") == 0) {
 		b->id = AMBER_BINDING_SCREENSHOT_REGION;
 	} else if (strcmp(buf, "screenshot-screen") == 0) {
@@ -1211,6 +1347,7 @@ static void config_set_defaults(struct amber_server *server) {
 		}
 		b.id = d->id;
 		b.arg = d->arg;
+		b.cmd = d->cmd != NULL ? strdup(d->cmd) : NULL;
 		struct amber_binding *grown = realloc(server->bindings,
 			(server->binding_count + 1) * sizeof(b));
 		if (grown == NULL) {
@@ -1229,6 +1366,7 @@ static void config_load(struct amber_server *server) {
 	server->corner_radius = 8;
 	server->blur_enabled = false;
 	server->blur_radius = 5;
+	server->shadows_enabled = false;
 	wl_list_init(&server->window_rules);
 
 	const char *override = getenv("AMBER_CONFIG");
@@ -1307,6 +1445,9 @@ static void config_load(struct amber_server *server) {
 			}
 		} else if (strcmp(key, "blur") == 0) {
 			server->blur_enabled = strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "shadows") == 0) {
+			server->shadows_enabled =
+				strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "blur-radius") == 0) {
 			server->blur_radius = atoi(value);
 			if (server->blur_radius < 0) {
@@ -1394,6 +1535,71 @@ static void config_reload(struct amber_server *server) {
 	wlr_log(WLR_INFO, "config reloaded");
 }
 
+/* Watch the config's directory with inotify; editors either write in
+ * place (IN_CLOSE_WRITE) or replace via rename (IN_MOVED_TO). One idle
+ * fd otherwise — no polling cost. */
+static int config_file_changed(int fd, uint32_t mask, void *data) {
+	struct amber_server *server = data;
+	char buf[1024] __attribute__((aligned(__alignof__(
+		struct inotify_event))));
+
+	while (true) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n <= 0) {
+			break;
+		}
+		const char *base = strrchr(server->config_path, '/');
+		base = base != NULL ? base + 1 : server->config_path;
+		size_t base_len = strlen(base);
+
+		for (char *p = buf; p < buf + n; ) {
+			struct inotify_event *ev =
+				(struct inotify_event *)p;
+			p += sizeof(*ev) + ev->len;
+			if ((mask & WL_EVENT_ERROR) != 0 ||
+					ev->len == 0 ||
+					strlen(ev->name) != base_len ||
+					memcmp(ev->name, base,
+						base_len) != 0) {
+				continue;
+			}
+			if (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) {
+				config_reload(server);
+			}
+		}
+	}
+	return 0;
+}
+
+static void config_watch_init(struct amber_server *server) {
+	server->config_inotify_fd = -1;
+	if (server->config_path == NULL) {
+		return; // no config file: nothing to watch
+	}
+	int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+	if (fd < 0) {
+		return;
+	}
+	char dir[512];
+	snprintf(dir, sizeof(dir), "%s", server->config_path);
+	char *slash = strrchr(dir, '/');
+	if (slash != NULL) {
+		*slash = '\0';
+	}
+	uint32_t mask = IN_CLOSE_WRITE | IN_MOVED_TO;
+	if (inotify_add_watch(fd, dir[0] != '\0' ? dir : "/", mask) < 0) {
+		close(fd);
+		return;
+	}
+	struct wl_event_loop *loop =
+		wl_display_get_event_loop(server->wl_display);
+	server->config_watch_source =
+		wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE,
+			config_file_changed, server);
+	server->config_inotify_fd = fd;
+	wlr_log(WLR_INFO, "watching %s for changes", server->config_path);
+}
+
 static void screenshot_start_region(struct amber_server *server);
 static void screenshot_full_screen(struct amber_server *server);
 
@@ -1446,6 +1652,11 @@ static void binding_exec(struct amber_server *server,
 		break;
 	case AMBER_BINDING_TOGGLE_FULLSCREEN:
 		toggle_focused_fullscreen(server);
+		break;
+	case AMBER_BINDING_TOGGLE_MAXIMIZE:
+		if (server->focused_toplevel != NULL) {
+			toplevel_toggle_maximize(server->focused_toplevel);
+		}
 		break;
 	case AMBER_BINDING_SCREENSHOT_REGION:
 		screenshot_start_region(server);
@@ -1851,7 +2062,13 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 		snprintf(path, sizeof(path), "%s/amberwm-%s.png",
 			screenshot_dir(server), ts);
 		FILE *f = fopen(path, "wb");
-		if (f == NULL) {
+	if (f != NULL) {
+		/* Remember where the config lives so the inotify watcher
+		 * can pick up edits. */
+		free(server->config_path);
+		server->config_path = strdup(path);
+	}
+	if (f == NULL) {
 			wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
 		} else {
 			fwrite(png.data, 1, png.len, f);
@@ -4121,6 +4338,7 @@ int main(int argc, char *argv[]) {
 	 * autostart commands (in config order), then the -s command. */
 	setenv("WAYLAND_DISPLAY", socket, true);
 	ipc_init(&server);
+	config_watch_init(&server);
 
 	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
 	struct wl_event_loop *event_loop =
