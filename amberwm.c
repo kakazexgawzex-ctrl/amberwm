@@ -16,6 +16,7 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/interfaces/wlr_buffer.h>
@@ -170,6 +171,7 @@ struct amber_workspace {
 struct amber_server {
 	struct wl_display *wl_display;
 	struct wlr_backend *backend;
+	struct wlr_session *session;
 	struct wlr_renderer *renderer;
 	struct wlr_allocator *allocator;
 	struct wlr_scene *scene;
@@ -2674,6 +2676,22 @@ static void keyboard_handle_key(
 			return;
 		}
 		for (int i = 0; i < nsyms && !handled; i++) {
+			/* Ctrl+Alt+Fx hands the VT back to logind/seatd;
+			 * without this the combo falls through to clients
+			 * and the TTY is unreachable. */
+			if (syms[i] >= XKB_KEY_XF86Switch_VT_1 &&
+					syms[i] <= XKB_KEY_XF86Switch_VT_12) {
+				if (server->session != NULL) {
+					wlr_session_change_vt(server->session,
+						(int)(syms[i] -
+							XKB_KEY_XF86Switch_VT_1)
+							+ 1);
+				}
+				handled = true;
+				break;
+			}
+		}
+		for (int i = 0; i < nsyms && !handled; i++) {
 			for (size_t j = 0; j < server->binding_count; j++) {
 				const struct amber_binding *binding =
 					&server->bindings[j];
@@ -2913,10 +2931,54 @@ static void reset_cursor_mode(struct amber_server *server) {
 }
 
 static void process_cursor_move(struct amber_server *server) {
+	struct amber_toplevel *toplevel = server->grabbed_toplevel;
+	if (!toplevel->floating) {
+		/* Tile-reorder drag: the window stays tiled; when the
+		 * cursor crosses into another column's slot, swap strip
+		 * positions and let the reflow glide animate the shift. */
+		struct amber_workspace *ws = toplevel_workspace(toplevel);
+		if (ws == NULL || toplevel->output != ws->output) {
+			return;
+		}
+		int px = (int)(server->cursor->x -
+			ws->output->layout_box.x + ws->view_offset);
+		struct amber_toplevel *it, *target = NULL;
+		wl_list_for_each(it, &ws->toplevels, link) {
+			if (it->floating || it == toplevel) {
+				continue;
+			}
+			if (px >= it->tile_x &&
+					px < it->tile_x + it->tile_w) {
+				target = it;
+				break;
+			}
+		}
+		if (target == NULL) {
+			return;
+		}
+		bool target_first = false, seen_self = false;
+		wl_list_for_each(it, &ws->toplevels, link) {
+			if (it == target && !seen_self) {
+				target_first = true;
+				break;
+			}
+			if (it == toplevel) {
+				seen_self = true;
+			}
+		}
+		/* Anchor computed before removal so adjacency survives. */
+		struct wl_list *anchor = target_first
+			? target->link.prev
+			: &target->link;
+		wl_list_remove(&toplevel->link);
+		wl_list_insert(anchor, &toplevel->link);
+		focus_toplevel(toplevel);
+		workspace_arrange(ws);
+		return;
+	}
 	/* Move the grabbed toplevel to the new position. Scene node
 	 * positions are local to the workspace tree, which sits at the
 	 * output's origin, so convert cursor layout coords -> local. */
-	struct amber_toplevel *toplevel = server->grabbed_toplevel;
 	int old_x = toplevel->scene_tree->node.x;
 	int old_y = toplevel->scene_tree->node.y;
 	wlr_scene_node_set_position(&toplevel->scene_tree->node,
@@ -3113,8 +3175,10 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 		 * the client ever seeing this press. */
 		focus_toplevel(toplevel);
 
-		if (!toplevel->floating) {
-			/* Dragging a tiled window floats it, Hyprland-style. */
+		if (!toplevel->floating && event->button == BTN_RIGHT) {
+			/* Right-drag resize floats first (Hyprland-style);
+			 * left-drag keeps tiles in place and reorders them
+			 * (see process_cursor_move). */
 			toplevel_to_floating(toplevel);
 			struct wlr_box *geo =
 				&toplevel->xdg_toplevel->base->geometry;
@@ -5453,7 +5517,7 @@ int main(int argc, char *argv[]) {
 	 * output hardware. The autocreate option will choose the most suitable
 	 * backend based on the current environment, such as opening an X11 window
 	 * if an X11 server is running. */
-	server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
+	server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), &server.session);
 	if (server.backend == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_backend");
 		return 1;
@@ -5470,6 +5534,12 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
 		return 1;
 	}
+	/* crocus/i965 (HD 3000) advertises EGL_ANDROID_native_fence_sync but
+	 * eglDupNativeFenceFDANDROID then fails on every call, leaking one
+	 * fd per frame until "Too many open files" wedges the compositor.
+	 * Disabling the timeline feature keeps wlroots on implicit sync,
+	 * which is what these drivers actually implement. */
+	server.renderer->features.timeline = false;
 
 	wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
