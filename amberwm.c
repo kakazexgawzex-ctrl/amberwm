@@ -1373,6 +1373,7 @@ static void config_load(struct amber_server *server) {
 	char path[512];
 	FILE *f = NULL;
 	if (override != NULL) {
+		snprintf(path, sizeof(path), "%s", override);
 		f = fopen(override, "r");
 	} else {
 		const char *xdg = getenv("XDG_CONFIG_HOME");
@@ -1387,6 +1388,12 @@ static void config_load(struct amber_server *server) {
 				"%s/.config/amberwm/amberwm.cfg", home);
 			f = fopen(path, "r");
 		}
+	}
+	if (f != NULL) {
+		/* Remember where the config lives so the inotify watcher
+		 * can pick up edits. */
+		free(server->config_path);
+		server->config_path = strdup(path);
 	}
 	if (f == NULL) {
 		config_set_defaults(server);
@@ -2062,13 +2069,7 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 		snprintf(path, sizeof(path), "%s/amberwm-%s.png",
 			screenshot_dir(server), ts);
 		FILE *f = fopen(path, "wb");
-	if (f != NULL) {
-		/* Remember where the config lives so the inotify watcher
-		 * can pick up edits. */
-		free(server->config_path);
-		server->config_path = strdup(path);
-	}
-	if (f == NULL) {
+		if (f == NULL) {
 			wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
 		} else {
 			fwrite(png.data, 1, png.len, f);
@@ -4072,7 +4073,7 @@ static void server_new_toplevel_decoration(struct wl_listener *listener,
 int main(int argc, char *argv[]) {
 	/* Debug logging in hot paths is measurable overhead; default to
 	 * errors only, opt back in with AMBERWM_DEBUG=1. */
-	wlr_log_init(getenv("AMBERWM_DEBUG") != NULL ? WLR_DEBUG : WLR_ERROR,
+	wlr_log_init(getenv("AMBERWM_DEBUG") != NULL ? WLR_DEBUG : WLR_INFO,
 		NULL);
 
 	/* Prefer server-side decoration in toolkits that only honor env
