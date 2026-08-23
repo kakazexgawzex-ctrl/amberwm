@@ -348,6 +348,7 @@ struct amber_toplevel {
 	/* Stable numeric id exposed over IPC (mango-style client ids). */
 	long ipc_id;
 	int tile_x, tile_w; // arrangement cache (local coords)
+	bool placed; // node coords are a trustworthy visual start (gates reflow glide)
 	struct wlr_box pre_fs_box; // float geometry before fullscreen
 
 	/* Foreign toplevel handle for bars/docks. */
@@ -668,10 +669,21 @@ static void workspace_arrange(struct amber_workspace *ws) {
 			wlr_scene_node_set_position(&t->scene_tree->node,
 				u->x, u->y);
 			toplevel_configure_size(t, u->width, u->height);
+			t->placed = true;
 			continue;
 		}
-		wlr_scene_node_set_position(&t->scene_tree->node,
-			t->tile_x - (int)offset, u->y + gap);
+		int tx = t->tile_x - (int)offset;
+		int ty = u->y + gap;
+		/* An in-flight tween reports its visual position here, so a
+		 * rearrange chains from where the window actually looks. */
+		int ox = t->scene_tree->node.x;
+		int oy = t->scene_tree->node.y;
+		bool moved = t->placed && (ox != tx || oy != ty);
+		wlr_scene_node_set_position(&t->scene_tree->node, tx, ty);
+		t->placed = true;
+		if (moved) {
+			animation_start_float_glide(t, ox, oy);
+		}
 		toplevel_configure_size(t, t->tile_w, height);
 	}
 }
@@ -935,6 +947,7 @@ static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
 	wlr_scene_node_reparent(&toplevel->scene_tree->node,
 		output->workspaces[index].tree);
 	toplevel->workspace = index;
+	toplevel->placed = false; // old workspace coords are not a visual start
 
 	workspace_arrange(src);
 	workspace_arrange(&output->workspaces[index]);
@@ -992,12 +1005,14 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 		 * window covers the whole output at local (0,0). */
 		wlr_scene_node_set_position(&t->scene_tree->node, 0, 0);
 		wlr_scene_node_raise_to_top(&t->scene_tree->node);
+		t->placed = false; // overlay coords must not seed a glide
 		toplevel_configure_size(t,
 			output->layout_box.width, output->layout_box.height);
-	} else {
+	} 	else {
 		/* Back into its workspace tree; arrange restores geometry. */
 		wlr_scene_node_reparent(&t->scene_tree->node,
 			output->workspaces[t->workspace].tree);
+		t->placed = false; // node still sits at the old overlay (0,0)
 	}
 
 	if (!t->floating) {
@@ -3899,6 +3914,18 @@ static void animation_start_float_glide(struct amber_toplevel *toplevel,
 	int dx = to_x - from_x, dy = to_y - from_y;
 	if (dx * dx + dy * dy < 64) { // under ~8px: not worth a tween
 		return;
+	}
+
+	/* A newer tween supersedes an in-flight one so rapid rearranges
+	 * chain smoothly instead of two animations fighting over the node. */
+	struct amber_animation *prev_glide, *glide_tmp;
+	wl_list_for_each_safe(prev_glide, glide_tmp, &server->animations,
+			link) {
+		if (prev_glide->toplevel == toplevel &&
+				prev_glide->kind == ANIM_FLOAT_TWEEN) {
+			wl_list_remove(&prev_glide->link);
+			free(prev_glide);
+		}
 	}
 
 	struct amber_animation *anim = calloc(1, sizeof(*anim));
