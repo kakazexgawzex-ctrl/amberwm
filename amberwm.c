@@ -8,6 +8,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <wlr/types/wlr_data_device.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
@@ -46,6 +49,9 @@
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
 #include "vendor/stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBIW_ASSERT(x)
+#include "vendor/stb_image_write.h"
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
@@ -69,6 +75,7 @@ enum amber_cursor_mode {
 	AMBER_CURSOR_PASSTHROUGH,
 	AMBER_CURSOR_MOVE,
 	AMBER_CURSOR_RESIZE,
+	AMBER_CURSOR_SCREENSHOT,
 };
 
 struct amber_workspace {
@@ -158,6 +165,15 @@ struct amber_server {
 	struct wl_listener request_set_selection;
 	struct wl_list keyboards;
 	enum amber_cursor_mode cursor_mode;
+	/* Interactive region screenshot state (niri-style: drag to select,
+	 * Ctrl+C copies, Space saves to file, Esc cancels). */
+	bool shot_active;
+	bool shot_dragging;
+	double shot_sx, shot_sy; // selection start, layout coords
+	struct amber_output *shot_output;
+	struct wlr_scene_rect *shot_dim;
+	struct wlr_scene_rect *shot_borders[4];
+	char *screenshot_dir; // config override, NULL = default
 	struct amber_toplevel *grabbed_toplevel;
 	double grab_x, grab_y;
 	struct wlr_box grab_geobox;
@@ -756,6 +772,8 @@ enum amber_binding_id {
 	AMBER_BINDING_COLUMN_WIDTH,
 	AMBER_BINDING_TOGGLE_FLOAT,
 	AMBER_BINDING_TOGGLE_FULLSCREEN,
+	AMBER_BINDING_SCREENSHOT,
+	AMBER_BINDING_SCREENSHOT_REGION,
 };
 
 struct amber_binding {
@@ -825,6 +843,8 @@ static const struct amber_binding_defaults amber_default_bindings[] = {
 	{ "SUPER+EQUAL", AMBER_BINDING_COLUMN_WIDTH, 1 },
 	{ "SUPER+V", AMBER_BINDING_TOGGLE_FLOAT, 0 },
 	{ "SUPER+F", AMBER_BINDING_TOGGLE_FULLSCREEN, 0 },
+	{ "Print", AMBER_BINDING_SCREENSHOT_REGION, 0 },
+	{ "SHIFT+Print", AMBER_BINDING_SCREENSHOT, 0 },
 };
 
 #define AMBER_DEFAULT_BINDING_COUNT \
@@ -912,6 +932,10 @@ static bool parse_action(struct amber_server *server,
 		b->id = AMBER_BINDING_TOGGLE_FLOAT;
 	} else if (strcmp(buf, "toggle-fullscreen") == 0) {
 		b->id = AMBER_BINDING_TOGGLE_FULLSCREEN;
+	} else if (strcmp(buf, "screenshot") == 0) {
+		b->id = AMBER_BINDING_SCREENSHOT_REGION;
+	} else if (strcmp(buf, "screenshot-screen") == 0) {
+		b->id = AMBER_BINDING_SCREENSHOT;
 	} else if (strcmp(buf, "workspace") == 0 || strcmp(buf,
 				"move-to-workspace") == 0) {
 		int n = sp ? atoi(sp + 1) : 0;
@@ -1077,6 +1101,10 @@ static void config_load(struct amber_server *server) {
 			free(server->wallpaper_path);
 			server->wallpaper_path = *value == '\0'
 				? NULL : expand_path(value);
+		} else if (strcmp(key, "screenshot-dir") == 0) {
+			free(server->screenshot_dir);
+			server->screenshot_dir = *value == '\0'
+				? NULL : expand_path(value);
 		} else if (strcmp(key, "wallpaper-mode") == 0) {
 			if (strcmp(value, "cover") == 0) {
 				server->wallpaper_mode = AMBER_WALLPAPER_COVER;
@@ -1115,6 +1143,9 @@ static void config_load(struct amber_server *server) {
 		config_set_defaults(server);
 	}
 }
+
+static void screenshot_start_region(struct amber_server *server);
+static void screenshot_full_screen(struct amber_server *server);
 
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
@@ -1166,7 +1197,467 @@ static void binding_exec(struct amber_server *server,
 	case AMBER_BINDING_TOGGLE_FULLSCREEN:
 		toggle_focused_fullscreen(server);
 		break;
+	case AMBER_BINDING_SCREENSHOT_REGION:
+		screenshot_start_region(server);
+		break;
+	case AMBER_BINDING_SCREENSHOT:
+		screenshot_full_screen(server);
+		break;
 	}
+}
+
+/* ==================== Built-in screenshots (niri-style) ==================
+ * Print enters region mode: drag a rectangle, then
+ *   Ctrl+C  copy the image to the clipboard (image/png)
+ *   Space / Enter  save to ~/Pictures/Screenshots and copy
+ *   Esc / right click  cancel
+ * Shift+Print captures the whole screen instantly. */
+
+struct amber_png_mem {
+	unsigned char *data;
+	size_t len;
+};
+
+/* Payload of the clipboard source; replaced on every copy, freed when
+ * the source is destroyed or a new one takes its place. */
+static struct amber_png_mem shot_clipboard = {0};
+
+static void screenshot_png_write(void *ctx, void *data, int size) {
+	struct amber_png_mem *mem = ctx;
+	unsigned char *grown = realloc(mem->data, mem->len + size);
+	if (grown == NULL) {
+		return;
+	}
+	memcpy(grown + mem->len, data, size);
+	mem->data = grown;
+	mem->len += size;
+}
+
+static bool mkdir_p(const char *path) {
+	char buf[512];
+	size_t len = strlen(path);
+	if (len == 0 || len >= sizeof(buf)) {
+		return false;
+	}
+	memcpy(buf, path, len + 1);
+	for (char *p = buf + 1; *p != '\0'; p++) {
+		if (*p != '/') {
+			continue;
+		}
+		*p = '\0';
+		if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+			return false;
+		}
+		*p = '/';
+	}
+	if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+		return false;
+	}
+	return true;
+}
+
+static const char *screenshot_dir(struct amber_server *server) {
+	if (server->screenshot_dir != NULL) {
+		return server->screenshot_dir;
+	}
+	static char fallback[400];
+	const char *home = getenv("HOME");
+	snprintf(fallback, sizeof(fallback), "%s/Pictures/Screenshots",
+		home ? home : ".");
+	return fallback;
+}
+
+static void clipboard_send(struct wlr_data_source *source,
+		const char *mime_type, int32_t fd) {
+	if (shot_clipboard.data != NULL) {
+		ssize_t rc = write(fd, shot_clipboard.data,
+			(ssize_t)shot_clipboard.len);
+		(void)rc;
+	}
+	close(fd);
+}
+
+static void clipboard_destroy(struct wlr_data_source *source) {
+	free(shot_clipboard.data);
+	shot_clipboard.data = NULL;
+	shot_clipboard.len = 0;
+	free(source);
+}
+
+static const struct wlr_data_source_impl clipboard_impl = {
+	.send = clipboard_send,
+	.destroy = clipboard_destroy,
+};
+
+static void clipboard_set(struct amber_server *server,
+		struct amber_png_mem png) {
+	free(shot_clipboard.data);
+	shot_clipboard = png;
+
+	struct wlr_data_source *source = calloc(1, sizeof(*source));
+	source->impl = &clipboard_impl;
+	const char *mime = "image/png";
+	char *copy = strdup(mime);
+	char **slot = wl_array_add(&source->mime_types, sizeof(copy));
+	if (slot != NULL) {
+		*slot = copy;
+	}
+
+	wlr_seat_set_selection(server->seat, source,
+		wl_display_next_serial(server->wl_display));
+}
+
+/* Render the given output-local box from the scene graph into fresh RGBA
+ * memory (8 bit/channel). The whole output frame is composed offscreen via
+ * wlr_scene_output_build_state(), then cropped. */
+static unsigned char *screenshot_capture(struct amber_server *server,
+		struct amber_output *output, struct wlr_box lbox) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	int ow = wlr_output->width, oh = wlr_output->height;
+	if (ow <= 0 || oh <= 0 || lbox.width <= 0 || lbox.height <= 0 ||
+			lbox.x < 0 || lbox.y < 0 ||
+			lbox.x + lbox.width > ow || lbox.y + lbox.height > oh) {
+		return NULL;
+	}
+	struct wlr_scene_output *scene_output =
+		wlr_scene_get_scene_output(server->scene, wlr_output);
+	if (scene_output == NULL) {
+		return NULL;
+	}
+
+	/* An extra (invisible) full-output node defeats direct scanout so
+	 * the scene is guaranteed to be composed into the capture buffer. */
+	float transparent[4] = {0, 0, 0, 0};
+	struct wlr_scene_rect *guard = wlr_scene_rect_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+		ow, oh, transparent);
+
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_enabled(&state, true);
+	bool ok = wlr_scene_output_build_state(scene_output, &state, NULL);
+	if (ok) {
+		/* Presenting the freshly rendered frame is visually a no-op
+		 * and gives us ownership semantics identical to a normal
+		 * frame commit. */
+		ok = wlr_output_commit_state(wlr_output, &state);
+	}
+	wlr_scene_node_destroy(&guard->node);
+	if (!ok || !(state.committed & WLR_OUTPUT_STATE_BUFFER) ||
+			state.buffer == NULL) {
+		wlr_output_state_finish(&state);
+		return NULL;
+	}
+
+	unsigned char *result = NULL;
+	struct wlr_texture *texture =
+		wlr_texture_from_buffer(server->renderer, state.buffer);
+	if (texture != NULL) {
+		uint32_t fmt = wlr_texture_preferred_read_format(texture);
+		uint32_t stride = (uint32_t)texture->width * 4;
+		void *raw = malloc(stride * texture->height);
+		if (raw != NULL) {
+			struct wlr_texture_read_pixels_options ropts = {
+				.format = fmt,
+				.data = raw,
+				.stride = stride,
+				.src_box = { .x = 0, .y = 0,
+					.width = texture->width,
+					.height = texture->height },
+			};
+			if (wlr_texture_read_pixels(texture, &ropts)) {
+				result = malloc(
+					(size_t)lbox.width * lbox.height * 4);
+				for (int row = 0; row < lbox.height; row++) {
+					unsigned char *src = (unsigned char *)raw +
+						(size_t)(lbox.y + row) * stride +
+						(size_t)lbox.x * 4;
+					unsigned char *dst = result +
+						(size_t)row * lbox.width * 4;
+					switch (fmt) {
+					case DRM_FORMAT_ABGR8888: // bytes R,G,B,A
+						memcpy(dst, src,
+							(size_t)lbox.width * 4);
+						break;
+					case DRM_FORMAT_XRGB8888:
+					case DRM_FORMAT_ARGB8888:
+						for (int x = 0; x < lbox.width; x++) {
+							dst[x*4+0] = src[x*4+2];
+							dst[x*4+1] = src[x*4+1];
+							dst[x*4+2] = src[x*4+0];
+							dst[x*4+3] = fmt ==
+								DRM_FORMAT_ARGB8888 ?
+								src[x*4+3] : 255;
+						}
+						break;
+					default: // XRGB-ish fallbacks
+						for (int x = 0; x < lbox.width; x++) {
+							dst[x*4+0] = src[x*4+3];
+							dst[x*4+1] = src[x*4+2];
+							dst[x*4+2] = src[x*4+1];
+							dst[x*4+3] = 255;
+						}
+						break;
+					}
+				}
+			}
+			free(raw);
+		}
+		wlr_texture_destroy(texture);
+	}
+	wlr_output_state_finish(&state);
+	return result;
+}
+
+static struct amber_png_mem screenshot_encode(unsigned char *rgba,
+		int width, int height) {
+	struct amber_png_mem png = {0};
+	stbi_write_png_compression_level = 3;
+	stbi_write_png_to_func(screenshot_png_write, &png,
+		width, height, 4, rgba, width * 4);
+	return png;
+}
+
+static void screenshot_hide_ui(struct amber_server *server) {
+	if (server->shot_dim != NULL) {
+		wlr_scene_node_destroy(&server->shot_dim->node);
+		server->shot_dim = NULL;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_borders[i] != NULL) {
+			wlr_scene_node_destroy(&server->shot_borders[i]->node);
+			server->shot_borders[i] = NULL;
+		}
+	}
+	server->shot_active = false;
+	server->shot_dragging = false;
+	server->shot_output = NULL;
+	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
+		server->cursor_mode = AMBER_CURSOR_PASSTHROUGH;
+	}
+}
+
+static void screenshot_cancel(struct amber_server *server) {
+	screenshot_hide_ui(server);
+	wlr_log(WLR_INFO, "screenshot canceled");
+}
+
+static struct wlr_box screenshot_selection_box(struct amber_server *server) {
+	double cx = server->cursor->x - server->shot_output->layout_box.x;
+	double cy = server->cursor->y - server->shot_output->layout_box.y;
+	int x1 = (int)server->shot_sx, y1 = (int)server->shot_sy;
+	int x2 = (int)cx, y2 = (int)cy;
+	if (x2 < x1) { int t = x1; x1 = x2; x2 = t; }
+	if (y2 < y1) { int t = y1; y1 = y2; y2 = t; }
+	struct wlr_box out = { .x = x1, .y = y1,
+		.width = x2 - x1 + 1, .height = y2 - y1 + 1 };
+	// Clamp to the output.
+	if (out.x < 0) { out.width += out.x; out.x = 0; }
+	if (out.y < 0) { out.height += out.y; out.y = 0; }
+	struct wlr_box lim = server->shot_output->layout_box;
+	if (out.x + out.width > lim.width) {
+		out.width = lim.width - out.x;
+	}
+	if (out.y + out.height > lim.height) {
+		out.height = lim.height - out.y;
+	}
+	if (out.width < 1 || out.height < 1) {
+		out.width = out.height = 0;
+	}
+	return out;
+}
+
+static void screenshot_ui_update(struct amber_server *server) {
+	if (!server->shot_active || server->shot_output == NULL) {
+		return;
+	}
+	struct wlr_box sel = screenshot_selection_box(server);
+	if (sel.width < 1) {
+		for (int i = 0; i < 4; i++) {
+			wlr_scene_node_set_enabled(
+				&server->shot_borders[i]->node, false);
+		}
+		return;
+	}
+	float border[4] = {1.00f, 0.70f, 0.13f, 0.9f}; // amber
+	int bw = 2;
+	struct wlr_scene_rect *r[4] = {
+		server->shot_borders[0], server->shot_borders[1],
+		server->shot_borders[2], server->shot_borders[3],
+	};
+	wlr_scene_rect_set_color(r[0], border);
+	wlr_scene_rect_set_size(r[0], sel.width + bw*2, bw);
+	wlr_scene_node_set_position(&r[0]->node, sel.x - bw, sel.y - bw);
+	wlr_scene_node_set_enabled(&r[0]->node, true);
+
+	wlr_scene_rect_set_size(r[1], sel.width + bw*2, bw);
+	wlr_scene_node_set_position(&r[1]->node, sel.x - bw,
+		sel.y + sel.height);
+	wlr_scene_node_set_enabled(&r[1]->node, true);
+
+	wlr_scene_rect_set_size(r[2], bw, sel.height);
+	wlr_scene_node_set_position(&r[2]->node, sel.x - bw, sel.y);
+	wlr_scene_node_set_enabled(&r[2]->node, true);
+
+	wlr_scene_rect_set_size(r[3], bw, sel.height);
+	wlr_scene_node_set_position(&r[3]->node, sel.x + sel.width, sel.y);
+	wlr_scene_node_set_enabled(&r[3]->node, true);
+}
+
+static void screenshot_start_region(struct amber_server *server) {
+	struct amber_output *output = active_output(server);
+	if (output == NULL) {
+		return;
+	}
+	if (server->shot_active) {
+		screenshot_cancel(server); // re-press restarts cleanly
+	}
+	server->shot_output = output;
+	server->shot_sx = server->cursor->x - output->layout_box.x;
+	server->shot_sy = server->cursor->y - output->layout_box.y;
+	server->shot_dragging = true;
+
+	float dim[4] = {0, 0, 0, 0.35f};
+	server->shot_dim = wlr_scene_rect_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+		output->layout_box.width, output->layout_box.height, dim);
+
+	float invisible[4] = {1.00f, 0.70f, 0.13f, 0.9f};
+	for (int i = 0; i < 4; i++) {
+		server->shot_borders[i] = wlr_scene_rect_create(
+			output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+			2, 2, invisible);
+	}
+	server->shot_active = true;
+	server->cursor_mode = AMBER_CURSOR_SCREENSHOT;
+	screenshot_ui_update(server);
+	wlr_log(WLR_INFO, "screenshot: drag to select — Ctrl+C copy, "
+		"Space save, Esc cancel");
+}
+
+static void screenshot_full_screen(struct amber_server *server) {
+	struct amber_output *output = active_output(server);
+	if (output == NULL) {
+		return;
+	}
+	struct wlr_box full = output->layout_box;
+	full.x = full.y = 0;
+	unsigned char *rgba = screenshot_capture(server, output, full);
+	if (rgba == NULL) {
+		wlr_log(WLR_ERROR, "screenshot failed");
+		return;
+	}
+	struct amber_png_mem png = screenshot_encode(rgba,
+		full.width, full.height);
+	free(rgba);
+	if (png.data == NULL) {
+		wlr_log(WLR_ERROR, "screenshot PNG encoding failed");
+		return;
+	}
+	mkdir_p(screenshot_dir(server));
+	char ts[32];
+	time_t now = time(NULL);
+	strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&now));
+	char path[560];
+	snprintf(path, sizeof(path), "%s/amberwm-%s.png",
+		screenshot_dir(server), ts);
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
+	} else {
+		fwrite(png.data, 1, png.len, f);
+		fclose(f);
+		wlr_log(WLR_INFO, "saved %s (%zu bytes)", path, png.len);
+	}
+	clipboard_set(server, png);
+}
+
+static void screenshot_finish(struct amber_server *server, bool save_file) {
+	struct wlr_box sel = screenshot_selection_box(server);
+	if (sel.width < 1 || sel.height < 1) {
+		screenshot_cancel(server);
+		return;
+	}
+	unsigned char *rgba = screenshot_capture(server, server->shot_output,
+		sel);
+	screenshot_hide_ui(server);
+	if (rgba == NULL) {
+		wlr_log(WLR_ERROR, "screenshot failed");
+		return;
+	}
+	struct amber_png_mem png = screenshot_encode(rgba,
+		sel.width, sel.height);
+	free(rgba);
+	if (png.data == NULL) {
+		wlr_log(WLR_ERROR, "screenshot PNG encoding failed");
+		return;
+	}
+	if (save_file) {
+		mkdir_p(screenshot_dir(server));
+		char ts[32];
+		time_t now = time(NULL);
+		strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&now));
+		char path[560];
+		snprintf(path, sizeof(path), "%s/amberwm-%s.png",
+			screenshot_dir(server), ts);
+		FILE *f = fopen(path, "wb");
+		if (f == NULL) {
+			wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
+		} else {
+			fwrite(png.data, 1, png.len, f);
+			fclose(f);
+			wlr_log(WLR_INFO, "saved %s (%zux%zu px)",
+				path, (size_t)sel.width, (size_t)sel.height);
+		}
+	}
+	clipboard_set(server, png);
+}
+
+static void screenshot_motion(struct amber_server *server) {
+	screenshot_ui_update(server);
+}
+
+static void screenshot_button(struct amber_server *server,
+		const struct wlr_pointer_button_event *event) {
+	if (event->button == BTN_LEFT) {
+		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+			/* Start a fresh selection where the cursor sits. */
+			server->shot_sx = server->cursor->x -
+				server->shot_output->layout_box.x;
+			server->shot_sy = server->cursor->y -
+				server->shot_output->layout_box.y;
+			server->shot_dragging = true;
+			screenshot_ui_update(server);
+		} else {
+			server->shot_dragging = false;
+		}
+	} else if (event->button == BTN_RIGHT) {
+		screenshot_cancel(server);
+	}
+}
+
+static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
+		const xkb_keysym_t *syms, int nsyms) {
+	for (int i = 0; i < nsyms; i++) {
+		xkb_keysym_t sym = syms[i];
+		if (sym == XKB_KEY_Escape) {
+			screenshot_cancel(server);
+			return true;
+		}
+		bool ctrl = modifiers & WLR_MODIFIER_CTRL;
+		if ((ctrl && (sym == XKB_KEY_c || sym == XKB_KEY_C)) &&
+				server->shot_dragging == false) {
+			screenshot_finish(server, false);
+			return true;
+		}
+		if ((sym == XKB_KEY_space || sym == XKB_KEY_Return ||
+				sym == XKB_KEY_KP_Enter) &&
+				server->shot_dragging == false) {
+			screenshot_finish(server, true);
+			return true;
+		}
+	}
+	return true; // swallow all keys while selecting
 }
 
 static void keyboard_handle_key(
@@ -1190,6 +1681,11 @@ static void keyboard_handle_key(
 		uint32_t modifiers =
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
+		if (server->shot_active) {
+			/* Region screenshot grabs all keys while active. */
+			screenshot_key(server, modifiers, syms, nsyms);
+			return;
+		}
 		for (int i = 0; i < nsyms && !handled; i++) {
 			for (size_t j = 0; j < server->binding_count; j++) {
 				const struct amber_binding *binding =
@@ -1512,6 +2008,9 @@ static void process_cursor_motion(struct amber_server *server, uint32_t time) {
 	} else if (server->cursor_mode == AMBER_CURSOR_RESIZE) {
 		process_cursor_resize(server);
 		return;
+	} else if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
+		screenshot_motion(server);
+		return;
 	}
 
 	/* Otherwise, find the toplevel under the pointer and send the event along. */
@@ -1588,6 +2087,11 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
+
+	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
+		screenshot_button(server, event);
+		return;
+	}
 
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
 		if (server->cursor_mode != AMBER_CURSOR_PASSTHROUGH) {
@@ -1688,6 +2192,13 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 
 static void arrange_layers(struct amber_output *output);
 static void output_update_geometry(struct amber_output *output);
+static void screenshot_start_region(struct amber_server *server);
+static void screenshot_full_screen(struct amber_server *server);
+static void screenshot_motion(struct amber_server *server);
+static void screenshot_button(struct amber_server *server,
+	const struct wlr_pointer_button_event *event);
+static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
+	const xkb_keysym_t *syms, int nsyms);
 
 /*
  * Built-in wallpaper.
