@@ -110,6 +110,8 @@ enum amber_anim_kind {
 	ANIM_WS_SLIDE    // horizontal slide between two workspace trees
 };
 
+#define ANIM_TICK_MS 16 // animation timer cadence (~60 updates/sec)
+
 /* A single event-loop timer drives every active animation at frame rate
  * and disarms itself when the list drains (no idle wakeups). */
 struct amber_animation {
@@ -312,6 +314,10 @@ struct amber_toplevel {
 	/* SceneFX: optimized-blur node behind this window's content, living
 	 * inside the window tree so it follows moves for free. */
 	struct wlr_scene_optimized_blur *blur_node;
+	/* The scene node displaying this window's main surface buffer;
+	 * cached at map so close animations can grab the scene's own
+	 * locked copy of the last frame at unmap time. */
+	struct wlr_scene_buffer *scene_buffer;
 	/* Drop shadow (floating windows only; static scene node, so it is
 	 * free once placed). */
 	struct wlr_scene_shadow *shadow_node;
@@ -3433,7 +3439,13 @@ static int animation_tick(void *data) {
 		active = true;
 	}
 	server->anim_timer_armed = active;
-	return active ? 16 : 0; // ms until next tick; 0 disarms
+	/* libwayland 1.26 ignores the callback's positive return value
+	 * (rearm-by-return regressed), so rearm explicitly instead. */
+	if (active && server->anim_source != NULL) {
+		wl_event_source_timer_update(server->anim_source,
+			ANIM_TICK_MS);
+	}
+	return 0; // 0 would normally disarm; handled above
 }
 
 static void animations_kick(struct amber_server *server) {
@@ -3476,14 +3488,14 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
 	animations_kick(server);
 }
 
-#define LAMP_STRIP_COUNT 24 // dense enough to look curved, cheap on CPU
-
 /* KDE magic-lamp close effect. wlroots emits surface::unmap BEFORE
  * swapping in the empty commit, so the last displayed buffer + logical
  * size are still valid right here: lock the buffer (keeps pixels alive
  * no matter how the client dies), slice it into horizontal strips as
  * scene buffers above every layer, and let animation_lamp_tick drive
  * each strip along the bezier path to the bottom-center target. */
+#define LAMP_STRIP_COUNT 24 // dense enough to look curved, cheap on CPU
+
 static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	struct amber_server *server = toplevel->server;
 	struct amber_output *output = toplevel->output;
@@ -3501,10 +3513,23 @@ static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	int win_x = toplevel->scene_tree->node.x;
 	int win_y = toplevel->scene_tree->node.y;
 
+	/* The scene graph holds its OWN lock on the last displayed buffer
+	 * and only clears it on the commit that follows this unmap — so
+	 * reading scene_buffer->buffer here is race-free, unlike the
+	 * surface's own buffer pointers which the client teardown may
+	 * have already freed. */
+	struct wlr_buffer *snap_buf = toplevel->scene_buffer != NULL
+		? toplevel->scene_buffer->buffer : NULL;
+	if (snap_buf == NULL && toplevel->xdg_toplevel->base->surface != NULL) {
+		struct wlr_surface *ws =
+			toplevel->xdg_toplevel->base->surface;
+		snap_buf = ws->buffer != NULL ? &ws->buffer->base
+			: ws->current.buffer;
+	}
 	struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-	if (surface == NULL || surface->current.buffer == NULL ||
-			surface->current.width < 1 ||
-			surface->current.height < 1) {
+	int surf_w = surface ? surface->current.width : 0;
+	int surf_h = surface ? surface->current.height : 0;
+	if (snap_buf == NULL || surf_w < 1 || surf_h < 1) {
 		return; // nothing worth animating (empty/dead buffer)
 	}
 
@@ -3525,7 +3550,7 @@ static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	anim->start_usec = anim_now_usec();
 	anim->duration_ms = server->lamp_close_duration_ms;
 
-	anim->snapshot = surface->current.buffer;
+	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
 
 	anim->strip_count = LAMP_STRIP_COUNT;
@@ -4210,6 +4235,21 @@ static void session_lock_new_lock(struct wl_listener *listener, void *data) {
 	wlr_session_lock_v1_send_locked(lock);
 }
 
+/* Cache the node that displays the window's main surface buffer (a
+ * direct buffer child of the toplevel tree; popups live in their own
+ * subtrees and blur/shadow are not buffer nodes). */
+static void toplevel_cache_scene_buffer(struct amber_toplevel *toplevel) {
+	toplevel->scene_buffer = NULL;
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &toplevel->scene_tree->children, link) {
+		if (node->type == WLR_SCENE_NODE_BUFFER) {
+			toplevel->scene_buffer =
+				wlr_scene_buffer_from_node(node);
+			break;
+		}
+	}
+}
+
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	struct amber_toplevel *toplevel = wl_container_of(listener, toplevel, map);
@@ -4249,6 +4289,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 		workspace_arrange(toplevel_workspace(toplevel));
 	}
 	toplevel_apply_fx(toplevel);
+	toplevel_cache_scene_buffer(toplevel);
 	animation_start_open(toplevel);
 	toplevel_foreign_init(toplevel);
 	ipc_broadcast(server); // occupancy changed
