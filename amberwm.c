@@ -3438,10 +3438,11 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 		}
 
 		/* Horizontal: per-row squeeze (the funnel feel — bottom rows
-		 * pinch first). At 24 strips the width jumps between neighbors
-		 * reached ~15px, reading as "connected cubes" on the sides;
-		 * at 192 strips steps stay ~2px, lost in the motion. */
-		float bow = sinf(tc * pi) * 0.35f * anim->win_w;
+		 * pinch first). Bow amplitude 0.25: the sideways whip stays
+		 * readable while its per-row drift keeps silhouette steps
+		 * ~3px at 128 strips (24 strips + 0.35 bow produced the
+		 * ~15px "connected cubes" this replaced). */
+		float bow = sinf(tc * pi) * 0.25f * anim->win_w;
 		float xc = anim->win_x + anim->win_w * 0.5f;
 		float bxc = lamp_bezier(xc, xc + bow,
 			anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
@@ -3691,7 +3692,7 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
  * no matter how the client dies), slice it into horizontal strips as
  * scene buffers above every layer, and let animation_lamp_tick drive
  * each strip along the bezier path to the bottom-center target. */
-#define LAMP_STRIP_COUNT 192 // dense: per-row side steps stay ~2px
+#define LAMP_STRIP_COUNT 128 // dense: per-row side steps stay ~3px
 
 static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	struct amber_server *server = toplevel->server;
