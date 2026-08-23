@@ -227,6 +227,8 @@ struct amber_server {
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
+	char *cursor_theme; // config cursor-theme= (XCURSOR_THEME default)
+	int cursor_size;    // config cursor-size= (XCURSOR_SIZE default)
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
 	struct wl_listener cursor_button;
@@ -1498,6 +1500,11 @@ static void config_load(struct amber_server *server) {
 	server->ws_slide_enabled = true;
 	server->ws_slide_duration_ms = 250;
 	server->wobbly_windows = true; // Compiz-style spring grid on drag
+	const char *env_theme = getenv("XCURSOR_THEME");
+	server->cursor_theme = env_theme != NULL ? strdup(env_theme) : NULL;
+	const char *env_size = getenv("XCURSOR_SIZE");
+	int cs = env_size != NULL ? atoi(env_size) : 24;
+	server->cursor_size = cs >= 8 && cs <= 128 ? cs : 24;
 	wl_list_init(&server->animations);
 	wl_list_init(&server->window_rules);
 
@@ -1611,6 +1618,14 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "wobbly-windows") == 0) {
 			server->wobbly_windows =
 				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "cursor-theme") == 0) {
+			free(server->cursor_theme);
+			server->cursor_theme = *value == '\0'
+				? NULL : strdup(value);
+		} else if (strcmp(key, "cursor-size") == 0) {
+			int v = atoi(value);
+			server->cursor_size =
+				v >= 8 && v <= 128 ? v : 24;
 		} else if (strcmp(key, "blur-radius") == 0) {
 			server->blur_radius = atoi(value);
 			if (server->blur_radius < 0) {
@@ -1677,6 +1692,22 @@ static void config_reload(struct amber_server *server) {
 	server->binding_count = 0;
 
 	config_load(server);
+
+	/* Cursor theme/size may have changed: rebuild the manager and
+	 * reapply the image; future clients inherit the new env. */
+	wlr_xcursor_manager_destroy(server->cursor_mgr);
+	server->cursor_mgr = wlr_xcursor_manager_create(
+		server->cursor_theme, server->cursor_size);
+	if (server->cursor != NULL) {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			"default");
+	}
+	if (server->cursor_theme != NULL) {
+		setenv("XCURSOR_THEME", server->cursor_theme, 1);
+	}
+	char csizebuf[16];
+	snprintf(csizebuf, sizeof(csizebuf), "%d", server->cursor_size);
+	setenv("XCURSOR_SIZE", csizebuf, 1);
 
 	wlr_scene_set_blur_data(server->scene, 3, server->blur_radius,
 		0.02f, 0.90f, 0.90f, 1.10f);
@@ -5113,6 +5144,14 @@ int main(int argc, char *argv[]) {
 	/* User config: ~/.config/amberwm/amberwm.cfg (or $AMBER_CONFIG). */
 	server.terminal_cmd = NULL;
 	config_load(&server);
+
+	/* Clients inherit the cursor theme via the environment. */
+	if (server.cursor_theme != NULL) {
+		setenv("XCURSOR_THEME", server.cursor_theme, 1);
+	}
+	char csizebuf[16];
+	snprintf(csizebuf, sizeof(csizebuf), "%d", server.cursor_size);
+	setenv("XCURSOR_SIZE", csizebuf, 1);
 	wlr_scene_set_blur_data(server.scene, 3, server.blur_radius,
 		0.02f, 0.90f, 0.90f, 1.10f);
 	if (server.terminal_cmd == NULL) {
@@ -5140,7 +5179,8 @@ int main(int argc, char *argv[]) {
 	 * Xcursor themes to source cursor images from and makes sure that cursor
 	 * images are available at all scale factors on the screen (necessary for
 	 * HiDPI support). */
-	server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
+	server.cursor_mgr = wlr_xcursor_manager_create(
+		server.cursor_theme, server.cursor_size);
 
 	/*
 	 * wlr_cursor *only* displays an image on screen. It does not move around
