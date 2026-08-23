@@ -4933,9 +4933,28 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 	free(popup);
 }
 
+/* Find the scene tree of a tracked layer surface so popups anchored
+ * through zwlr_layer_shell_v1.get_popup can be placed relative to their
+ * real parent panel; NULL when untracked/unmapped. */
+static struct wlr_scene_tree *amber_layer_parent_tree(
+		struct amber_server *server, struct wlr_layer_surface_v1 *ls) {
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct amber_layer_surface *layer;
+		wl_list_for_each(layer, &output->layers[ls->current.layer], link) {
+			if (layer->layer_surface == ls && layer->scene_layer != NULL) {
+				return layer->scene_layer->tree;
+			}
+		}
+	}
+	return NULL;
+}
+
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	/* This event is raised when a client creates a new popup. */
 	struct wlr_xdg_popup *xdg_popup = data;
+	struct amber_server *server =
+		wl_container_of(listener, server, new_xdg_popup);
 
 	struct amber_popup *popup = calloc(1, sizeof(*popup));
 	popup->xdg_popup = xdg_popup;
@@ -4944,10 +4963,39 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	 * wlroots scene graph provides a helper for this, but to use it we must
 	 * provide the proper parent scene node of the xdg popup. To enable this,
 	 * we always set the user data field of xdg_surfaces to the corresponding
-	 * scene node. */
-	struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
-	assert(parent != NULL);
-	struct wlr_scene_tree *parent_tree = parent->data;
+	 * scene node.
+	 *
+	 * Popups parented through zwlr_layer_shell_v1.get_popup (panel tooltips
+	 * and menus) have no xdg parent; on wlroots 0.20 their ->parent is even
+	 * NULL. try_from(NULL) segfaults the whole session (seen with noctalia),
+	 * so resolve an anchor defensively and only dismiss the popup when no
+	 * sane placement target exists. */
+	struct wlr_xdg_surface *parent = xdg_popup->parent ?
+		wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent) : NULL;
+
+	struct wlr_scene_tree *parent_tree = NULL;
+	if (parent != NULL) {
+		parent_tree = parent->data;
+	} else {
+		struct wlr_layer_surface_v1 *ls = xdg_popup->parent ?
+			wlr_layer_surface_v1_try_from_wlr_surface(
+				xdg_popup->parent) : NULL;
+		if (ls != NULL) {
+			parent_tree = amber_layer_parent_tree(server, ls);
+		}
+		if (parent_tree == NULL) {
+			struct amber_output *output = active_output(server);
+			if (output != NULL) {
+				parent_tree =
+					output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
+			}
+		}
+	}
+	if (parent_tree == NULL) {
+		wlr_xdg_popup_destroy(xdg_popup);
+		free(popup);
+		return;
+	}
 	xdg_popup->base->data = wlr_scene_xdg_surface_create(parent_tree, xdg_popup->base);
 
 	popup->commit.notify = xdg_popup_commit;
