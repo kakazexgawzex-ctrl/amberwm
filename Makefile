@@ -11,7 +11,7 @@ CFLAGS := -g -O2 -Werror -march=x86-64 -mtune=generic \
           -I. -DWLR_USE_UNSTABLE
 LDLIBS := $(shell $(PKG_CONFIG) --libs $(PKGS))
 
-all: amberwm
+all: amberwm ambermsg
 
 wlr-layer-shell-unstable-v1-protocol.h: protocols/wlr-layer-shell-unstable-v1.xml
 	wayland-scanner server-header $< $@
@@ -22,7 +22,10 @@ amberwm.o: amberwm.c wlr-layer-shell-unstable-v1-protocol.h
 amberwm: amberwm.o
 	$(CC) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
+ambermsg: ambermsg.c
+	$(CC) -g -O2 -Werror -march=x86-64 -mtune=generic $< -o $@
+
 clean:
-	rm -f amberwm amberwm.o wlr-layer-shell-unstable-v1-protocol.h
+	rm -f amberwm ambermsg amberwm.o wlr-layer-shell-unstable-v1-protocol.h
 
 .PHONY: all clean
