@@ -20,6 +20,7 @@
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/interfaces/wlr_buffer.h>
+#include <wlr/types/wlr_ext_workspace_v1.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
@@ -218,6 +219,11 @@ struct amber_server {
 	/* Foreign toplevel (taskbars/docks enumerate + control windows). */
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_mgr;
 
+	/* ext-workspace-v1: bars like Noctalia render + switch workspaces. */
+	struct wlr_ext_workspace_manager_v1 *ext_ws_mgr;
+	struct wl_listener ext_ws_commit;
+	struct wl_listener ext_ws_destroy;
+
 	/* Session lock (swaylock & friends). */
 	struct wlr_session_lock_v1 *active_lock;
 	struct wl_list lock_surfaces; // amber_lock_surface.link
@@ -320,6 +326,10 @@ struct amber_output {
 	struct wl_list layers[4]; // amber_layer_surface.link, per zwlr_layer_shell_v1_layer
 	struct amber_workspace workspaces[AMBER_WORKSPACE_COUNT];
 	int active_workspace;
+	/* ext-workspace-v1 handles: one group + one handle per workspace,
+	 * so bars can show pills and switch on click. */
+	struct wlr_ext_workspace_group_handle_v1 *ext_group;
+	struct wlr_ext_workspace_handle_v1 *ext_ws[AMBER_WORKSPACE_COUNT];
 	struct wlr_scene_buffer *wallpaper_node;
 	/* Animation overlay: lamp-close snapshots + workspace slides render
 	 * here, above every layer. Created last => stacked on top. */
@@ -880,6 +890,25 @@ static void keyboard_handle_modifiers(
 		&keyboard->wlr_keyboard->modifiers);
 }
 
+/* Mirror the active-workspace change to ext-workspace-v1 consumers
+ * (Noctalia bar pills). old_index < 0 means "initial state only". */
+static void ext_workspace_sync_active(struct amber_output *output,
+		int old_index, int new_index) {
+	if (output->server->ext_ws_mgr == NULL) {
+		return;
+	}
+	if (old_index >= 0 && old_index < AMBER_WORKSPACE_COUNT &&
+			output->ext_ws[old_index] != NULL) {
+		wlr_ext_workspace_handle_v1_set_active(
+			output->ext_ws[old_index], false);
+	}
+	if (new_index >= 0 && new_index < AMBER_WORKSPACE_COUNT &&
+			output->ext_ws[new_index] != NULL) {
+		wlr_ext_workspace_handle_v1_set_active(
+			output->ext_ws[new_index], true);
+	}
+}
+
 static void workspace_switch(struct amber_output *output, int index) {
 	if (index < 0 || index >= AMBER_WORKSPACE_COUNT ||
 			index == output->active_workspace) {
@@ -900,6 +929,7 @@ static void workspace_switch(struct amber_output *output, int index) {
 		&output->workspaces[old_index];
 	struct amber_workspace *new = &output->workspaces[index];
 	output->active_workspace = index;
+	ext_workspace_sync_active(output, old_index, index);
 	workspace_arrange(new);
 	workspace_update_top_layer(output);
 	focus_workspace_topmost(server, new);
@@ -943,6 +973,30 @@ static void workspace_switch(struct amber_output *output, int index) {
 	wlr_scene_node_set_enabled(&old->tree->node, false);
 	wlr_scene_node_set_enabled(&new->tree->node, true);
 	ipc_broadcast(server);
+}
+
+/* A bar requested a workspace switch by handle; map it back to
+ * (output, index) and run the normal switch path. */
+static void server_ext_ws_commit(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, ext_ws_commit);
+	struct wlr_ext_workspace_v1_commit_event *event = data;
+	struct wlr_ext_workspace_v1_request *req, *tmp;
+	wl_list_for_each_safe(req, tmp, event->requests, link) {
+		if (req->type != WLR_EXT_WORKSPACE_V1_REQUEST_ACTIVATE ||
+				req->activate.workspace == NULL) {
+			continue;
+		}
+		struct amber_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+				if (output->ext_ws[i] ==
+						req->activate.workspace) {
+					workspace_switch(output, i);
+				}
+			}
+		}
+	}
 }
 
 static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
@@ -4606,6 +4660,27 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	output_update_geometry(output);
 }
 
+/* ext-workspace-v1 requires all group/workspace handles destroyed
+ * before the display tears down; also needed for outputs that never
+ * pass through output_destroy (direct wl_display_destroy at exit). */
+static void ext_workspace_release_output(struct amber_output *output) {
+	if (output->server->ext_ws_mgr == NULL) {
+		return;
+	}
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		if (output->ext_ws[i] != NULL) {
+			wlr_ext_workspace_handle_v1_destroy(
+				output->ext_ws[i]);
+			output->ext_ws[i] = NULL;
+		}
+	}
+	if (output->ext_group != NULL) {
+		wlr_ext_workspace_group_handle_v1_destroy(
+			output->ext_group);
+		output->ext_group = NULL;
+	}
+}
+
 static void output_destroy(struct wl_listener *listener, void *data) {
 	struct amber_output *output = wl_container_of(listener, output, destroy);
 
@@ -4626,6 +4701,7 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+	ext_workspace_release_output(output);
 	free(output);
 }
 
@@ -4850,6 +4926,35 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		output->workspaces[i].tree = NULL;
 		output->workspaces[i].output = output;
 		wl_list_init(&output->workspaces[i].toplevels);
+	}
+
+	/* Publish the 9 workspaces over ext-workspace-v1 so bars can
+	 * render and switch them (caps advertise ACTIVATE only — we do
+	 * not support client-driven create/remove). */
+	if (server->ext_ws_mgr != NULL) {
+		uint32_t ws_caps =
+			EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE;
+		output->ext_group = wlr_ext_workspace_group_handle_v1_create(
+			server->ext_ws_mgr, 0);
+		for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+			char id[16], name[16];
+			snprintf(id, sizeof(id), "amber-%d", i);
+			snprintf(name, sizeof(name), "%d", i + 1);
+			struct wlr_ext_workspace_handle_v1 *h =
+				wlr_ext_workspace_handle_v1_create(
+					server->ext_ws_mgr, id, ws_caps);
+			wlr_ext_workspace_handle_v1_set_name(h, name);
+			uint32_t coords[2] = {0, (uint32_t)i};
+			wlr_ext_workspace_handle_v1_set_coordinates(h,
+				coords, 2);
+			wlr_ext_workspace_handle_v1_set_group(h,
+				output->ext_group);
+			output->ext_ws[i] = h;
+		}
+		wlr_ext_workspace_group_handle_v1_output_enter(
+			output->ext_group, wlr_output);
+		ext_workspace_sync_active(output, -1,
+			output->active_workspace);
 	}
 
 	/* Sets up a listener for the frame event. */
@@ -5656,6 +5761,15 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&lock_mgr->events.new_lock,
 		&server.session_lock_new_lock);
 
+	/* ext-workspace-v1 for bars (Noctalia pills + click-to-switch). */
+	server.ext_ws_mgr = wlr_ext_workspace_manager_v1_create(
+		server.wl_display, 1);
+	if (server.ext_ws_mgr != NULL) {
+		server.ext_ws_commit.notify = server_ext_ws_commit;
+		wl_signal_add(&server.ext_ws_mgr->events.commit,
+			&server.ext_ws_commit);
+	}
+
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
@@ -5853,6 +5967,16 @@ int main(int argc, char *argv[]) {
 	free(server.wallpaper_path);
 	if (server.wallpaper_buffer != NULL) {
 		wlr_buffer_drop(server.wallpaper_buffer);
+	}
+	/* Outputs may still be alive here (backend not explicitly torn
+	 * down); ext-workspace handles must die before the display. */
+	if (server.ext_ws_mgr != NULL) {
+		/* wlroots asserts the commit listener is gone at teardown. */
+		wl_list_remove(&server.ext_ws_commit.link);
+	}
+	struct amber_output *out, *out_tmp;
+	wl_list_for_each_safe(out, out_tmp, &server.outputs, link) {
+		ext_workspace_release_output(out);
 	}
 	wl_display_destroy(server.wl_display);
 	return 0;
