@@ -107,7 +107,8 @@ struct amber_ipc_watcher {
 enum amber_anim_kind {
 	ANIM_OPEN,       // fade + slide-in of a live window
 	ANIM_LAMP_CLOSE, // magic-lamp suck-in of a closing window's snapshot
-	ANIM_WS_SLIDE    // horizontal slide between two workspace trees
+	ANIM_WS_SLIDE,   // horizontal slide between two workspace trees
+	ANIM_WOBBLE      // Compiz-style spring grid over a live dragged window
 };
 
 #define ANIM_TICK_MS 16 // animation timer cadence (~60 updates/sec)
@@ -131,6 +132,13 @@ struct amber_animation {
 	struct amber_output *output;
 	int win_x, win_y, win_w, win_h; // window rect at unmap (output-local)
 	int tgt_x, tgt_y;               // lamp target (bottom-center)
+	/* ANIM_WOBBLE: spring grid over a live dragged window. Reuses
+	 * strips[] (cells), strip_count, snapshot (locked live buffer),
+	 * toplevel (the live window), output, and start_usec (failsafe). */
+	int gx, gy, gw, gh;             // window rect at grab (output-local)
+	int cols, rows;                 // grid cell dimensions
+	float *px, *py, *vx, *vy;       // point state ((cols+1)*(rows+1))
+	bool wobble_released;           // button up: settle then finish
 	/* ANIM_WS_SLIDE: two workspace trees sliding horizontally. */
 	struct amber_workspace *ws_from, *ws_to;
 	int slide_dir;    // +1 = toward higher index (content moves left)
@@ -246,6 +254,7 @@ struct amber_server {
 	uint32_t lamp_close_duration_ms;
 	bool ws_slide_enabled; // workspace-switch horizontal slide
 	uint32_t ws_slide_duration_ms;
+	bool wobbly_windows; // Compiz-style spring grid on drag
 	struct wl_list animations; // amber_animation.link
 	struct wl_event_source *anim_source;
 	bool anim_timer_armed;
@@ -452,6 +461,10 @@ static void focus_nothing(struct amber_server *server) {
 static void focus_toplevel(struct amber_toplevel *toplevel);
 static void ipc_broadcast(struct amber_server *server);
 void animation_cancel_for(struct amber_toplevel *toplevel);
+void animation_start_wobble(struct amber_toplevel *toplevel);
+void animation_wobble_nudge(struct amber_toplevel *toplevel,
+	int dx, int dy);
+void animation_wobble_release(struct amber_toplevel *toplevel);
 static void toplevel_apply_fx(struct amber_toplevel *toplevel);
 struct amber_animation;
 static void animation_destroy(struct amber_server *server,
@@ -1480,6 +1493,7 @@ static void config_load(struct amber_server *server) {
 	server->lamp_close_duration_ms = 350; // KDE's ~350ms feel
 	server->ws_slide_enabled = true;
 	server->ws_slide_duration_ms = 250;
+	server->wobbly_windows = true; // Compiz-style spring grid on drag
 	wl_list_init(&server->animations);
 	wl_list_init(&server->window_rules);
 
@@ -1590,6 +1604,9 @@ static void config_load(struct amber_server *server) {
 			int v = atoi(value);
 			server->ws_slide_duration_ms =
 				v > 0 && v <= 1000 ? (uint32_t)v : 250;
+		} else if (strcmp(key, "wobbly-windows") == 0) {
+			server->wobbly_windows =
+				strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "blur-radius") == 0) {
 			server->blur_radius = atoi(value);
 			if (server->blur_radius < 0) {
@@ -2520,6 +2537,10 @@ static struct amber_toplevel *desktop_toplevel_at(
 
 static void reset_cursor_mode(struct amber_server *server) {
 	/* Reset the cursor mode to passthrough. */
+	if (server->cursor_mode == AMBER_CURSOR_MOVE &&
+			server->grabbed_toplevel != NULL) {
+		animation_wobble_release(server->grabbed_toplevel);
+	}
 	server->cursor_mode = AMBER_CURSOR_PASSTHROUGH;
 	server->grabbed_toplevel = NULL;
 }
@@ -2529,9 +2550,14 @@ static void process_cursor_move(struct amber_server *server) {
 	 * positions are local to the workspace tree, which sits at the
 	 * output's origin, so convert cursor layout coords -> local. */
 	struct amber_toplevel *toplevel = server->grabbed_toplevel;
+	int old_x = toplevel->scene_tree->node.x;
+	int old_y = toplevel->scene_tree->node.y;
 	wlr_scene_node_set_position(&toplevel->scene_tree->node,
 		server->cursor->x - toplevel->output->layout_box.x - server->grab_x,
 		server->cursor->y - toplevel->output->layout_box.y - server->grab_y);
+	animation_wobble_nudge(toplevel,
+		toplevel->scene_tree->node.x - old_x,
+		toplevel->scene_tree->node.y - old_y);
 }
 
 static void process_cursor_resize(struct amber_server *server) {
@@ -3311,6 +3337,19 @@ static void animation_destroy(struct amber_server *server,
 	case ANIM_LAMP_CLOSE:
 		animation_lamp_cleanup(anim);
 		break;
+	case ANIM_WOBBLE:
+		/* Visibility is restored regardless of `restore`: the real
+		 * node was hidden for the grid, and both teardown paths are
+		 * safe while the tree still exists. */
+		if (anim->tree != NULL) {
+			wlr_scene_node_set_enabled(&anim->tree->node, true);
+		}
+		animation_lamp_cleanup(anim);
+		free(anim->px);
+		free(anim->py);
+		free(anim->vx);
+		free(anim->vy);
+		break;
 	case ANIM_WS_SLIDE:
 		if (anim->ws_from != NULL && anim->ws_from->tree != NULL) {
 			wlr_scene_node_set_position(&anim->ws_from->tree->node,
@@ -3359,22 +3398,38 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 	/* Per-row helpers: progress exponent, smoothstep squeeze, and the
 	 * bowed bezier Y for a given normalized row position fy. */
 #define LAMP_T(fy) powf(p, 1.8f - 1.2f * (fy))
-	float bow = sinf(LAMP_T(0.5f) * pi) * 0.35f * anim->win_w;
+	/* Horizontal: ONE shared left/right edge pair for all strips,
+	 * driven by the near-bottom row's progress (fy=0.9, the fastest).
+	 * Per-strip widths would stair-step into the "connected cubes"
+	 * artifact; coupling the shared squeeze to the slow midline instead
+	 * made the effect read as a plain slide-down (wide sheet landing
+	 * first). The bottom row's clock keeps the funnel in sync with the
+	 * descent while every strip's edges stay on identical vertical
+	 * lines. */
+	float tc = LAMP_T(0.9f);
+	if (tc > 1.0f) {
+		tc = 1.0f;
+	}
+	float sc = tc * tc * (3.0f - 2.0f * tc);
+	float bow = sinf(tc * pi) * 0.35f * anim->win_w;
+	float xc = anim->win_x + anim->win_w * 0.5f;
+	float bxc = lamp_bezier(xc, xc + bow,
+		anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
+	bxc += (anim->tgt_x - bxc) * sc;
+	int w = (int)(anim->win_w * (1.0f - sc));
+	if (w < 1) {
+		w = 1;
+	}
+	int x = (int)bxc - w / 2;
 
 	for (int i = 0; i < anim->strip_count; i++) {
 		float fy0 = (float)i / anim->strip_count;
 		float fy1 = (float)(i + 1) / anim->strip_count;
-		float fyc = 0.5f * (fy0 + fy1);
 
 		float t0 = LAMP_T(fy0);
 		float t1 = LAMP_T(fy1);
-		float tc = LAMP_T(fyc);
 		if (t0 > 1.0f) t0 = 1.0f;
 		if (t1 > 1.0f) t1 = 1.0f;
-		if (tc > 1.0f) tc = 1.0f;
-		float s0 = t0 * t0 * (3.0f - 2.0f * t0);
-		float s1 = t1 * t1 * (3.0f - 2.0f * t1);
-		float sc = tc * tc * (3.0f - 2.0f * tc);
 
 		/* Vertical edges: bezier Y of each row boundary. Strip i's
 		 * bottom edge equals strip i+1's top edge by construction. */
@@ -3394,23 +3449,95 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 			h = 1;
 		}
 
-		/* Horizontal: center-line bezier + pinch, width collapses
-		 * with the row's own squeeze. */
-		float xc = anim->win_x + anim->win_w * 0.5f;
-		float bxc = lamp_bezier(xc, xc + bow,
-			anim->tgt_x + bow * 0.5f, anim->tgt_x, tc);
-		bxc += (anim->tgt_x - bxc) * sc;
-		int w = (int)(anim->win_w * (1.0f - s1));
-		if (w < 1) {
-			w = 1;
-		}
-
 		struct wlr_scene_buffer *s = anim->strips[i];
 		wlr_scene_buffer_set_dest_size(s, w, h);
-		wlr_scene_node_set_position(&s->node,
-			(int)bxc - w / 2, top);
+		wlr_scene_node_set_position(&s->node, x, top);
 	}
 #undef LAMP_T
+}
+
+#define WOB_COLS 6
+#define WOB_ROWS 5
+#define WOB_STIFFNESS 180.0f
+#define WOB_DAMPING 14.8f // zeta ~0.55: a couple of visible overshoots
+#define WOB_DT (ANIM_TICK_MS / 1000.0f)
+#define WOB_SETTLE_DISP 0.8f  // px
+#define WOB_SETTLE_VEL 15.0f  // px/s
+#define WOB_MAX_VEL 3500.0f   // px/s nudge clamp
+
+/* One frame of the wobble. Every grid POINT springs toward its rest
+ * position (which tracks the window's true position each tick), and
+ * each cell renders the rect between its top-left and bottom-right
+ * points — neighbors share exact corner points, so the sheet can
+ * stretch and overshoot but never tear. Returns true once released
+ * and settled, or when the 5s failsafe expires. */
+static bool animation_wobble_tick(struct amber_animation *anim) {
+	struct amber_toplevel *toplevel = anim->toplevel;
+	if (toplevel == NULL || toplevel->scene_tree == NULL) {
+		return true;
+	}
+	float k = WOB_STIFFNESS, c = WOB_DAMPING, dt = WOB_DT;
+	int nx = toplevel->scene_tree->node.x;
+	int ny = toplevel->scene_tree->node.y;
+	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
+	float cell_w = (float)anim->gw / anim->cols;
+	float cell_h = (float)anim->gh / anim->rows;
+	float max_disp = 0.0f, max_vel = 0.0f;
+
+	for (int iy = 0; iy < pts_y; iy++) {
+		for (int ix = 0; ix < pts_x; ix++) {
+			int idx = iy * pts_x + ix;
+			float tx = nx + ix * cell_w;
+			float ty = ny + iy * cell_h;
+			float ax = k * (tx - anim->px[idx]) - c * anim->vx[idx];
+			float ay = k * (ty - anim->py[idx]) - c * anim->vy[idx];
+			anim->vx[idx] += ax * dt;
+			anim->vy[idx] += ay * dt;
+			anim->px[idx] += anim->vx[idx] * dt;
+			anim->py[idx] += anim->vy[idx] * dt;
+			float dx = fabsf(tx - anim->px[idx]);
+			float dy = fabsf(ty - anim->py[idx]);
+			if (dx > max_disp) {
+				max_disp = dx;
+			}
+			if (dy > max_disp) {
+				max_disp = dy;
+			}
+			float avx = fabsf(anim->vx[idx]);
+			float avy = fabsf(anim->vy[idx]);
+			if (avx > max_vel) {
+				max_vel = avx;
+			}
+			if (avy > max_vel) {
+				max_vel = avy;
+			}
+		}
+	}
+
+	for (int iy = 0; iy < anim->rows; iy++) {
+		for (int ix = 0; ix < anim->cols; ix++) {
+			struct wlr_scene_buffer *cell =
+				anim->strips[iy * anim->cols + ix];
+			int tl = iy * pts_x + ix;
+			int br = (iy + 1) * pts_x + ix + 1;
+			int w = (int)(anim->px[br] - anim->px[tl]);
+			int h = (int)(anim->py[br] - anim->py[tl]);
+			if (w < 1) {
+				w = 1;
+			}
+			if (h < 1) {
+				h = 1;
+			}
+			wlr_scene_buffer_set_dest_size(cell, w, h);
+			wlr_scene_node_set_position(&cell->node,
+				(int)anim->px[tl], (int)anim->py[tl]);
+		}
+	}
+
+	bool settled = max_disp < WOB_SETTLE_DISP &&
+		max_vel < WOB_SETTLE_VEL;
+	bool expired = anim_now_usec() - anim->start_usec > 5000000;
+	return (anim->wobble_released && settled) || expired;
 }
 
 static int animation_tick(void *data) {
@@ -3420,6 +3547,14 @@ static int animation_tick(void *data) {
 
 	struct amber_animation *anim, *tmp;
 	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind == ANIM_WOBBLE) {
+			/* Springs decide completion, not wall time. */
+			if (animation_wobble_tick(anim)) {
+				animation_destroy(server, anim, true);
+			}
+			active = true;
+			continue;
+		}
 		float p = (float)(now - anim->start_usec) /
 			(float)(anim->duration_ms * 1000);
 		if (p >= 1.0f) {
@@ -3610,6 +3745,155 @@ static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 
 	wl_list_insert(server->animations.prev, &anim->link);
 	animations_kick(server);
+}
+
+/* Compiz-style wobble for interactive moves. The window's live buffer
+ * is locked (same scene-graph lock trick as the lamp), sliced into a
+ * cols x rows grid of scene buffers, and the real node is hidden until
+ * the springs settle after button release. */
+void animation_start_wobble(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	struct amber_output *output = toplevel->output;
+	if (!server->animations_enabled || !server->wobbly_windows ||
+			output == NULL || output->fx_tree == NULL ||
+			toplevel->fullscreen ||
+			toplevel->workspace != output->active_workspace ||
+			toplevel->scene_tree == NULL) {
+		return;
+	}
+
+	/* Re-grabbing during a settle retires the old sheet first. */
+	struct amber_animation *old, *old_tmp;
+	wl_list_for_each_safe(old, old_tmp, &server->animations, link) {
+		if (old->kind == ANIM_WOBBLE && old->toplevel == toplevel) {
+			animation_destroy(server, old, true);
+		}
+	}
+
+	/* Same race-free read as the lamp: the scene graph holds its own
+	 * lock on the last displayed buffer. */
+	struct wlr_buffer *snap_buf = toplevel->scene_buffer != NULL
+		? toplevel->scene_buffer->buffer : NULL;
+	struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+	int surf_w = surface ? surface->current.width : 0;
+	int surf_h = surface ? surface->current.height : 0;
+	if (snap_buf == NULL || surf_w < 1 || surf_h < 1) {
+		return;
+	}
+
+	struct amber_animation *anim = calloc(1, sizeof(*anim));
+	if (anim == NULL) {
+		return;
+	}
+	anim->kind = ANIM_WOBBLE;
+	anim->toplevel = toplevel;
+	anim->tree = toplevel->scene_tree;
+	anim->output = output;
+	anim->gx = toplevel->scene_tree->node.x;
+	anim->gy = toplevel->scene_tree->node.y;
+	anim->gw = surf_w;
+	anim->gh = surf_h;
+	anim->cols = WOB_COLS;
+	anim->rows = WOB_ROWS;
+	anim->start_usec = anim_now_usec();
+
+	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
+	int point_count = pts_x * pts_y;
+	anim->px = calloc(point_count, sizeof(float));
+	anim->py = calloc(point_count, sizeof(float));
+	anim->vx = calloc(point_count, sizeof(float));
+	anim->vy = calloc(point_count, sizeof(float));
+	anim->strips = calloc(anim->cols * anim->rows,
+		sizeof(*anim->strips));
+	if (anim->px == NULL || anim->py == NULL || anim->vx == NULL ||
+			anim->vy == NULL || anim->strips == NULL) {
+		animation_destroy(server, anim, false);
+		return;
+	}
+
+	anim->snapshot = snap_buf;
+	wlr_buffer_lock(anim->snapshot);
+
+	float buf_w = anim->snapshot->width;
+	float buf_h = anim->snapshot->height;
+	for (int iy = 0; iy < anim->rows; iy++) {
+		for (int ix = 0; ix < anim->cols; ix++) {
+			struct wlr_scene_buffer *cell =
+				wlr_scene_buffer_create(output->fx_tree,
+					anim->snapshot);
+			if (cell == NULL) {
+				anim->strip_count = iy * anim->cols + ix;
+				animation_destroy(server, anim, false);
+				return;
+			}
+			struct wlr_fbox src = {
+				.x = (double)ix * buf_w / anim->cols,
+				.y = (double)iy * buf_h / anim->rows,
+				.width = buf_w / anim->cols,
+				.height = buf_h / anim->rows,
+			};
+			wlr_scene_buffer_set_source_box(cell, &src);
+			wlr_scene_buffer_set_dest_size(cell,
+				anim->gw / anim->cols, anim->gh / anim->rows);
+			wlr_scene_node_set_position(&cell->node,
+				anim->gx + (int)(ix * anim->gw /
+					(float)anim->cols),
+				anim->gy + (int)(iy * anim->gh /
+					(float)anim->rows));
+			anim->strips[iy * anim->cols + ix] = cell;
+		}
+	}
+	anim->strip_count = anim->cols * anim->rows;
+
+	for (int iy = 0; iy < pts_y; iy++) {
+		for (int ix = 0; ix < pts_x; ix++) {
+			int idx = iy * pts_x + ix;
+			anim->px[idx] = anim->gx +
+				ix * (float)anim->gw / anim->cols;
+			anim->py[idx] = anim->gy +
+				iy * (float)anim->gh / anim->rows;
+		}
+	}
+
+	wlr_scene_node_set_enabled(&anim->tree->node, false);
+
+	wl_list_insert(server->animations.prev, &anim->link);
+	animations_kick(server);
+}
+
+/* Inject pointer motion into every point so fast drags visibly throw
+ * the sheet around (velocity clamp keeps flings sane). */
+void animation_wobble_nudge(struct amber_toplevel *toplevel,
+		int dx, int dy) {
+	struct amber_server *server = toplevel->server;
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind != ANIM_WOBBLE || anim->toplevel != toplevel) {
+			continue;
+		}
+		int count = (anim->cols + 1) * (anim->rows + 1);
+		for (int i = 0; i < count; i++) {
+			float nvx = anim->vx[i] + dx * 10.0f;
+			float nvy = anim->vy[i] + dy * 10.0f;
+			if (nvx > WOB_MAX_VEL) nvx = WOB_MAX_VEL;
+			if (nvx < -WOB_MAX_VEL) nvx = -WOB_MAX_VEL;
+			if (nvy > WOB_MAX_VEL) nvy = WOB_MAX_VEL;
+			if (nvy < -WOB_MAX_VEL) nvy = -WOB_MAX_VEL;
+			anim->vx[i] = nvx;
+			anim->vy[i] = nvy;
+		}
+	}
+}
+
+/* Button-up: let the springs carry the sheet home before swap-back. */
+void animation_wobble_release(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind == ANIM_WOBBLE && anim->toplevel == toplevel) {
+			anim->wobble_released = true;
+		}
+	}
 }
 
 /*
@@ -4414,6 +4698,7 @@ static void begin_interactive(struct amber_toplevel *toplevel,
 	server->cursor_mode = mode;
 
 	if (mode == AMBER_CURSOR_MOVE) {
+		animation_start_wobble(toplevel);
 		server->grab_x = server->cursor->x -
 			toplevel->output->layout_box.x - toplevel->scene_tree->node.x;
 		server->grab_y = server->cursor->y -
