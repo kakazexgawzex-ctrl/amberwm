@@ -103,6 +103,19 @@ struct amber_ipc_watcher {
 	struct wl_event_source *source;
 };
 
+/* Open animation: fade + slide-in from the usable area's right edge.
+ * A single event-loop timer drives every active animation at frame rate
+ * and disarms itself when the list drains (no idle wakeups). */
+struct amber_animation {
+	struct wl_list link;
+	struct amber_toplevel *toplevel; // canceled on unmap/destroy
+	struct wlr_scene_tree *tree;
+	int base_x, base_y; // final layout position (parent-local px)
+	int from_dx;        // horizontal offset applied at progress 0
+	int64_t start_usec;
+	uint32_t duration_ms;
+};
+
 struct amber_workspace {
 	/* Scene tree holding every toplevel on this workspace. Hiding a
 	 * workspace is a single node disable: hidden subtrees produce no
@@ -205,6 +218,12 @@ struct amber_server {
 	struct wl_event_source *config_watch_source;
 	char *config_path;
 	bool shadows_enabled;
+	/* Animations. */
+	bool animations_enabled;
+	uint32_t animation_duration_ms;
+	struct wl_list animations; // amber_animation.link
+	struct wl_event_source *anim_source;
+	bool anim_timer_armed;
 	/* Per-app window rules (config "rule=" lines). Matched by app-id;
 	 * a rule with empty app_id matches every window. */
 	struct wl_list window_rules; // amber_window_rule.link
@@ -400,6 +419,7 @@ static void focus_nothing(struct amber_server *server) {
 
 static void focus_toplevel(struct amber_toplevel *toplevel);
 static void ipc_broadcast(struct amber_server *server);
+void animation_cancel_for(struct amber_toplevel *toplevel);
 
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -762,6 +782,7 @@ static void toplevel_move_to_workspace(struct amber_toplevel *toplevel,
 		 * fullscreen; drop that first so the reparent is clean. */
 		toplevel_set_fullscreen(toplevel, false);
 	}
+	animation_cancel_for(toplevel); // parent is about to change
 	struct amber_output *output = toplevel->output;
 	struct amber_workspace *src = toplevel_workspace(toplevel);
 	bool was_focused = toplevel->server->focused_toplevel == toplevel;
@@ -805,6 +826,7 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 	if (output == NULL) {
 		return;
 	}
+	animation_cancel_for(t); // node is about to reparent
 
 	if (fullscreen) {
 		t->pre_fs_box.width = t->xdg_toplevel->base->geometry.width;
@@ -1367,6 +1389,9 @@ static void config_load(struct amber_server *server) {
 	server->blur_enabled = false;
 	server->blur_radius = 5;
 	server->shadows_enabled = false;
+	server->animations_enabled = true;
+	server->animation_duration_ms = 150;
+	wl_list_init(&server->animations);
 	wl_list_init(&server->window_rules);
 
 	const char *override = getenv("AMBER_CONFIG");
@@ -1455,6 +1480,13 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "shadows") == 0) {
 			server->shadows_enabled =
 				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "animations") == 0) {
+			server->animations_enabled =
+				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "animation-duration") == 0) {
+			int v = atoi(value);
+			server->animation_duration_ms =
+				v > 0 && v <= 1000 ? (uint32_t)v : 150;
 		} else if (strcmp(key, "blur-radius") == 0) {
 			server->blur_radius = atoi(value);
 			if (server->blur_radius < 0) {
@@ -3121,6 +3153,118 @@ static int ipc_hup_reload(int signal, void *data) {
 	return 0;
 }
 
+/* ========================= Open animations =============================== */
+
+static int64_t anim_now_usec(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+struct fx_opacity_ctx {
+	float opacity;
+};
+
+static void fx_opacity_cb(struct wlr_scene_buffer *buffer,
+		int sx, int sy, void *data) {
+	struct fx_opacity_ctx *ctx = data;
+	wlr_scene_buffer_set_opacity(buffer, ctx->opacity);
+}
+
+static void animation_tree_set_opacity(struct wlr_scene_tree *tree,
+		float opacity) {
+	struct fx_opacity_ctx ctx = { .opacity = opacity };
+	wlr_scene_node_for_each_buffer(&tree->node, fx_opacity_cb, &ctx);
+}
+
+static void animation_destroy(struct amber_server *server,
+		struct amber_animation *anim, bool restore) {
+	if (restore && anim->tree != NULL) {
+		wlr_scene_node_set_position(&anim->tree->node,
+			anim->base_x, anim->base_y);
+		animation_tree_set_opacity(anim->tree, 1.0f);
+	}
+	wl_list_remove(&anim->link);
+	free(anim);
+}
+
+/* Cancel any animation tracking a window whose node is about to be
+ * moved or destroyed (unmap, reparent, fullscreen toggles...). */
+void animation_cancel_for(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->toplevel == toplevel) {
+			animation_destroy(server, anim, false);
+		}
+	}
+}
+
+static int animation_tick(void *data) {
+	struct amber_server *server = data;
+	int64_t now = anim_now_usec();
+	bool active = false;
+
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		float p = (float)(now - anim->start_usec) /
+			(float)(anim->duration_ms * 1000);
+		if (p >= 1.0f) {
+			animation_destroy(server, anim, true);
+			continue;
+		}
+		/* Cubic ease-out: fast start, gentle landing. */
+		float eased = 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
+		float inv = 1.0f - eased;
+		wlr_scene_node_set_position(&anim->tree->node,
+			anim->base_x + (int)(anim->from_dx * inv),
+			anim->base_y);
+		animation_tree_set_opacity(anim->tree, 0.25f + 0.75f * eased);
+		active = true;
+	}
+	server->anim_timer_armed = active;
+	return active ? 16 : 0; // ms until next tick; 0 disarms
+}
+
+static void animations_kick(struct amber_server *server) {
+	if (server->anim_timer_armed || server->anim_source == NULL) {
+		return;
+	}
+	server->anim_timer_armed = true;
+	wl_event_source_timer_update(server->anim_source, 1);
+}
+
+static void animation_start_open(struct amber_toplevel *toplevel) {
+	struct amber_server *server = toplevel->server;
+	if (!server->animations_enabled ||
+			server->animation_duration_ms == 0 ||
+			toplevel->fullscreen || toplevel->output == NULL) {
+		return;
+	}
+
+	struct amber_animation *anim = calloc(1, sizeof(*anim));
+	if (anim == NULL) {
+		return;
+	}
+	/* workspace_arrange has already placed the node at its final
+	 * spot; capture it and slide in from the usable area's right. */
+	anim->toplevel = toplevel;
+	anim->tree = toplevel->scene_tree;
+	anim->base_x = toplevel->scene_tree->node.x;
+	anim->base_y = toplevel->scene_tree->node.y;
+	int edge_x = toplevel->output->usable_area.width +
+		toplevel->output->usable_area.x;
+	anim->from_dx = edge_x - anim->base_x;
+	if (anim->from_dx < 32) {
+		anim->from_dx = 32; // always at least a nudge
+	}
+	anim->start_usec = anim_now_usec();
+	anim->duration_ms = server->animation_duration_ms;
+
+	wl_list_insert(server->animations.prev, &anim->link);
+	animations_kick(server);
+}
+
 /*
  * Built-in wallpaper.
  *
@@ -3791,6 +3935,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 		workspace_arrange(toplevel_workspace(toplevel));
 	}
 	toplevel_apply_fx(toplevel);
+	animation_start_open(toplevel);
 	toplevel_foreign_init(toplevel);
 	ipc_broadcast(server); // occupancy changed
 }
@@ -3814,6 +3959,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	}
 
 	struct amber_workspace *ws = toplevel_workspace(toplevel);
+	animation_cancel_for(toplevel); // node is about to be destroyed
 	toplevel_foreign_destroy(toplevel);
 	wl_list_remove(&toplevel->link);
 	workspace_arrange(ws);
@@ -4341,10 +4487,15 @@ int main(int argc, char *argv[]) {
 	ipc_init(&server);
 	config_watch_init(&server);
 
-	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
-	struct wl_event_loop *event_loop =
+	/* Animation driver: one shared timer, armed only while animating. */
+	wl_list_init(&server.animations);
+	struct wl_event_loop *anim_loop =
 		wl_display_get_event_loop(server.wl_display);
-	wl_event_loop_add_signal(event_loop, SIGHUP,
+	server.anim_source =
+		wl_event_loop_add_timer(anim_loop, animation_tick, &server);
+
+	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
+	wl_event_loop_add_signal(anim_loop, SIGHUP,
 		ipc_hup_reload, &server);
 
 	for (size_t i = 0; i < server.autostart_count; i++) {
