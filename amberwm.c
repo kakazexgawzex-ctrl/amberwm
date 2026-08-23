@@ -420,6 +420,7 @@ static void focus_nothing(struct amber_server *server) {
 static void focus_toplevel(struct amber_toplevel *toplevel);
 static void ipc_broadcast(struct amber_server *server);
 void animation_cancel_for(struct amber_toplevel *toplevel);
+static void toplevel_apply_fx(struct amber_toplevel *toplevel);
 
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -628,6 +629,7 @@ static void toplevel_to_floating(struct amber_toplevel *t) {
 	t->floating = true;
 	wlr_scene_node_raise_to_top(&t->scene_tree->node);
 	workspace_arrange(toplevel_workspace(t));
+	toplevel_apply_fx(t); // shadow appears
 }
 
 /* Insert a floating window back into the strip, next to focus. */
@@ -657,6 +659,7 @@ static void toplevel_to_tiled(struct amber_toplevel *t) {
 	wl_list_insert(anchor, &t->link); // after anchor = right of it
 	t->floating = false;
 	workspace_arrange(ws);
+	toplevel_apply_fx(t); // shadow disappears
 }
 
 static void toplevel_set_fullscreen(struct amber_toplevel *t,
