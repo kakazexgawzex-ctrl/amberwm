@@ -108,7 +108,8 @@ enum amber_anim_kind {
 	ANIM_OPEN,       // fade + slide-in of a live window
 	ANIM_LAMP_CLOSE, // magic-lamp suck-in of a closing window's snapshot
 	ANIM_WS_SLIDE,   // horizontal slide between two workspace trees
-	ANIM_WOBBLE      // Compiz-style spring grid over a live dragged window
+	ANIM_WOBBLE,     // Compiz-style spring grid over a live dragged window
+	ANIM_FLOAT_TWEEN // position glide across a float/tile toggle
 };
 
 #define ANIM_TICK_MS 16 // animation timer cadence (~60 updates/sec)
@@ -147,6 +148,10 @@ struct amber_animation {
 	struct amber_workspace *ws_from, *ws_to;
 	int slide_dir;    // +1 = toward higher index (content moves left)
 	int origin_x, origin_y; // layout origin to restore
+	/* ANIM_FLOAT_TWEEN: glides a live window from from_x/from_y to the
+	 * node's current position (base_x/base_y). Canceled like ANIM_OPEN
+	 * via animation_cancel_for on unmap/reparent. */
+	int from_x, from_y;
 };
 
 struct amber_workspace {
@@ -296,7 +301,8 @@ struct amber_output {
 	struct wlr_box usable_area;
 
 	/* Children of the scene output tree, in stacking order:
-	 * background < bottom < workspaces (windows) < top < overlay. */
+	 * background < bottom < top(bar) < workspaces (windows) < overlay
+	 * < fx_tree. Layer popups + fullscreen windows live in overlay. */
 	struct wlr_scene_tree *layer_trees[4];
 	struct wl_list layers[4]; // amber_layer_surface.link, per zwlr_layer_shell_v1_layer
 	struct amber_workspace workspaces[AMBER_WORKSPACE_COUNT];
@@ -468,6 +474,8 @@ static void focus_toplevel(struct amber_toplevel *toplevel);
 static void ipc_broadcast(struct amber_server *server);
 void animation_cancel_for(struct amber_toplevel *toplevel);
 void animation_start_wobble(struct amber_toplevel *toplevel);
+static void animation_start_float_glide(struct amber_toplevel *toplevel,
+	int from_x, int from_y);
 void animation_wobble_nudge(struct amber_toplevel *toplevel,
 	int dx, int dy);
 void animation_wobble_release(struct amber_toplevel *toplevel);
@@ -725,7 +733,31 @@ static void toplevel_set_fullscreen(struct amber_toplevel *t,
 		bool fullscreen);
 static void toplevel_apply_fx(struct amber_toplevel *toplevel);
 
+/* Park a freshly floating window near the middle of the usable area,
+ * keeping its current size; skipped until the client committed a size
+ * or when the window already fills the area. */
+static void toplevel_center_floating(struct amber_toplevel *t) {
+	struct amber_workspace *ws = toplevel_workspace(t);
+	if (ws == NULL || t->scene_tree == NULL || t->xdg_toplevel == NULL) {
+		return;
+	}
+	struct wlr_box *u = &ws->output->usable_area;
+	struct wlr_box g = t->xdg_toplevel->base->geometry;
+	if (g.width <= 0 || g.height <= 0 ||
+			g.width >= u->width || g.height >= u->height) {
+		return;
+	}
+	wlr_scene_node_set_position(&t->scene_tree->node,
+		u->x + (u->width - g.width) / 2,
+		u->y + (u->height - g.height) / 2);
+}
+
 static void toplevel_toggle_float(struct amber_toplevel *t) {
+	int pre_x = 0, pre_y = 0;
+	if (t->scene_tree != NULL) {
+		pre_x = t->scene_tree->node.x;
+		pre_y = t->scene_tree->node.y;
+	}
 	if (t->fullscreen) {
 		toplevel_set_fullscreen(t, false);
 	}
@@ -736,7 +768,9 @@ static void toplevel_toggle_float(struct amber_toplevel *t) {
 		toplevel_to_tiled(t);
 	} else {
 		toplevel_to_floating(t);
+		toplevel_center_floating(t);
 	}
+	animation_start_float_glide(t, pre_x, pre_y);
 }
 
 static void cycle_focus(struct amber_server *server, int dir) {
@@ -852,12 +886,13 @@ static void workspace_switch(struct amber_output *output, int index) {
 			a->start_usec = anim_now_usec();
 			a->duration_ms = server->ws_slide_duration_ms;
 			/* Hidden workspaces cost nothing when idle, but
-			 * both trees render during the slide; raise the
-			 * incoming one so lower-index trees don't hide
-			 * underneath (sibling z-order is creation order). */
+			 * both trees render during the slide; they never
+			 * overlap (offset positions), so no z-order games:
+			 * raising here would lift the whole workspace above
+			 * the overlay/bar layers permanently and break
+			 * popups/fullscreen stacking afterwards. */
 			wlr_scene_node_set_enabled(&old->tree->node, true);
 			wlr_scene_node_set_enabled(&new->tree->node, true);
-			wlr_scene_node_raise_to_top(&new->tree->node);
 			wlr_scene_node_set_position(&new->tree->node,
 				a->origin_x + a->slide_dir *
 					output->layout_box.width,
@@ -3411,6 +3446,14 @@ static void animation_destroy(struct amber_server *server,
 				true);
 		}
 		break;
+	case ANIM_FLOAT_TWEEN:
+		/* Landing spot is wherever arrange put the node; snapping
+		 * there keeps cancel paths (unmap mid-glide) consistent. */
+		if (restore && anim->tree != NULL) {
+			wlr_scene_node_set_position(&anim->tree->node,
+				anim->base_x, anim->base_y);
+		}
+		break;
 	}
 	wl_list_remove(&anim->link);
 	free(anim);
@@ -3668,6 +3711,17 @@ static bool animations_run(struct amber_server *server) {
 					width * (1.0f - e)),
 				anim->origin_y);
 		} break;
+		case ANIM_FLOAT_TWEEN: {
+			/* Cubic ease-out, same feel as window-open. */
+			float eased = 1.0f - (1.0f - p) * (1.0f - p)
+				* (1.0f - p);
+			float inv = 1.0f - eased;
+			wlr_scene_node_set_position(&anim->tree->node,
+				anim->base_x + (int)((anim->from_x
+					- anim->base_x) * inv),
+				anim->base_y + (int)((anim->from_y
+					- anim->base_y) * inv));
+		} break;
 		}
 		active = true;
 	}
@@ -3720,6 +3774,42 @@ static void animation_start_open(struct amber_toplevel *toplevel) {
 	if (anim->from_dx < 32) {
 		anim->from_dx = 32; // always at least a nudge
 	}
+	anim->start_usec = anim_now_usec();
+	anim->duration_ms = server->animation_duration_ms;
+
+	wl_list_insert(server->animations.prev, &anim->link);
+	animations_kick(server);
+}
+
+/* Glide a live window from (from_x, from_y) to wherever its scene node
+ * sits right now (the caller arranges first). Skipped when disabled or
+ * when the move is too small to see. */
+static void animation_start_float_glide(struct amber_toplevel *toplevel,
+		int from_x, int from_y) {
+	struct amber_server *server = toplevel->server;
+	if (!server->animations_enabled ||
+			server->animation_duration_ms == 0 ||
+			toplevel->scene_tree == NULL) {
+		return;
+	}
+	int to_x = toplevel->scene_tree->node.x;
+	int to_y = toplevel->scene_tree->node.y;
+	int dx = to_x - from_x, dy = to_y - from_y;
+	if (dx * dx + dy * dy < 64) { // under ~8px: not worth a tween
+		return;
+	}
+
+	struct amber_animation *anim = calloc(1, sizeof(*anim));
+	if (anim == NULL) {
+		return;
+	}
+	anim->kind = ANIM_FLOAT_TWEEN;
+	anim->toplevel = toplevel;
+	anim->tree = toplevel->scene_tree;
+	anim->base_x = to_x;
+	anim->base_y = to_y;
+	anim->from_x = from_x;
+	anim->from_y = from_y;
 	anim->start_usec = anim_now_usec();
 	anim->duration_ms = server->animation_duration_ms;
 
@@ -4428,10 +4518,14 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	/* Per-output subtrees live directly under the scene root and are
 	 * kept positioned at the output's layout origin (see
 	 * output_update_geometry). Creation order defines stacking:
-	 * background < bottom < workspaces < top < overlay. */
+	 * background < bottom < top(bar) < workspaces < overlay < fx.
+	 * Windows sit ABOVE the bar by design; layer popups and
+	 * fullscreen windows live in the overlay tree above them. */
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND] =
 		wlr_scene_tree_create(&server->scene->tree);
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM] =
+		wlr_scene_tree_create(&server->scene->tree);
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] =
 		wlr_scene_tree_create(&server->scene->tree);
 	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
 		output->workspaces[i].tree =
@@ -4439,8 +4533,6 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_scene_node_set_enabled(&output->workspaces[i].tree->node,
 			i == output->active_workspace);
 	}
-	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] =
-		wlr_scene_tree_create(&server->scene->tree);
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY] =
 		wlr_scene_tree_create(&server->scene->tree);
 	output->fx_tree = wlr_scene_tree_create(&server->scene->tree);
@@ -4460,11 +4552,11 @@ static void output_update_geometry(struct amber_output *output) {
 	struct wlr_scene_node *nodes[14] = {
 		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]->node,
 		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM]->node,
+		&output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP]->node,
 	};
 	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
-		nodes[2 + i] = &output->workspaces[i].tree->node;
+		nodes[3 + i] = &output->workspaces[i].tree->node;
 	}
-	nodes[11] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP]->node;
 	nodes[12] = &output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]->node;
 	nodes[13] = output->fx_tree != NULL ? &output->fx_tree->node : NULL;
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
@@ -4933,17 +5025,17 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 	free(popup);
 }
 
-/* Find the scene tree of a tracked layer surface so popups anchored
- * through zwlr_layer_shell_v1.get_popup can be placed relative to their
- * real parent panel; NULL when untracked/unmapped. */
-static struct wlr_scene_tree *amber_layer_parent_tree(
+/* Find the tracked layer surface's output so popups anchored through
+ * zwlr_layer_shell_v1.get_popup can render in that output's overlay
+ * tree (above windows); NULL when untracked. */
+static struct amber_output *amber_layer_output(
 		struct amber_server *server, struct wlr_layer_surface_v1 *ls) {
 	struct amber_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
 		struct amber_layer_surface *layer;
 		wl_list_for_each(layer, &output->layers[ls->current.layer], link) {
-			if (layer->layer_surface == ls && layer->scene_layer != NULL) {
-				return layer->scene_layer->tree;
+			if (layer->layer_surface == ls) {
+				return output;
 			}
 		}
 	}
@@ -4977,18 +5069,18 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	if (parent != NULL) {
 		parent_tree = parent->data;
 	} else {
+		/* Layer popups float ABOVE windows: park them in the
+		 * overlay tree of the popup's own output when tracked,
+		 * else the active one. Trees share the output origin, so
+		 * panel-relative configure coords land unchanged. */
 		struct wlr_layer_surface_v1 *ls = xdg_popup->parent ?
 			wlr_layer_surface_v1_try_from_wlr_surface(
 				xdg_popup->parent) : NULL;
-		if (ls != NULL) {
-			parent_tree = amber_layer_parent_tree(server, ls);
-		}
-		if (parent_tree == NULL) {
-			struct amber_output *output = active_output(server);
-			if (output != NULL) {
-				parent_tree =
-					output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
-			}
+		struct amber_output *output = ls != NULL ?
+			amber_layer_output(server, ls) : active_output(server);
+		if (output != NULL) {
+			parent_tree =
+				output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
 		}
 	}
 	if (parent_tree == NULL) {
