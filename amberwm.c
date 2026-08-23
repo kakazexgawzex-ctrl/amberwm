@@ -258,6 +258,7 @@ struct amber_server {
 	struct wl_event_source *config_watch_source;
 	char *config_path;
 	bool shadows_enabled;
+	bool center_focused_column;
 	/* Animations. */
 	bool animations_enabled;
 	uint32_t animation_duration_ms;
@@ -283,6 +284,13 @@ struct amber_server {
 	struct wlr_scene_rect *shot_dim;
 	struct wlr_scene_rect *shot_borders[4];
 	struct wlr_scene_buffer *shot_freeze; // frozen frame under the dim
+	bool shot_moving; // dragging the committed rectangle around
+	double shot_move_ax, shot_move_ay; // grab anchor, output-local
+	struct wlr_box shot_move_orig; // box at grab time
+	bool shot_have_last; // keep last selection for the next session
+	struct wlr_box shot_last_box;
+	struct amber_output *shot_last_output; // identity compare only
+	bool shot_show_pointer; // stamp the cursor into the frozen frame
 	char *screenshot_dir; // config override, NULL = default
 	struct amber_toplevel *grabbed_toplevel;
 	double grab_x, grab_y;
@@ -633,16 +641,26 @@ static void workspace_arrange(struct amber_workspace *ws) {
 		}
 	}
 
-	/* Scroll so the focused column is fully visible (minimal shift). */
+	/* Scroll so the focused column is fully visible: minimal shift, or
+	 * dead-center when center_focused_column is set (niri-style). */
 	double offset = ws->view_offset;
 	if (have_focus_extent) {
 		int view_right = u->x + u->width - gap;
 		int view_left = u->x + gap;
-		if (fx1 - offset > view_right) {
-			offset = fx1 - view_right;
-		}
-		if (fx0 - offset < view_left) {
+		int inner_w = view_right - view_left;
+		if (ws->output->server->center_focused_column &&
+				fx1 - fx0 < inner_w) {
+			offset = fx0 - view_left
+				- (inner_w - (fx1 - fx0)) / 2.0;
+		} else if (ws->output->server->center_focused_column) {
 			offset = fx0 - view_left;
+		} else {
+			if (fx1 - offset > view_right) {
+				offset = fx1 - view_right;
+			}
+			if (fx0 - offset < view_left) {
+				offset = fx0 - view_left;
+			}
 		}
 	}
 	double max_offset = x - gap - (u->x + u->width);
@@ -1546,6 +1564,7 @@ static void config_load(struct amber_server *server) {
 	server->blur_enabled = false;
 	server->blur_radius = 5;
 	server->shadows_enabled = false;
+	server->center_focused_column = false;
 	server->animations_enabled = true;
 	server->animation_duration_ms = 150;
 	server->lamp_close_enabled = true;
@@ -1646,6 +1665,9 @@ static void config_load(struct amber_server *server) {
 			server->blur_enabled = strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "shadows") == 0) {
 			server->shadows_enabled =
+				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "center-focused-column") == 0) {
+			server->center_focused_column =
 				strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "animations") == 0) {
 			server->animations_enabled =
@@ -2172,6 +2194,113 @@ static struct amber_png_mem screenshot_encode(unsigned char *rgba,
 	return png;
 }
 
+/* Alpha-blend the default arrow cursor into a captured frame so "P" can
+ * include the pointer position in the saved image. */
+static void screenshot_stamp_cursor(struct amber_server *server,
+		struct amber_output *output, unsigned char *frame,
+		int fw, int fh) {
+	struct wlr_xcursor *xc = wlr_xcursor_manager_get_xcursor(
+		server->cursor_mgr, "left_ptr", output->wlr_output->scale);
+	if (xc == NULL || xc->image_count == 0) {
+		return;
+	}
+	struct wlr_xcursor_image *img = xc->images[0];
+	int px = (int)((server->cursor->x - output->layout_box.x)
+			* output->wlr_output->scale) - img->hotspot_x;
+	int py = (int)((server->cursor->y - output->layout_box.y)
+			* output->wlr_output->scale) - img->hotspot_y;
+	for (int y = 0; y < img->height; y++) {
+		int fy = py + y;
+		if (fy < 0 || fy >= fh) {
+			continue;
+		}
+		for (int x = 0; x < img->width; x++) {
+			int fx = px + x;
+			if (fx < 0 || fx >= fw) {
+				continue;
+			}
+			const unsigned char *src =
+				img->buffer + (y * img->width + x) * 4;
+			unsigned char a = src[3];
+			if (a == 0) {
+				continue;
+			}
+			unsigned char *dst = frame + (fy * fw + fx) * 4;
+			/* xcursor pixels are ARGB bytes (B,G,R,A); frame is
+			 * RGBA, so channels swap on copy. */
+			if (a == 255) {
+				dst[0] = src[2];
+				dst[1] = src[1];
+				dst[2] = src[0];
+				dst[3] = 255;
+			} else {
+				dst[0] = (src[2] * a + dst[0] * (255 - a)) / 255;
+				dst[1] = (src[1] * a + dst[1] * (255 - a)) / 255;
+				dst[2] = (src[0] * a + dst[2] * (255 - a)) / 255;
+				dst[3] = 255;
+			}
+		}
+	}
+}
+
+/* (Re)capture and attach the frozen frame. Live UI nodes are hidden for
+ * the capture so dim/borders never bake into the image. */
+static void screenshot_freeze_attach(struct amber_server *server,
+		struct amber_output *output) {
+	if (server->shot_freeze != NULL) {
+		wlr_scene_node_destroy(&server->shot_freeze->node);
+		server->shot_freeze = NULL;
+	}
+	bool border_on[4] = {false, false, false, false};
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_borders[i] != NULL) {
+			border_on[i] = server->shot_borders[i]->node.enabled;
+			wlr_scene_node_set_enabled(
+				&server->shot_borders[i]->node, false);
+		}
+	}
+	if (server->shot_dim != NULL) {
+		wlr_scene_node_set_enabled(&server->shot_dim->node, false);
+	}
+	int ow = output->wlr_output->width;
+	int oh = output->wlr_output->height;
+	unsigned char *frame = ow > 0 && oh > 0
+		? screenshot_capture(server, output,
+			(struct wlr_box){ .width = ow, .height = oh })
+		: NULL;
+	if (server->shot_dim != NULL) {
+		wlr_scene_node_set_enabled(&server->shot_dim->node, true);
+	}
+	for (int i = 0; i < 4; i++) {
+		if (border_on[i]) {
+			wlr_scene_node_set_enabled(
+				&server->shot_borders[i]->node, true);
+		}
+	}
+	if (frame == NULL) {
+		return;
+	}
+	if (server->shot_show_pointer) {
+		screenshot_stamp_cursor(server, output, frame, ow, oh);
+	}
+	struct wlr_buffer *buf = rgba_buffer_take(ow, oh, frame);
+	if (buf == NULL) {
+		return;
+	}
+	struct wlr_scene_buffer *node = wlr_scene_buffer_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+		buf);
+	if (node != NULL) {
+		server->shot_freeze = node;
+		wlr_scene_node_set_position(&node->node, 0, 0);
+		wlr_scene_buffer_set_dest_size(node,
+			output->layout_box.width, output->layout_box.height);
+	}
+	/* The scene holds its own reference once attached; dropping ours
+	 * also cleans up failed attaches. */
+	wlr_buffer_unlock(buf);
+}
+
 static void screenshot_hide_ui(struct amber_server *server) {
 	if (server->shot_dim != NULL) {
 		wlr_scene_node_destroy(&server->shot_dim->node);
@@ -2187,8 +2316,15 @@ static void screenshot_hide_ui(struct amber_server *server) {
 		wlr_scene_node_destroy(&server->shot_freeze->node);
 		server->shot_freeze = NULL;
 	}
+	if (server->shot_has_sel && server->shot_output != NULL &&
+			server->shot_box.width > 1) {
+		server->shot_have_last = true;
+		server->shot_last_box = server->shot_box;
+		server->shot_last_output = server->shot_output;
+	}
 	server->shot_active = false;
 	server->shot_dragging = false;
+	server->shot_moving = false;
 	server->shot_has_sel = false;
 	server->shot_output = NULL;
 	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
@@ -2291,31 +2427,7 @@ static void screenshot_start_region(struct amber_server *server) {
 	/* Freeze the live frame into a static scene buffer so windows
 	 * cannot move mid-selection; created before the dim rect so the
 	 * image renders beneath it. */
-	int ow = output->wlr_output->width;
-	int oh = output->wlr_output->height;
-	unsigned char *frame = ow > 0 && oh > 0
-		? screenshot_capture(server, output,
-			(struct wlr_box){ .width = ow, .height = oh })
-		: NULL;
-	if (frame != NULL) {
-		struct wlr_buffer *buf = rgba_buffer_take(ow, oh, frame);
-		if (buf != NULL) {
-			struct wlr_scene_buffer *node =
-				wlr_scene_buffer_create(output->layer_trees[
-					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-					buf);
-			if (node != NULL) {
-				server->shot_freeze = node;
-				wlr_scene_node_set_position(&node->node, 0, 0);
-				wlr_scene_buffer_set_dest_size(node,
-					output->layout_box.width,
-					output->layout_box.height);
-			}
-			/* The scene holds its own reference once attached;
-			 * dropping ours also cleans up failed attaches. */
-			wlr_buffer_unlock(buf);
-		}
-	}
+	screenshot_freeze_attach(server, output);
 
 	float dim[4] = {0, 0, 0, 0.35f};
 	server->shot_dim = wlr_scene_rect_create(
@@ -2330,9 +2442,22 @@ static void screenshot_start_region(struct amber_server *server) {
 	}
 	server->shot_active = true;
 	server->cursor_mode = AMBER_CURSOR_SCREENSHOT;
+	/* Bring back the previous rectangle when re-entering on the same
+	 * output (niri keeps it too); Esc still clears everything. */
+	if (server->shot_have_last &&
+			server->shot_last_output == output &&
+			server->shot_last_box.width > 1 &&
+			server->shot_last_box.x + server->shot_last_box.width
+				<= output->layout_box.width &&
+			server->shot_last_box.y + server->shot_last_box.height
+				<= output->layout_box.height) {
+		server->shot_has_sel = true;
+		server->shot_box = server->shot_last_box;
+	}
 	screenshot_ui_update(server);
 	wlr_log(WLR_INFO, "screenshot: screen frozen — drag to select, "
-		"Ctrl+C copy, Space save, Esc cancel");
+		"drag inside to move, P toggles pointer, Ctrl+C copy, "
+		"Space save, Esc cancel");
 }
 
 static void screenshot_full_screen(struct amber_server *server) {
@@ -2414,6 +2539,30 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 }
 
 static void screenshot_motion(struct amber_server *server) {
+	if (server->shot_active && server->shot_moving) {
+		double cx = server->cursor->x -
+			server->shot_output->layout_box.x;
+		double cy = server->cursor->y -
+			server->shot_output->layout_box.y;
+		struct wlr_box lim = server->shot_output->layout_box;
+		struct wlr_box *b = &server->shot_box;
+		b->x = server->shot_move_orig.x +
+			(int)(cx - server->shot_move_ax);
+		b->y = server->shot_move_orig.y +
+			(int)(cy - server->shot_move_ay);
+		if (b->x < 0) {
+			b->x = 0;
+		}
+		if (b->y < 0) {
+			b->y = 0;
+		}
+		if (b->x + b->width > lim.width) {
+			b->x = lim.width - b->width;
+		}
+		if (b->y + b->height > lim.height) {
+			b->y = lim.height - b->height;
+		}
+	}
 	screenshot_ui_update(server);
 }
 
@@ -2421,6 +2570,25 @@ static void screenshot_button(struct amber_server *server,
 		const struct wlr_pointer_button_event *event) {
 	if (event->button == BTN_LEFT) {
 		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+			double cx = server->cursor->x -
+				server->shot_output->layout_box.x;
+			double cy = server->cursor->y -
+				server->shot_output->layout_box.y;
+			/* Pressing inside the committed rectangle moves it
+			 * instead of starting a fresh selection (niri). */
+			if (server->shot_has_sel &&
+					cx >= server->shot_box.x &&
+					cy >= server->shot_box.y &&
+					cx < server->shot_box.x +
+						server->shot_box.width &&
+					cy < server->shot_box.y +
+						server->shot_box.height) {
+				server->shot_moving = true;
+				server->shot_move_ax = cx;
+				server->shot_move_ay = cy;
+				server->shot_move_orig = server->shot_box;
+				return;
+			}
 			/* A rectangle appears only on an explicit drag. */
 			server->shot_sx = server->cursor->x -
 				server->shot_output->layout_box.x;
@@ -2429,6 +2597,8 @@ static void screenshot_button(struct amber_server *server,
 			server->shot_dragging = true;
 			server->shot_has_sel = true;
 			screenshot_ui_update(server);
+		} else if (server->shot_moving) {
+			server->shot_moving = false;
 		} else if (server->shot_dragging) {
 			server->shot_dragging = false;
 			/* Freeze the rectangle where the drag ended so it
@@ -2450,9 +2620,19 @@ static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 			return true;
 		}
 		bool ctrl = modifiers & WLR_MODIFIER_CTRL;
-		/* Act only once a rectangle exists and no drag is running;
-		 * without this, Space before any drag would save a 1x1 box. */
-		bool ready = server->shot_has_sel && !server->shot_dragging;
+		if (sym == XKB_KEY_p && !ctrl &&
+				server->shot_output != NULL) {
+			server->shot_show_pointer =
+				!server->shot_show_pointer;
+			screenshot_freeze_attach(server,
+				server->shot_output);
+			return true;
+		}
+		/* Act only once a rectangle exists and no gesture is
+		 * running; without this, Space before any drag would save
+		 * a 1x1 box. */
+		bool ready = server->shot_has_sel && !server->shot_dragging
+			&& !server->shot_moving;
 		if ((ctrl && (sym == XKB_KEY_c || sym == XKB_KEY_C)) &&
 				ready) {
 			screenshot_finish(server, false);
