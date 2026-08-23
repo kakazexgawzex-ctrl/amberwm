@@ -139,6 +139,10 @@ struct amber_animation {
 	int cols, rows;                 // grid cell dimensions
 	float *px, *py, *vx, *vy;       // point state ((cols+1)*(rows+1))
 	bool wobble_released;           // button up: settle then finish
+	int64_t last_usec;              // previous tick (adaptive spring dt)
+	/* Last applied rect per strip/cell [x,y,w,h]*4 — skips redundant
+	 * scene property writes when the int grid didn't move. */
+	int *strip_rect;
 	/* ANIM_WS_SLIDE: two workspace trees sliding horizontally. */
 	struct amber_workspace *ws_from, *ws_to;
 	int slide_dir;    // +1 = toward higher index (content moves left)
@@ -3322,6 +3326,8 @@ static void animation_lamp_cleanup(struct amber_animation *anim) {
 		wlr_buffer_unlock(anim->snapshot);
 		anim->snapshot = NULL;
 	}
+	free(anim->strip_rect);
+	anim->strip_rect = NULL;
 }
 
 static void animation_destroy(struct amber_server *server,
@@ -3446,9 +3452,17 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 		}
 
 		struct wlr_scene_buffer *s = anim->strips[i];
-		wlr_scene_buffer_set_dest_size(s, w, h);
-		wlr_scene_node_set_position(&s->node,
-			(int)bxc - w / 2, top);
+		int nx = (int)bxc - w / 2;
+		int *lr = &anim->strip_rect[i * 4];
+		if (lr[0] != nx || lr[1] != top || lr[2] != w ||
+				lr[3] != h) {
+			wlr_scene_buffer_set_dest_size(s, w, h);
+			wlr_scene_node_set_position(&s->node, nx, top);
+			lr[0] = nx;
+			lr[1] = top;
+			lr[2] = w;
+			lr[3] = h;
+		}
 	}
 #undef LAMP_T
 }
@@ -3473,7 +3487,17 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 	if (toplevel == NULL || toplevel->scene_tree == NULL) {
 		return true;
 	}
-	float k = WOB_STIFFNESS, c = WOB_DAMPING, dt = WOB_DT;
+	float k = WOB_STIFFNESS, c = WOB_DAMPING;
+	int64_t now = anim_now_usec();
+	float dt = anim->last_usec == 0 ? WOB_DT
+		: (float)(now - anim->last_usec) / 1000000.0f;
+	if (dt < 0.004f) {
+		dt = 0.004f;
+	}
+	if (dt > 0.032f) {
+		dt = 0.032f;
+	}
+	anim->last_usec = now;
 	int nx = toplevel->scene_tree->node.x;
 	int ny = toplevel->scene_tree->node.y;
 	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
@@ -3525,9 +3549,18 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 			if (h < 1) {
 				h = 1;
 			}
-			wlr_scene_buffer_set_dest_size(cell, w, h);
-			wlr_scene_node_set_position(&cell->node,
-				(int)anim->px[tl], (int)anim->py[tl]);
+			int nx = (int)anim->px[tl];
+			int ny = (int)anim->py[tl];
+			int *lr = &anim->strip_rect[(iy * anim->cols + ix) * 4];
+			if (lr[0] != nx || lr[1] != ny || lr[2] != w ||
+					lr[3] != h) {
+				wlr_scene_buffer_set_dest_size(cell, w, h);
+				wlr_scene_node_set_position(&cell->node, nx, ny);
+				lr[0] = nx;
+				lr[1] = ny;
+				lr[2] = w;
+				lr[3] = h;
+			}
 		}
 	}
 
@@ -3537,8 +3570,12 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 	return (anim->wobble_released && settled) || expired;
 }
 
-static int animation_tick(void *data) {
-	struct amber_server *server = data;
+/* One pass over all active animations; true while any remain. Driven
+ * by output frame events (vblank-aligned updates) with the 16ms timer
+ * as fallback for frameless setups. Safe to run at any cadence: lamp
+ * strips are a pure function of wall-time progress, wobble springs use
+ * adaptive dt, and unchanged rects skip scene writes entirely. */
+static bool animations_run(struct amber_server *server) {
 	int64_t now = anim_now_usec();
 	bool active = false;
 
@@ -3592,6 +3629,12 @@ static int animation_tick(void *data) {
 		}
 		active = true;
 	}
+	return active;
+}
+
+static int animation_tick(void *data) {
+	struct amber_server *server = data;
+	bool active = animations_run(server);
 	server->anim_timer_armed = active;
 	/* libwayland 1.26 ignores the callback's positive return value
 	 * (rearm-by-return regressed), so rearm explicitly instead. */
@@ -3710,7 +3753,9 @@ static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 	anim->strip_count = LAMP_STRIP_COUNT;
 	anim->strips = calloc(LAMP_STRIP_COUNT,
 		sizeof(*anim->strips));
-	if (anim->strips == NULL) {
+	anim->strip_rect = calloc(LAMP_STRIP_COUNT * 4,
+		sizeof(*anim->strip_rect));
+	if (anim->strips == NULL || anim->strip_rect == NULL) {
 		animation_destroy(server, anim, false);
 		return;
 	}
@@ -3802,11 +3847,15 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	anim->vy = calloc(point_count, sizeof(float));
 	anim->strips = calloc(anim->cols * anim->rows,
 		sizeof(*anim->strips));
+	anim->strip_rect = calloc(anim->cols * anim->rows * 4,
+		sizeof(*anim->strip_rect));
 	if (anim->px == NULL || anim->py == NULL || anim->vx == NULL ||
-			anim->vy == NULL || anim->strips == NULL) {
+			anim->vy == NULL || anim->strips == NULL ||
+			anim->strip_rect == NULL) {
 		animation_destroy(server, anim, false);
 		return;
 	}
+	anim->last_usec = anim_now_usec();
 
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
@@ -4030,6 +4079,14 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	 * generally at the output's refresh rate (e.g. 60Hz). */
 	struct amber_output *output = wl_container_of(listener, output, frame);
 	struct wlr_scene *scene = output->server->scene;
+
+	/* Advance animations just before commit so every displayed frame
+	 * carries the freshest state — vblank-aligned, no beat stutter
+	 * against the 16ms fallback timer. */
+	if (output->server->anim_timer_armed &&
+			!animations_run(output->server)) {
+		output->server->anim_timer_armed = false;
+	}
 
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		scene, output->wlr_output);
