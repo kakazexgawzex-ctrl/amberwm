@@ -32,7 +32,6 @@
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
-#include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_gamma_control_v1.h>
@@ -5320,6 +5319,16 @@ static void output_update_geometry(struct amber_output *output) {
 static void foreign_handle_activate(struct wl_listener *listener, void *data) {
 	struct amber_toplevel *toplevel =
 		wl_container_of(listener, toplevel, foreign_activate);
+	if (!toplevel_alive(toplevel)) {
+		return;
+	}
+	/* Taskbar click on a window parked on another workspace must
+	 * take you there first - focusing a hidden window otherwise. */
+	if (!toplevel->floating && toplevel->output != NULL &&
+			toplevel->workspace !=
+				toplevel->output->active_workspace) {
+		workspace_switch(toplevel->output, toplevel->workspace);
+	}
 	focus_toplevel(toplevel);
 }
 
@@ -6107,11 +6116,9 @@ int main(int argc, char *argv[]) {
 	server.ext_toplevel_list = wlr_ext_foreign_toplevel_list_v1_create(
 		server.wl_display, 1);
 
-	/* Screen capture: grim/slurp + wayshot (screencopy), OBS dmabuf
-	 * (export-dmabuf), portals + modern tools (ext-image-copy-capture
-	 * with its output-source manager). wlroots owns the sessions. */
-	wlr_screencopy_manager_v1_create(server.wl_display);
-	wlr_export_dmabuf_manager_v1_create(server.wl_display);
+	/* Screen capture for portals and modern tools (ext-image-copy-capture
+	 * with its output-source manager); classic screencopy/export-dmabuf
+	 * are created in the cheap-globals block above. */
 	wlr_ext_output_image_capture_source_manager_v1_create(
 		server.wl_display, 1);
 	wlr_ext_image_copy_capture_manager_v1_create(server.wl_display, 1);
