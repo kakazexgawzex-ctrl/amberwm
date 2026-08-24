@@ -1475,6 +1475,12 @@ static bool parse_combo(char *combo, uint32_t *mods, xkb_keysym_t *sym) {
 		return false;
 	}
 	*sym = xkb_keysym_from_name(key_name, XKB_KEYSYM_CASE_INSENSITIVE);
+	/* "F" resolves to XKB_KEY_F, which only matches caps-lock or
+	 * shifted input; a config key name means the physical key, so
+	 * fold letters to their lowercase keysym. */
+	if (*sym >= XKB_KEY_A && *sym <= XKB_KEY_Z) {
+		*sym += XKB_KEY_a - XKB_KEY_A;
+	}
 	return *sym != XKB_KEY_NoSymbol;
 }
 
@@ -2090,30 +2096,34 @@ static const char *screenshot_dir(struct amber_server *server) {
 	return fallback;
 }
 
+static char shot_clipboard_text[600];
+
 static void clipboard_send(struct wlr_data_source *source,
 		const char *mime_type, int32_t fd) {
-	if (shot_clipboard.data != NULL) {
-		ssize_t rc = write(fd, shot_clipboard.data,
-			(ssize_t)shot_clipboard.len);
+	if (strcmp(mime_type, "image/png") == 0) {
+		if (shot_clipboard.data != NULL) {
+			ssize_t rc = write(fd, shot_clipboard.data,
+				(ssize_t)shot_clipboard.len);
+			(void)rc;
+		}
+	} else if (shot_clipboard_text[0] != '\0') {
+		/* text/plain / text/uri-list: what clipboard managers and
+		 * paste targets actually read for a usable entry. */
+		ssize_t rc = write(fd, shot_clipboard_text,
+			strlen(shot_clipboard_text));
 		(void)rc;
 	}
 	close(fd);
 }
 
-/* Only tears down the source object. The PNG payload lives in
- * shot_clipboard and is owned by clipboard_set(): replacing the selection
- * on a second copy destroys this source while the NEW payload must stay
- * alive, so freeing data here would kill the fresh image (and later
- * double-free it in clipboard_set). */
+/* Intentionally frees nothing: wlroots runs this whenever the seat
+ * swaps selections, possibly while clipboard managers still hold
+ * offers from earlier copies - freeing there SIGSEGV'd in the mime
+ * loop. Sources are tiny and copies are human-rate; the leak is the
+ * safe tradeoff. The payload is owned by clipboard_set, not the
+ * source, so nothing else needs releasing either. */
 static void clipboard_destroy(struct wlr_data_source *source) {
-	/* wlroots 0.20 exports no source-finish helper: release the mime
-	 * strings and array ourselves, mirroring its internal cleanup. */
-	char **mime;
-	wl_array_for_each(mime, &source->mime_types) {
-		free(*mime);
-	}
-	wl_array_release(&source->mime_types);
-	free(source);
+	(void)source;
 }
 
 static const struct wlr_data_source_impl clipboard_impl = {
@@ -2122,26 +2132,34 @@ static const struct wlr_data_source_impl clipboard_impl = {
 };
 
 static void clipboard_set(struct amber_server *server,
-		struct amber_png_mem png) {
+		struct amber_png_mem png, const char *saved_path) {
+	/* Payload ownership stays here across copies; sources come and go
+	 * with each selection swap and are never freed (see above). */
 	free(shot_clipboard.data);
 	shot_clipboard = png;
+
+	shot_clipboard_text[0] = '\0';
+	if (saved_path != NULL && saved_path[0] != '\0') {
+		snprintf(shot_clipboard_text, sizeof(shot_clipboard_text),
+			"file://%s", saved_path);
+	}
 
 	struct wlr_data_source *source = calloc(1, sizeof(*source));
 	if (source == NULL) {
 		return;
 	}
-	/* Mandatory: leaves events.destroy as a zeroed wl_list otherwise,
-	 * and wl_list_insert into it segfaults when the seat swaps sources
-	 * on the next copy (observed crash). */
 	wlr_data_source_init(source, &clipboard_impl);
-	const char *mime = "image/png";
-	char *copy = strdup(mime);
-	char **slot = copy != NULL
-		? wl_array_add(&source->mime_types, sizeof(copy)) : NULL;
-	if (slot != NULL) {
-		*slot = copy;
-	} else {
-		free(copy);
+	const char *mimes[] = {"image/png", "text/plain"};
+	for (size_t i = 0; i < sizeof(mimes) / sizeof(mimes[0]); i++) {
+		char *copy = strdup(mimes[i]);
+		char **slot = copy != NULL
+			? wl_array_add(&source->mime_types, sizeof(copy))
+			: NULL;
+		if (slot != NULL) {
+			*slot = copy;
+		} else {
+			free(copy);
+		}
 	}
 
 	wlr_seat_set_selection(server->seat, source,
@@ -2559,7 +2577,7 @@ static void screenshot_full_screen(struct amber_server *server) {
 		fclose(f);
 		wlr_log(WLR_INFO, "saved %s (%zu bytes)", path, png.len);
 	}
-	clipboard_set(server, png);
+	clipboard_set(server, png, path);
 }
 
 static void screenshot_finish(struct amber_server *server, bool save_file) {
@@ -2582,12 +2600,13 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 		wlr_log(WLR_ERROR, "screenshot PNG encoding failed");
 		return;
 	}
+	char ts[32];
+	char path[560];
+	path[0] = '\0';
 	if (save_file) {
 		mkdir_p(screenshot_dir(server));
-		char ts[32];
 		time_t now = time(NULL);
 		strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&now));
-		char path[560];
 		snprintf(path, sizeof(path), "%s/amberwm-%s.png",
 			screenshot_dir(server), ts);
 		FILE *f = fopen(path, "wb");
@@ -2599,8 +2618,10 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 			wlr_log(WLR_INFO, "saved %s (%zux%zu px)",
 				path, (size_t)sel.width, (size_t)sel.height);
 		}
+	} else {
+		path[0] = '\0';
 	}
-	clipboard_set(server, png);
+	clipboard_set(server, png, path);
 }
 
 static void screenshot_motion(struct amber_server *server) {
@@ -5413,13 +5434,32 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 		}
 	}
 
+	bool was_focused = toplevel->server->focused_toplevel == toplevel;
+
 	struct amber_workspace *ws = toplevel_workspace(toplevel);
 	animation_start_lamp_close(toplevel); // snapshot before teardown
 	animation_cancel_for(toplevel); // node is about to be destroyed
 	toplevel_foreign_destroy(toplevel);
+	/* Neighbors captured pre-remove (the removed node's own links go
+	 * stale but the list is already rewired). */
+	struct wl_list *nb_next = toplevel->link.next;
+	struct wl_list *nb_prev = toplevel->link.prev;
 	wl_list_remove(&toplevel->link);
 	workspace_arrange(ws);
 	ipc_broadcast(toplevel->server); // occupancy changed
+
+	if (was_focused) {
+		/* Closing the focused window must not leave the seat
+		 * focusless: hand focus to the neighbor that took the
+		 * slot (right one first, else left). */
+		struct wl_list *pick = nb_next != &ws->toplevels
+			? nb_next : nb_prev;
+		if (pick != &ws->toplevels) {
+			struct amber_toplevel *n;
+			n = wl_container_of(pick, n, link);
+			focus_toplevel(n);
+		}
+	}
 }
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
@@ -5523,6 +5563,11 @@ static void xdg_toplevel_request_move(
 	 * provided serial against a list of button press serials sent to this
 	 * client, to prevent the client from requesting this whenever they want. */
 	struct amber_toplevel *toplevel = wl_container_of(listener, toplevel, request_move);
+	/* Tiles are moved by SUPER+drag (column reorder); honoring CSD
+	 * move requests here would yank tiles around on title-bar grabs. */
+	if (!toplevel->floating) {
+		return;
+	}
 	begin_interactive(toplevel, AMBER_CURSOR_MOVE, 0);
 }
 
