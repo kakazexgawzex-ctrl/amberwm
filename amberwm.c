@@ -2682,6 +2682,37 @@ static void screenshot_stamp_cursor(struct amber_server *server,
  * the capture so dim/borders never bake into the image. */
 static void screenshot_freeze_attach(struct amber_server *server,
 		struct amber_output *output) {
+	/* Fast PRINT re-entry can land here with the previous shot's
+	 * card/strips still on screen; tear the overlay down BEFORE
+	 * capturing or it bakes into the frozen frame. Node teardown
+	 * only - state flags stay untouched (unlike hide_ui). */
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_destroy(
+				&server->shot_shade[i]->node);
+			server->shot_shade[i] = NULL;
+		}
+		if (server->shot_borders[i] != NULL) {
+			wlr_scene_node_destroy(&server->shot_borders[i]->node);
+			server->shot_borders[i] = NULL;
+		}
+	}
+	if (server->shot_hint_bg != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_bg->node);
+		server->shot_hint_bg = NULL;
+	}
+	if (server->shot_hint_icon != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_icon->node);
+		server->shot_hint_icon = NULL;
+	}
+	if (server->shot_hint_l1 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l1->node);
+		server->shot_hint_l1 = NULL;
+	}
+	if (server->shot_hint_l2 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l2->node);
+		server->shot_hint_l2 = NULL;
+	}
 	if (server->shot_freeze != NULL) {
 		wlr_scene_node_destroy(&server->shot_freeze->node);
 		server->shot_freeze = NULL;
