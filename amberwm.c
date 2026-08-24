@@ -2270,7 +2270,7 @@ static unsigned char *screenshot_capture(struct amber_server *server,
 	struct wlr_texture *texture =
 		wlr_texture_from_buffer(server->renderer, state.buffer);
 	if (texture != NULL) {
-		uint32_t fmt = wlr_texture_preferred_read_format(texture);
+		uint32_t fmt = DRM_FORMAT_ABGR8888;
 		uint32_t stride = (uint32_t)texture->width * 4;
 		void *raw = malloc(stride * texture->height);
 		if (raw != NULL) {
@@ -2282,7 +2282,19 @@ static unsigned char *screenshot_capture(struct amber_server *server,
 					.width = texture->width,
 					.height = texture->height },
 			};
-			if (wlr_texture_read_pixels(texture, &ropts)) {
+			bool ok = wlr_texture_read_pixels(texture, &ropts);
+			if (!ok) {
+				/* Driver refused ABGR: retry with whatever it
+				 * prefers and let the swizzle below cope. */
+				fmt = wlr_texture_preferred_read_format(
+					texture);
+				if (fmt == DRM_FORMAT_INVALID) {
+					fmt = DRM_FORMAT_ABGR8888;
+				}
+				ropts.format = fmt;
+				ok = wlr_texture_read_pixels(texture, &ropts);
+			}
+			if (ok) {
 				result = malloc(
 					(size_t)lbox.width * lbox.height * 4);
 				for (int row = 0; row < lbox.height; row++) {
