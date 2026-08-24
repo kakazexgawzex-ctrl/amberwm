@@ -426,6 +426,11 @@ struct amber_keyboard {
 	/* Modifier bits that are locks (caps/num), stripped before matching
 	 * bindings so NumLock does not break Super+key combos. */
 	uint32_t lock_mask;
+	/* Keycodes whose press was consumed by us (bind, VT combo, or
+	 * screenshot grab); the matching releases are swallowed too, or
+	 * clients see a release for a key they never received. */
+	uint32_t swallowed[16];
+	size_t n_swallowed;
 
 	struct wl_listener modifiers;
 	struct wl_listener key;
@@ -2707,6 +2712,27 @@ static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 	return true; // swallow all keys while selecting
 }
 
+static bool keyboard_consume_swallowed(struct amber_keyboard *keyboard,
+		uint32_t keycode) {
+	for (size_t i = 0; i < keyboard->n_swallowed; i++) {
+		if (keyboard->swallowed[i] == keycode) {
+			keyboard->swallowed[i] =
+				keyboard->swallowed[--keyboard->n_swallowed];
+			return true;
+		}
+	}
+	return false;
+}
+
+static void keyboard_mark_swallowed(struct amber_keyboard *keyboard,
+		uint32_t keycode) {
+	if (keyboard->n_swallowed <
+			sizeof(keyboard->swallowed) /
+			sizeof(keyboard->swallowed[0])) {
+		keyboard->swallowed[keyboard->n_swallowed++] = keycode;
+	}
+}
+
 static void keyboard_handle_key(
 		struct wl_listener *listener, void *data) {
 	/* This event is raised when a key is pressed or released. */
@@ -2715,6 +2741,12 @@ static void keyboard_handle_key(
 	struct amber_server *server = keyboard->server;
 	struct wlr_keyboard_key_event *event = data;
 	struct wlr_seat *seat = server->seat;
+
+	if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
+			keyboard_consume_swallowed(keyboard,
+				event->keycode)) {
+		return;
+	}
 
 	/* Translate libinput keycode -> xkbcommon */
 	uint32_t keycode = event->keycode + 8;
@@ -2729,7 +2761,9 @@ static void keyboard_handle_key(
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
 		if (server->shot_active) {
-			/* Region screenshot grabs all keys while active. */
+			/* Region screenshot grabs all keys while active;
+			 * releases are swallowed via the mark below. */
+			keyboard_mark_swallowed(keyboard, event->keycode);
 			screenshot_key(server, modifiers, syms, nsyms);
 			return;
 		}
@@ -2745,6 +2779,8 @@ static void keyboard_handle_key(
 							XKB_KEY_XF86Switch_VT_1)
 							+ 1);
 				}
+				keyboard_mark_swallowed(keyboard,
+					event->keycode);
 				handled = true;
 				break;
 			}
@@ -2756,6 +2792,8 @@ static void keyboard_handle_key(
 				if (binding->mods == modifiers &&
 						binding->sym == syms[i]) {
 					binding_exec(server, binding);
+					keyboard_mark_swallowed(keyboard,
+						event->keycode);
 					handled = true;
 					break;
 				}
