@@ -6185,6 +6185,27 @@ static void mesh_test_draw(struct amber_server *server,
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(ta.target, ta.tex);
 		glUniform1i(ttex[ext], 0);
+		/* Backdrop first: repaint the whole output from the
+		 * snapshot every frame. The scene's damage-based redraws
+		 * leave stale mesh trails behind under the mesh - this
+		 * makes each frame deterministic. */
+		glDisable(GL_BLEND);
+		{
+			const GLfloat bv[] = {
+				-1.0f, -1.0f, 0.0f, 0.0f,
+				 1.0f, -1.0f, 1.0f, 0.0f,
+				-1.0f,  1.0f, 0.0f, 1.0f,
+				 1.0f,  1.0f, 1.0f, 1.0f,
+			};
+			glVertexAttribPointer(tpos[ext], 2, GL_FLOAT,
+				GL_FALSE, 4 * sizeof(GLfloat), bv);
+			glVertexAttribPointer(tuv[ext], 2, GL_FLOAT,
+				GL_FALSE, 4 * sizeof(GLfloat), bv + 2);
+			glEnableVertexAttribArray(tpos[ext]);
+			glEnableVertexAttribArray(tuv[ext]);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		}
+		glEnable(GL_BLEND);
 		glVertexAttribPointer(tpos[ext], 2, GL_FLOAT, GL_FALSE,
 			4 * sizeof(GLfloat), tva);
 		glVertexAttribPointer(tuv[ext], 2, GL_FLOAT, GL_FALSE,
