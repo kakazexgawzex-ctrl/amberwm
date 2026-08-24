@@ -5130,10 +5130,10 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 #undef LAMP_T
 }
 
-#define WOB_COLS 6
-#define WOB_ROWS 5
-#define WOB_STIFFNESS 180.0f
-#define WOB_DAMPING 14.8f // zeta ~0.55: a couple of visible overshoots
+#define WOB_COLS 8
+#define WOB_ROWS 6
+#define WOB_STIFFNESS 120.0f
+#define WOB_DAMPING 11.0f // zeta ~0.55: a couple of visible overshoots
 #define WOB_DT (ANIM_TICK_MS / 1000.0f)
 #define WOB_SETTLE_DISP 0.8f  // px
 #define WOB_SETTLE_VEL 15.0f  // px/s
@@ -5215,9 +5215,12 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 			int nx = (int)anim->px[tl];
 			int ny = (int)anim->py[tl];
 			int *lr = &anim->strip_rect[(iy * anim->cols + ix) * 4];
+			/* 2px right/bottom bleed hides hairline seams between
+			 * neighboring cells caused by int truncation. */
 			if (lr[0] != nx || lr[1] != ny || lr[2] != w ||
 					lr[3] != h) {
-				wlr_scene_buffer_set_dest_size(cell, w, h);
+				wlr_scene_buffer_set_dest_size(cell,
+					w + 2, h + 2);
 				wlr_scene_node_set_position(&cell->node, nx, ny);
 				lr[0] = nx;
 				lr[1] = ny;
