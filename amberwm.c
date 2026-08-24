@@ -143,6 +143,7 @@ struct amber_animation {
 	/* ANIM_LAMP_CLOSE: owns a locked snapshot + detached strip nodes. */
 	struct wlr_buffer *snapshot;   // locked at unmap, ours until done
 	struct wlr_texture *mesh_tex;  // GPU import of snapshot (mesh mode)
+	struct wlr_buffer *mesh_buf;   // our own copy backing mesh_tex
 	struct wlr_scene_buffer **strips; // live in output->fx_tree
 	int strip_count;
 	struct amber_output *output;
@@ -5092,6 +5093,10 @@ static void animation_lamp_cleanup(struct amber_animation *anim) {
 		wlr_texture_destroy(anim->mesh_tex);
 		anim->mesh_tex = NULL;
 	}
+	if (anim->mesh_buf != NULL) {
+		wlr_buffer_drop(anim->mesh_buf);
+		anim->mesh_buf = NULL;
+	}
 	free(anim->strip_rect);
 	anim->strip_rect = NULL;
 }
@@ -5751,12 +5756,29 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
 	if (server->wobble_mesh && anim->mesh_tex == NULL) {
-		/* Zero-copy GPU import: dmabuf -> EGLImage. No CPU
-		 * readback; texture holds its own buffer reference. */
-		anim->mesh_tex = fx_texture_from_buffer(
-			server->renderer, anim->snapshot);
-		wlr_log(WLR_INFO, "mesh: texture %dx%d import %s",
-			anim->snapshot->width, anim->snapshot->height,
+		/* Importing the client's own buffer melts on crocus:
+		 * scenefx's shm path trips GL_INVALID_VALUE in
+		 * glCopyTexSubImage2D and the texture ends up with
+		 * garbage/dead rows. Take ONE renderer readback of the
+		 * window rect (the proven screenshot path) and upload
+		 * our own buffer instead. */
+		struct wlr_box box = { anim->gx, anim->gy,
+			anim->gw, anim->gh };
+		unsigned char *cap = screenshot_capture(server, output,
+			box);
+		if (cap != NULL) {
+			struct wlr_buffer *own = rgba_buffer_take(
+				anim->gw, anim->gh, cap);
+			if (own != NULL) {
+				anim->mesh_tex = fx_texture_from_buffer(
+					server->renderer, own);
+				anim->mesh_buf = own;
+			} else {
+				free(cap);
+			}
+		}
+		wlr_log(WLR_INFO, "mesh: snapshot copy %dx%d %s",
+			anim->gw, anim->gh,
 			anim->mesh_tex != NULL ? "ok" : "FAILED");
 	}
 
