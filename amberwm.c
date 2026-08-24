@@ -14,6 +14,9 @@
 #include <sys/stat.h>
 #include <sys/inotify.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_data_control_v1.h>
+#include <wlr/types/wlr_ext_data_control_v1.h>
+#include <wlr/types/wlr_primary_selection_v1.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/session.h>
@@ -437,6 +440,11 @@ struct amber_keyboard {
 	 * clients see a release for a key they never received. */
 	uint32_t swallowed[16];
 	size_t n_swallowed;
+	/* Physically-held keycodes; a PRESSED event for an already-held
+	 * keycode is auto-repeat and must never re-trigger one-shot binds
+	 * (PRINT re-entering screenshot mode spawned cancel loops). */
+	uint32_t held[32];
+	size_t n_held;
 
 	struct wl_listener modifiers;
 	struct wl_listener key;
@@ -2761,6 +2769,35 @@ static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 	return true; // swallow all keys while selecting
 }
 
+static bool keyboard_held_has(struct amber_keyboard *keyboard,
+		uint32_t keycode) {
+	for (size_t i = 0; i < keyboard->n_held; i++) {
+		if (keyboard->held[i] == keycode) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void keyboard_held_mark(struct amber_keyboard *keyboard,
+		uint32_t keycode) {
+	if (!keyboard_held_has(keyboard, keycode) &&
+			keyboard->n_held < sizeof(keyboard->held) /
+				sizeof(keyboard->held[0])) {
+		keyboard->held[keyboard->n_held++] = keycode;
+	}
+}
+
+static void keyboard_held_clear(struct amber_keyboard *keyboard,
+		uint32_t keycode) {
+	for (size_t i = 0; i < keyboard->n_held; i++) {
+		if (keyboard->held[i] == keycode) {
+			keyboard->held[i] = keyboard->held[--keyboard->n_held];
+			return;
+		}
+	}
+}
+
 static bool keyboard_consume_swallowed(struct amber_keyboard *keyboard,
 		uint32_t keycode) {
 	for (size_t i = 0; i < keyboard->n_swallowed; i++) {
@@ -2791,10 +2828,11 @@ static void keyboard_handle_key(
 	struct wlr_keyboard_key_event *event = data;
 	struct wlr_seat *seat = server->seat;
 
-	if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
-			keyboard_consume_swallowed(keyboard,
-				event->keycode)) {
-		return;
+	if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+		keyboard_held_clear(keyboard, event->keycode);
+		if (keyboard_consume_swallowed(keyboard, event->keycode)) {
+			return;
+		}
 	}
 
 	/* Translate libinput keycode -> xkbcommon */
@@ -2806,45 +2844,65 @@ static void keyboard_handle_key(
 
 	bool handled = false;
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		bool is_repeat = keyboard_held_has(keyboard, event->keycode);
+		keyboard_held_mark(keyboard, event->keycode);
 		uint32_t modifiers =
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
-		if (server->shot_active) {
-			/* Region screenshot grabs all keys while active;
-			 * releases are swallowed via the mark below. */
-			keyboard_mark_swallowed(keyboard, event->keycode);
-			screenshot_key(server, modifiers, syms, nsyms);
-			return;
-		}
-		for (int i = 0; i < nsyms && !handled; i++) {
-			/* Ctrl+Alt+Fx hands the VT back to logind/seatd;
-			 * without this the combo falls through to clients
-			 * and the TTY is unreachable. */
-			if (syms[i] >= XKB_KEY_XF86Switch_VT_1 &&
-					syms[i] <= XKB_KEY_XF86Switch_VT_12) {
-				if (server->session != NULL) {
-					wlr_session_change_vt(server->session,
-						(int)(syms[i] -
-							XKB_KEY_XF86Switch_VT_1)
-							+ 1);
-				}
+		if (!is_repeat) {
+			if (server->shot_active) {
+				/* Region screenshot grabs all keys while
+				 * active; releases are swallowed via the
+				 * mark below. */
 				keyboard_mark_swallowed(keyboard,
 					event->keycode);
-				handled = true;
-				break;
+				screenshot_key(server, modifiers, syms,
+					nsyms);
+				return;
 			}
-		}
-		for (int i = 0; i < nsyms && !handled; i++) {
-			for (size_t j = 0; j < server->binding_count; j++) {
-				const struct amber_binding *binding =
-					&server->bindings[j];
-				if (binding->mods == modifiers &&
-						binding->sym == syms[i]) {
-					binding_exec(server, binding);
+			for (int i = 0; i < nsyms && !handled; i++) {
+				/* Ctrl+Alt+Fx hands the VT back to logind/
+				 * seatd; without this the combo falls
+				 * through to clients and the TTY is
+				 * unreachable. */
+				if (syms[i] >= XKB_KEY_XF86Switch_VT_1 &&
+						syms[i] <=
+						XKB_KEY_XF86Switch_VT_12) {
+					if (server->session != NULL) {
+						wlr_session_change_vt(
+							server->session,
+							(int)(syms[i] -
+								XKB_KEY_XF86Switch_VT_1)
+								+ 1);
+					}
 					keyboard_mark_swallowed(keyboard,
 						event->keycode);
 					handled = true;
 					break;
+				}
+			}
+			for (int i = 0; i < nsyms && !handled; i++) {
+				xkb_keysym_t sym = syms[i];
+				/* Config key names mean physical keys: fold
+				 * shifted/caps letters so SUPER+SHIFT+t
+				 * matches a bind stored as lowercase. */
+				if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
+					sym += XKB_KEY_a - XKB_KEY_A;
+				}
+				for (size_t j = 0;
+						j < server->binding_count;
+						j++) {
+					const struct amber_binding *binding =
+						&server->bindings[j];
+					if (binding->mods == modifiers &&
+							binding->sym == sym) {
+						binding_exec(server, binding);
+						keyboard_mark_swallowed(
+							keyboard,
+							event->keycode);
+						handled = true;
+						break;
+					}
 				}
 			}
 		}
@@ -3382,11 +3440,21 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	/* Notify the client with pointer focus that a button press has occurred */
+	/* Notify the client with pointer focus that a button press has
+	 * occurred, then focus it. */
+	struct wlr_surface *prev_focus =
+		server->seat->keyboard_state.focused_surface;
 	wlr_seat_pointer_notify_button(server->seat,
 			event->time_msec, event->button, event->state);
-	/* Focus that client if the button was _pressed_ */
 	focus_toplevel(toplevel);
+	if (event->state == WL_POINTER_BUTTON_STATE_PRESSED &&
+			toplevel != NULL && !toplevel->floating &&
+			server->seat->keyboard_state.focused_surface !=
+				prev_focus) {
+		/* Camera follows focus (niri): re-arranging scrolls the
+		 * newly focused column into view / centers it. */
+		workspace_arrange(toplevel_workspace(toplevel));
+	}
 }
 
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -5191,14 +5259,13 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	/* Per-output subtrees live directly under the scene root and are
 	 * kept positioned at the output's layout origin (see
 	 * output_update_geometry). Creation order defines stacking:
-	 * background < bottom < top(bar) < workspaces < overlay < fx.
-	 * Windows sit ABOVE the bar by design; layer popups and
-	 * fullscreen windows live in the overlay tree above them. */
+	 * background < bottom < workspaces < top(bar/notifs) < overlay < fx.
+	 * Windows sit BELOW the top layer so bar and notification popups
+	 * always render above them (tiles keep off the bar via its
+	 * exclusive zone); fullscreen windows move into overlay above all. */
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND] =
 		wlr_scene_tree_create(&server->scene->tree);
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM] =
-		wlr_scene_tree_create(&server->scene->tree);
-	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] =
 		wlr_scene_tree_create(&server->scene->tree);
 	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
 		output->workspaces[i].tree =
@@ -5206,6 +5273,8 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_scene_node_set_enabled(&output->workspaces[i].tree->node,
 			i == output->active_workspace);
 	}
+	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_TOP] =
+		wlr_scene_tree_create(&server->scene->tree);
 	output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY] =
 		wlr_scene_tree_create(&server->scene->tree);
 	output->fx_tree = wlr_scene_tree_create(&server->scene->tree);
@@ -6046,6 +6115,13 @@ int main(int argc, char *argv[]) {
 	wlr_ext_output_image_capture_source_manager_v1_create(
 		server.wl_display, 1);
 	wlr_ext_image_copy_capture_manager_v1_create(server.wl_display, 1);
+
+	/* Clipboard access for unfocused clients: clipboard managers
+	 * (noctalia history), wl-copy/wl-paste, cliphist. Without these
+	 * the seat selection is unreachable outside keyboard focus. */
+	wlr_data_control_manager_v1_create(server.wl_display);
+	wlr_ext_data_control_manager_v1_create(server.wl_display, 1);
+	wlr_primary_selection_v1_device_manager_create(server.wl_display);
 
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);

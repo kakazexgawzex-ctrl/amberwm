@@ -27,6 +27,24 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+static int ipc_dial(const char *path, bool verbose) {
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		if (verbose) {
+			fprintf(stderr, "ambermsg: cannot connect to %s: %s\n",
+				path, strerror(errno));
+		}
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 static int connect_ipc(void) {
 	char path[512];
 	path[0] = '\0';
@@ -35,32 +53,42 @@ static int connect_ipc(void) {
 		runtime = "/tmp";
 	}
 
-	/* AmberWM's own socket always wins: the host session may export
-	 * MANGO_INSTANCE_SIGNATURE for a DIFFERENT compositor (real
-	 * mango), and we must not talk to that. */
-	char pattern[512];
-	snprintf(pattern, sizeof(pattern), "%s/amberwm-*.sock", runtime);
-	glob_t gl;
-	bool found = glob(pattern, GLOB_NOSORT, NULL, &gl) == 0;
-	if (found && gl.gl_pathc >= 1) {
-		snprintf(path, sizeof(path), "%s",
-			gl.gl_pathv[gl.gl_pathc - 1]); // newest instance
-	}
-	size_t matches = found ? gl.gl_pathc : 0;
-	globfree(&gl);
-	if (matches > 1) {
-		fprintf(stderr,
-			"ambermsg: %zu amberwm instances, using %s "
-			"(set AMBERWM_IPC_SOCKET to disambiguate)\n",
-			matches, path);
+	/* An explicit AMBERWM_IPC_SOCKET always wins over scanning: stale
+	 * socket files from crashed sessions would otherwise be picked. */
+	const char *own = getenv("AMBERWM_IPC_SOCKET");
+	if (own != NULL && own[0] != '\0') {
+		snprintf(path, sizeof(path), "%s", own);
 	}
 
+	/* Probe candidates for a LIVE listener: crashed sessions leave
+	 * socket files behind that accept nothing. */
+	char fallback[512];
+	fallback[0] = '\0';
 	if (path[0] == '\0') {
-		const char *own = getenv("AMBERWM_IPC_SOCKET");
-		if (own != NULL && own[0] != '\0') {
-			snprintf(path, sizeof(path), "%s", own);
+		char pattern[512];
+		snprintf(pattern, sizeof(pattern), "%s/amberwm-*.sock",
+			runtime);
+		glob_t gl;
+		if (glob(pattern, GLOB_NOSORT, NULL, &gl) == 0) {
+			for (size_t i = 0; i < gl.gl_pathc; i++) {
+				snprintf(fallback, sizeof(fallback), "%s",
+					gl.gl_pathv[i]);
+				int pfd = ipc_dial(fallback, false);
+				if (pfd >= 0) {
+					close(pfd);
+					snprintf(path, sizeof(path), "%s",
+						fallback);
+					break;
+				}
+			}
+			globfree(&gl);
 		}
 	}
+	if (path[0] == '\0' && fallback[0] != '\0') {
+		/* Nothing answered; report against the last candidate. */
+		snprintf(path, sizeof(path), "%s", fallback);
+	}
+
 	if (path[0] == '\0') {
 		/* Legacy sessions still export the mango-style variable. */
 		const char *sig = getenv("MANGO_INSTANCE_SIGNATURE");
@@ -83,19 +111,7 @@ static int connect_ipc(void) {
 			display);
 	}
 
-	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	if (fd < 0) {
-		return -1;
-	}
-	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "ambermsg: cannot connect to %s: %s\n",
-			path, strerror(errno));
-		close(fd);
-		return -1;
-	}
-	return fd;
+	return ipc_dial(path, true);
 }
 
 static void usage(FILE *out) {
