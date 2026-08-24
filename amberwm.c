@@ -5230,8 +5230,8 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 #undef LAMP_T
 }
 
-#define WOB_COLS 12
-#define WOB_ROWS 10
+#define WOB_COLS 8
+#define WOB_ROWS 6
 #define WOB_STIFFNESS 165.0f
 #define WOB_DAMPING 14.5f // zeta ~0.55: a couple of visible overshoots
 #define WOB_DT (ANIM_TICK_MS / 1000.0f)
@@ -5283,9 +5283,9 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 			float lx = anim->drag_x * (wgt - 1.0f);
 			float ly = anim->drag_y * (wgt - 1.0f);
 			float ll = sqrtf(lx * lx + ly * ly);
-			if (ll > 56.0f) {
-				lx *= 56.0f / ll;
-				ly *= 56.0f / ll;
+			if (ll > 64.0f) {
+				lx *= 64.0f / ll;
+				ly *= 64.0f / ll;
 			}
 			float tx = nx + ix * cell_w + lx;
 			float ty = ny + iy * cell_h + ly;
@@ -5723,7 +5723,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			float dyp = iy * cell_h0 - anim->ay;
 			float dist = sqrtf(dxp * dxp + dyp * dyp);
 			anim->wf[iy * pts_x + ix] =
-				1.0f / (1.0f + dist / 160.0f);
+				1.0f / (1.0f + dist / 240.0f);
 		}
 	}
 	toplevel_apply_fx(toplevel);
