@@ -141,6 +141,7 @@ struct amber_animation {
 	int from_dx;        // horizontal offset applied at progress 0
 	/* ANIM_LAMP_CLOSE: owns a locked snapshot + detached strip nodes. */
 	struct wlr_buffer *snapshot;   // locked at unmap, ours until done
+	struct wlr_texture *mesh_tex;  // GPU import of snapshot (mesh mode)
 	struct wlr_scene_buffer **strips; // live in output->fx_tree
 	int strip_count;
 	struct amber_output *output;
@@ -5086,6 +5087,10 @@ static void animation_lamp_cleanup(struct amber_animation *anim) {
 		wlr_buffer_unlock(anim->snapshot);
 		anim->snapshot = NULL;
 	}
+	if (anim->mesh_tex != NULL) {
+		wlr_texture_destroy(anim->mesh_tex);
+		anim->mesh_tex = NULL;
+	}
 	free(anim->strip_rect);
 	anim->strip_rect = NULL;
 }
@@ -5735,6 +5740,15 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	toplevel_apply_fx(toplevel);
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
+	if (server->wobble_mesh && anim->mesh_tex == NULL) {
+		/* Zero-copy GPU import: dmabuf -> EGLImage. No CPU
+		 * readback; texture holds its own buffer reference. */
+		anim->mesh_tex = wlr_texture_from_buffer(
+			server->renderer, anim->snapshot, NULL);
+		wlr_log(WLR_INFO, "mesh: texture %dx%d import %s",
+			anim->snapshot->width, anim->snapshot->height,
+			anim->mesh_tex != NULL ? "ok" : "FAILED");
+	}
 
 	float buf_w = anim->snapshot->width;
 	float buf_h = anim->snapshot->height;
