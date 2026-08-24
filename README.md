@@ -52,6 +52,14 @@ radius / shadow rules, animations (`animations`,
 `center-focused-column`, magic-lamp close, workspace slide), key binds and
 per-app window rules.
 
+`wobble-render=mesh|strips` picks the wobble drag engine (default
+`strips`). `mesh` renders the drag through a GPU pass: the window is
+snapshotted to a texture at grab and drawn as a bicubic Bezier surface
+over a 4x4 compiz-style spring model (grab point pinned, corners lag
+and whip, C1-continuous bends). `strips` is the original scene-buffer
+grid. Falls back to `strips` automatically if the texture import
+fails.
+
 ## Highlights
 
 - Scrollable horizontal strip of columns (niri-style), optional
