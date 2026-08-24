@@ -2988,7 +2988,10 @@ static void handle_xdg_activation_request(struct wl_listener *listener,
 	}
 	struct wlr_scene_tree *tree = toplevel->base->data;
 	struct amber_toplevel *t = tree->node.data;
-	if (t == NULL) {
+	/* Pre-map windows have no output yet; toplevel_workspace() would
+	 * deref NULL and hand back a garbage-by-arithmetic pointer that no
+	 * NULL check downstream can catch. */
+	if (t == NULL || t->output == NULL) {
 		return;
 	}
 	struct amber_workspace *ws = toplevel_workspace(t);
