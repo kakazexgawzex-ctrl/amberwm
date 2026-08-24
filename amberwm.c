@@ -21,6 +21,10 @@
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/types/wlr_ext_workspace_v1.h>
+#include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_export_dmabuf_v1.h>
+#include <wlr/types/wlr_ext_image_copy_capture_v1.h>
+#include <wlr/types/wlr_ext_image_capture_source_v1.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
@@ -5862,6 +5866,15 @@ int main(int argc, char *argv[]) {
 		wl_signal_add(&server.ext_ws_mgr->events.commit,
 			&server.ext_ws_commit);
 	}
+
+	/* Screen capture: grim/slurp + wayshot (screencopy), OBS dmabuf
+	 * (export-dmabuf), portals + modern tools (ext-image-copy-capture
+	 * with its output-source manager). wlroots owns the sessions. */
+	wlr_screencopy_manager_v1_create(server.wl_display);
+	wlr_export_dmabuf_manager_v1_create(server.wl_display);
+	wlr_ext_output_image_capture_source_manager_v1_create(
+		server.wl_display, 1);
+	wlr_ext_image_copy_capture_manager_v1_create(server.wl_display, 1);
 
 	/* One xkb context shared by every keyboard that ever connects. */
 	server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
