@@ -3498,9 +3498,11 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 		screenshot_cancel(server);
 		return;
 	}
+	/* Hide the overlay FIRST: shade strips, borders and the hint card
+	 * must not bake into the captured pixels. */
+	screenshot_hide_ui(server);
 	unsigned char *rgba = screenshot_capture(server, server->shot_output,
 		sel);
-	screenshot_hide_ui(server);
 	if (rgba == NULL) {
 		wlr_log(WLR_ERROR, "screenshot failed");
 		return;
