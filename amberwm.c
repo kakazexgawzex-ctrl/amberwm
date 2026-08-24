@@ -813,7 +813,7 @@ static void toplevel_to_tiled(struct amber_toplevel *t) {
 			server->focused_toplevel->workspace == t->workspace) {
 		anchor = &server->focused_toplevel->link;
 	} else if (server->focused_toplevel == t) {
-		anchor = &t->link; // keep own slot
+		anchor = t->link.prev; // keep own slot
 	}
 	wl_list_remove(&t->link);
 	wl_list_insert(anchor, &t->link); // after anchor = right of it
@@ -3265,114 +3265,7 @@ static struct wlr_box screenshot_selection_box(struct amber_server *server) {
 	return out;
 }
 
-/* Hint card: stage 0 = intro (nothing selected yet), 1 = copy/save. */
-static void screenshot_hint_show(struct amber_server *server, int stage) {
-	struct amber_output *out = server->shot_output;
-	if (out == NULL) {
-		return;
-	}
-	/* Stage 1 carries l2; skip rebuild when already showing it so
-	 * per-motion ui_update calls don't recreate buffers. */
-	if (stage == 1 && server->shot_hint_l2 != NULL &&
-			server->shot_hint_bg != NULL) {
-		return;
-	}
-	if (stage == 0 && server->shot_hint_bg != NULL &&
-			server->shot_hint_l2 == NULL) {
-		return;
-	}
-	if (server->shot_hint_bg != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_bg->node);
-		server->shot_hint_bg = NULL;
-	}
-	if (server->shot_hint_icon != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_icon->node);
-		server->shot_hint_icon = NULL;
-	}
-	if (server->shot_hint_l1 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l1->node);
-		server->shot_hint_l1 = NULL;
-	}
-	if (server->shot_hint_l2 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l2->node);
-		server->shot_hint_l2 = NULL;
-	}
-	float card_col[4] = {0.11f, 0.11f, 0.13f, 0.94f};
-	float text_col[4] = {0.95f, 0.95f, 0.96f, 1.0f};
-	float dim_text[4] = {0.72f, 0.73f, 0.77f, 1.0f};
-	int pad = 18, gap = 10;
-	struct wlr_buffer *l1b = NULL, *l2b = NULL, *icon = NULL;
-	if (stage == 0) {
-		l1b = ui_text_buffer("Drag an area to screenshot",
-			16, text_col);
-	} else {
-		icon = ui_download_icon(42, text_col);
-		l1b = ui_text_buffer(
-			"Press Ctrl+C to copy to clipboard", 15,
-			text_col);
-		l2b = ui_text_buffer(
-			"Space saves the shot to ~/Pictures", 14,
-			dim_text);
-	}
-	if (l1b == NULL) {
-		return;
-	}
-	struct wlr_scene_tree *tree =
-		out->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
-	int iw = icon != NULL ? icon->width : 0;
-	int cw = l1b->width + pad * 2;
-	if (l2b != NULL && l2b->width + pad * 2 > cw) {
-		cw = l2b->width + pad * 2;
-	}
-	if (iw + pad * 2 > cw) {
-		cw = iw + pad * 2;
-	}
-	int ch = pad * 2 + l1b->height;
-	if (l2b != NULL) {
-		ch += gap + l2b->height;
-	}
-	if (icon != NULL) {
-		ch += gap + icon->height;
-	}
-	int lim_w = out->layout_box.width, lim_h =
-		out->layout_box.height;
-	int ox = (lim_w - cw) / 2, oy = (lim_h - ch) / 2;
-	{
-		struct wlr_buffer *card = ui_rounded_card(cw, ch, 18,
-			card_col);
-		server->shot_hint_bg = ui_attach(tree, card);
-	}
-	if (server->shot_hint_bg == NULL) {
-		return;
-	}
-	wlr_scene_node_set_position(&server->shot_hint_bg->node, ox, oy);
-	int y = oy + pad, x;
-	if (icon != NULL) {
-		server->shot_hint_icon = ui_attach(tree, icon);
-		x = ox + (cw - icon->width) / 2;
-		y += gap;
-		if (server->shot_hint_icon != NULL) {
-			wlr_scene_node_set_position(
-				&server->shot_hint_icon->node, x, y);
-		}
-		y += icon->height;
-	}
-	server->shot_hint_l1 = ui_attach(tree, l1b);
-	x = ox + (cw - l1b->width) / 2;
-	if (server->shot_hint_l1 != NULL) {
-		wlr_scene_node_set_position(
-			&server->shot_hint_l1->node, x, y);
-	}
-	y += l1b->height + (l2b != NULL ? gap : 0);
-	if (l2b != NULL) {
-		server->shot_hint_l2 = ui_attach(tree, l2b);
-		x = ox + (cw - l2b->width) / 2;
-		if (server->shot_hint_l2 != NULL) {
-			wlr_scene_node_set_position(
-				&server->shot_hint_l2->node, x, y);
-		}
-	}
-}
+
 
 static void screenshot_ui_update(struct amber_server *server) {
 	if (!server->shot_active || server->shot_output == NULL) {
@@ -3463,7 +3356,6 @@ static void screenshot_ui_update(struct amber_server *server) {
 	wlr_scene_node_set_position(&r[3]->node, sel.x + sel.width, sel.y);
 	wlr_scene_node_set_enabled(&r[3]->node, true);
 
-	screenshot_hint_show(server, 1);
 }
 
 static void screenshot_start_region(struct amber_server *server) {
