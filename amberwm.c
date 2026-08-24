@@ -2029,6 +2029,39 @@ static void switcher_open(struct amber_server *server);
 
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
+
+	/* Fast PRINT re-entry can land here with the previous shot's
+	 * card/strips still on screen; tear the overlay down BEFORE
+	 * capturing or it bakes into the frozen frame. Node teardown
+	 * only - state flags stay untouched (unlike hide_ui). */
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_destroy(
+				&server->shot_shade[i]->node);
+			server->shot_shade[i] = NULL;
+		}
+		if (server->shot_borders[i] != NULL) {
+			wlr_scene_node_destroy(&server->shot_borders[i]->node);
+			server->shot_borders[i] = NULL;
+		}
+	}
+	if (server->shot_hint_bg != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_bg->node);
+		server->shot_hint_bg = NULL;
+	}
+	if (server->shot_hint_icon != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_icon->node);
+		server->shot_hint_icon = NULL;
+	}
+	if (server->shot_hint_l1 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l1->node);
+		server->shot_hint_l1 = NULL;
+	}
+	if (server->shot_hint_l2 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l2->node);
+		server->shot_hint_l2 = NULL;
+	}
+	server->shot_show_pointer = true;
 	switch (binding->id) {
 	case AMBER_BINDING_QUIT:
 		server->shutting_down = true;
@@ -2682,37 +2715,6 @@ static void screenshot_stamp_cursor(struct amber_server *server,
  * the capture so dim/borders never bake into the image. */
 static void screenshot_freeze_attach(struct amber_server *server,
 		struct amber_output *output) {
-	/* Fast PRINT re-entry can land here with the previous shot's
-	 * card/strips still on screen; tear the overlay down BEFORE
-	 * capturing or it bakes into the frozen frame. Node teardown
-	 * only - state flags stay untouched (unlike hide_ui). */
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_destroy(
-				&server->shot_shade[i]->node);
-			server->shot_shade[i] = NULL;
-		}
-		if (server->shot_borders[i] != NULL) {
-			wlr_scene_node_destroy(&server->shot_borders[i]->node);
-			server->shot_borders[i] = NULL;
-		}
-	}
-	if (server->shot_hint_bg != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_bg->node);
-		server->shot_hint_bg = NULL;
-	}
-	if (server->shot_hint_icon != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_icon->node);
-		server->shot_hint_icon = NULL;
-	}
-	if (server->shot_hint_l1 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l1->node);
-		server->shot_hint_l1 = NULL;
-	}
-	if (server->shot_hint_l2 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l2->node);
-		server->shot_hint_l2 = NULL;
-	}
 	if (server->shot_freeze != NULL) {
 		wlr_scene_node_destroy(&server->shot_freeze->node);
 		server->shot_freeze = NULL;
@@ -3715,6 +3717,13 @@ static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
 		 * a 1x1 box. */
 		bool ready = server->shot_has_sel && !server->shot_dragging
 			&& !server->shot_moving;
+		if (sym == XKB_KEY_p || sym == XKB_KEY_P) {
+			server->shot_show_pointer =
+				!server->shot_show_pointer;
+			screenshot_freeze_attach(server,
+				server->shot_output);
+			return true;
+		}
 		if ((ctrl && (sym == XKB_KEY_c || sym == XKB_KEY_C)) &&
 				ready) {
 			screenshot_finish(server, false);
