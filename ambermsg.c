@@ -143,6 +143,40 @@ int main(int argc, char **argv) {
 		return argc < 2 ? 1 : 0;
 	}
 
+	/* Fake features that answer locally and never reach the wire;
+	 * real feature names never collide because the server validates
+	 * its own set. */
+	static const struct { const char *name, *msg; } eggs[] = {
+		{ "opsec",
+		  "vpn activated (it's logging your activity now)" },
+		{ "larp", "you are officially a larper now" },
+		{ "hacker",
+		  "accessing mainframe...\n"
+		  "access denied. this is a wayland compositor." },
+		{ "sigma", "grindset engaged. focus +100, sleep -8h" },
+		{ "darkmode", "rejected: your soul already ships dark mode" },
+		{ "productivity",
+		  "conflict: dependency 'motivation' not found in PATH" },
+		{ "touchgrass", "/touch/grass: No such file or directory" },
+		{ "ai", "ai enabled. it's if-statements all the way down" },
+		{ "blockchain",
+		  "block chained. nothing changed. as designed" },
+		{ "eggs", "no eggs here. definitely none. stop looking." },
+	};
+	const char *cmd0 = argv[1];
+	const char *arg1 = argc >= 3 ? argv[2] : NULL;
+	bool verb = strcmp(cmd0, "enable") == 0 ||
+		strcmp(cmd0, "disable") == 0;
+	for (size_t i = 0; i < sizeof(eggs) / sizeof(eggs[0]); i++) {
+		bool hit = arg1 != NULL && verb &&
+			strcmp(arg1, eggs[i].name) == 0;
+		hit = hit || (!verb && strcmp(cmd0, eggs[i].name) == 0);
+		if (hit) {
+			printf("%s\n", eggs[i].msg);
+			return 0;
+		}
+	}
+
 	char req[1024];
 	size_t len = 0;
 
