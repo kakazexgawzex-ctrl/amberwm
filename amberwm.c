@@ -3404,7 +3404,6 @@ static void screenshot_ui_update(struct amber_server *server) {
 			wlr_scene_node_set_enabled(
 				&server->shot_borders[i]->node, false);
 		}
-		screenshot_hint_show(server, 0);
 		return;
 	}
 	/* While dragging the box tracks the cursor; after release it must
@@ -3417,7 +3416,6 @@ static void screenshot_ui_update(struct amber_server *server) {
 			wlr_scene_node_set_enabled(
 				&server->shot_borders[i]->node, false);
 		}
-		screenshot_hint_show(server, 0);
 		return;
 	}
 
