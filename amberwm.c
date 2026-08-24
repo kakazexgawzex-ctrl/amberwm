@@ -311,6 +311,22 @@ struct amber_server {
 	struct amber_output *shot_last_output; // identity compare only
 	bool shot_show_pointer; // stamp the cursor into the frozen frame
 	char *screenshot_dir; // config override, NULL = default
+
+	/* Built-in window switcher: static thumbnail grid over a dim
+	 * layer on the active output; nodes live in the overlay tree. */
+	bool sw_active;
+	struct amber_output *sw_output;
+	struct wlr_scene_rect *sw_dim;
+	size_t sw_count, sw_selected, sw_cols;
+	struct {
+		struct amber_toplevel *tl;
+		struct wlr_buffer *buf; // captured pre-dim, attached below
+		struct wlr_scene_rect *ring;
+		struct wlr_scene_buffer *thumb;
+		struct wlr_scene_rect *fallback;
+		struct wlr_box box; // output-local hit rect
+	} sw_tiles[20];
+
 	struct amber_toplevel *grabbed_toplevel;
 	double grab_x, grab_y;
 	struct wlr_box grab_geobox;
@@ -1373,6 +1389,7 @@ enum amber_binding_id {
 	AMBER_BINDING_TOGGLE_MAXIMIZE,
 	AMBER_BINDING_SCREENSHOT,
 	AMBER_BINDING_SCREENSHOT_REGION,
+	AMBER_BINDING_SWITCHER,
 };
 
 struct amber_binding {
@@ -1565,6 +1582,8 @@ static bool parse_action(struct amber_server *server,
 		b->id = AMBER_BINDING_SCREENSHOT_REGION;
 	} else if (strcmp(buf, "screenshot-screen") == 0) {
 		b->id = AMBER_BINDING_SCREENSHOT;
+	} else if (strcmp(buf, "switcher") == 0) {
+		b->id = AMBER_BINDING_SWITCHER;
 	} else if (strcmp(buf, "workspace") == 0 || strcmp(buf,
 				"move-to-workspace") == 0) {
 		int n = sp ? atoi(sp + 1) : 0;
@@ -1976,6 +1995,7 @@ static void config_watch_init(struct amber_server *server) {
 
 static void screenshot_start_region(struct amber_server *server);
 static void screenshot_full_screen(struct amber_server *server);
+static void switcher_open(struct amber_server *server);
 
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
@@ -1995,6 +2015,9 @@ static void binding_exec(struct amber_server *server,
 		break;
 	case AMBER_BINDING_EXEC:
 		spawn(binding->cmd);
+		break;
+	case AMBER_BINDING_SWITCHER:
+		switcher_open(server);
 		break;
 	case AMBER_BINDING_CYCLE_FOCUS:
 		cycle_focus(server, binding->arg);
@@ -2455,6 +2478,294 @@ static void screenshot_cancel(struct amber_server *server) {
 	wlr_log(WLR_INFO, "screenshot canceled");
 }
 
+/* ==================== Built-in window switcher ====================
+ * Dim + grid of STATIC thumbnails captured at open time (cheap on old
+ * GPUs; no live compositing). Thumbnails are the labels: no text. */
+
+static void switcher_close(struct amber_server *server) {
+	if (!server->sw_active && server->sw_dim == NULL) {
+		return;
+	}
+	for (size_t i = 0; i < server->sw_count; i++) {
+		if (server->sw_tiles[i].thumb != NULL) {
+			wlr_scene_node_destroy(
+				&server->sw_tiles[i].thumb->node);
+		}
+		if (server->sw_tiles[i].fallback != NULL) {
+			wlr_scene_node_destroy(
+				&server->sw_tiles[i].fallback->node);
+		}
+		if (server->sw_tiles[i].ring != NULL) {
+			wlr_scene_node_destroy(
+				&server->sw_tiles[i].ring->node);
+		}
+		server->sw_tiles[i].tl = NULL;
+	}
+	server->sw_count = 0;
+	if (server->sw_dim != NULL) {
+		wlr_scene_node_destroy(&server->sw_dim->node);
+		server->sw_dim = NULL;
+	}
+	server->sw_active = false;
+	server->sw_output = NULL;
+}
+
+static void switcher_select(struct amber_server *server, size_t idx) {
+	if (server->sw_count == 0) {
+		return;
+	}
+	idx %= server->sw_count;
+	if (server->sw_selected < server->sw_count &&
+			server->sw_tiles[server->sw_selected].ring != NULL) {
+		wlr_scene_node_set_enabled(
+			&server->sw_tiles[server->sw_selected].ring->node,
+			false);
+	}
+	server->sw_selected = idx;
+	if (server->sw_tiles[idx].ring != NULL) {
+		wlr_scene_node_set_enabled(
+			&server->sw_tiles[idx].ring->node, true);
+	}
+}
+
+static void switcher_activate_selected(struct amber_server *server) {
+	struct amber_toplevel *t = server->sw_count > 0 &&
+		server->sw_selected < server->sw_count
+		? server->sw_tiles[server->sw_selected].tl
+		: NULL;
+	switcher_close(server);
+	if (t == NULL || !toplevel_alive(t)) {
+		return;
+	}
+	if (!t->floating && t->output != NULL &&
+			t->workspace != t->output->active_workspace) {
+		workspace_switch(t->output, t->workspace);
+	}
+	focus_toplevel(t);
+}
+
+static void switcher_key(struct amber_server *server,
+		const xkb_keysym_t *syms, int nsyms) {
+	for (int i = 0; i < nsyms; i++) {
+		xkb_keysym_t sym = syms[i];
+		size_t n = server->sw_count;
+		size_t cols = server->sw_cols > 0 ? server->sw_cols : 1;
+		if (sym == XKB_KEY_Escape) {
+			switcher_close(server);
+			return;
+		}
+		if (sym == XKB_KEY_Tab || sym == XKB_KEY_Right) {
+			switcher_select(server, server->sw_selected + 1);
+			return;
+		}
+		if (sym == XKB_KEY_Left) {
+			switcher_select(server, server->sw_selected + n - 1);
+			return;
+		}
+		if (sym == XKB_KEY_Down) {
+			switcher_select(server, server->sw_selected + cols);
+			return;
+		}
+		if (sym == XKB_KEY_Up) {
+			switcher_select(server, server->sw_selected + n -
+				(n > cols ? cols : 1));
+			return;
+		}
+		if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter ||
+				sym == XKB_KEY_space) {
+			switcher_activate_selected(server);
+			return;
+		}
+		if (sym >= XKB_KEY_1 && sym <= XKB_KEY_9) {
+			size_t d = (size_t)(sym - XKB_KEY_1);
+			if (d < n) {
+				switcher_select(server, d);
+				switcher_activate_selected(server);
+			}
+			return;
+		}
+	}
+}
+
+static void switcher_button(struct amber_server *server,
+		const struct wlr_pointer_button_event *event) {
+	if (event->state != WL_POINTER_BUTTON_STATE_PRESSED ||
+			server->sw_output == NULL) {
+		return;
+	}
+	double cx = server->cursor->x - server->sw_output->layout_box.x;
+	double cy = server->cursor->y - server->sw_output->layout_box.y;
+	for (size_t i = 0; i < server->sw_count; i++) {
+		struct wlr_box *b = &server->sw_tiles[i].box;
+		if (cx >= b->x && cy >= b->y &&
+				cx < b->x + b->width && cy < b->y + b->height) {
+			switcher_select(server, i);
+			switcher_activate_selected(server);
+			return;
+		}
+	}
+	switcher_close(server);
+}
+
+static void switcher_open(struct amber_server *server) {
+	struct amber_output *out = active_output(server);
+	if (out == NULL) {
+		return;
+	}
+	switcher_close(server);
+
+	struct amber_workspace *ws =
+		&out->workspaces[out->active_workspace];
+	struct wlr_box lim = out->layout_box;
+	struct amber_toplevel *t;
+	size_t n = 0;
+	size_t max_tiles = sizeof(server->sw_tiles) /
+		sizeof(server->sw_tiles[0]);
+	wl_list_for_each(t, &ws->toplevels, link) {
+		if (n >= max_tiles) {
+			break;
+		}
+		if (!toplevel_alive(t)) {
+			continue;
+		}
+		server->sw_tiles[n++].tl = t;
+	}
+	if (n == 0) {
+		wlr_log(WLR_INFO, "switcher: no windows");
+		return;
+	}
+
+	int margin = 48, gap = 14, pad = 6;
+	size_t cols = n <= 5 ? (n == 0 ? 1 : n) : 5;
+	size_t rows = (n + cols - 1) / cols;
+	int avail = lim.width - 2 * margin - gap * (int)(cols - 1);
+	int cell_w = (int)(avail / (int)cols);
+	if (cell_w > 260) {
+		cell_w = 260;
+	}
+	if (cell_w < 120) {
+		cell_w = 120;
+	}
+	int cell_h = cell_w * 10 / 16;
+	int total_w = cell_w * (int)cols + gap * (int)(cols - 1);
+	int total_h = cell_h * (int)rows + gap * (int)(rows - 1);
+	int ox = (lim.width - total_w) / 2;
+	int oy = (lim.height - total_h) / 2;
+
+	/* Capture BEFORE creating the dim rect so frames come out clean. */
+	for (size_t i = 0; i < n; i++) {
+		t = server->sw_tiles[i].tl;
+		struct wlr_box g =
+			t->xdg_toplevel->base->geometry;
+		struct wlr_box region = {
+			.x = (int)t->scene_tree->node.x + g.x,
+			.y = (int)t->scene_tree->node.y + g.y,
+			.width = g.width,
+			.height = g.height,
+		};
+		if (region.x < 0) {
+			region.width += region.x;
+			region.x = 0;
+		}
+		if (region.y < 0) {
+			region.height += region.y;
+			region.y = 0;
+		}
+		if (region.x + region.width > lim.width) {
+			region.width = lim.width - region.x;
+		}
+		if (region.y + region.height > lim.height) {
+			region.height = lim.height - region.y;
+		}
+		struct wlr_buffer *buf = NULL;
+		if (region.width > 24 && region.height > 24) {
+			unsigned char *frame = screenshot_capture(server,
+				out, region);
+			if (frame != NULL) {
+				buf = rgba_buffer_take(
+					region.width, region.height, frame);
+			}
+		}
+		server->sw_tiles[i].thumb = NULL;
+		server->sw_tiles[i].fallback = NULL;
+		server->sw_tiles[i].ring = NULL;
+		server->sw_tiles[i].box = (struct wlr_box){0};
+		server->sw_tiles[i].buf = buf;
+	}
+
+	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.55f};
+	server->sw_dim = wlr_scene_rect_create(
+		out->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+		lim.width, lim.height, dim_col);
+	if (server->sw_dim == NULL) {
+		for (size_t i = 0; i < n; i++) {
+			if (server->sw_tiles[i].buf != NULL) {
+				wlr_buffer_unlock(server->sw_tiles[i].buf);
+				server->sw_tiles[i].buf = NULL;
+			}
+			server->sw_tiles[i].tl = NULL;
+		}
+		return;
+	}
+
+	for (size_t i = 0; i < n; i++) {
+		t = server->sw_tiles[i].tl;
+		int row = (int)(i / cols), col = (int)(i % cols);
+		int x = ox + col * (cell_w + gap);
+		int y = oy + row * (cell_h + gap);
+
+		float ring_col[4] = {1.0f, 0.72f, 0.25f, 1.0f};
+		server->sw_tiles[i].ring = wlr_scene_rect_create(
+			out->layer_trees[
+				ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+			cell_w + 2 * pad, cell_h + 2 * pad, ring_col);
+		if (server->sw_tiles[i].ring != NULL) {
+			wlr_scene_node_set_position(
+				&server->sw_tiles[i].ring->node,
+				x - pad, y - pad);
+			wlr_scene_node_set_enabled(
+				&server->sw_tiles[i].ring->node, false);
+		}
+
+		struct wlr_buffer *buf = server->sw_tiles[i].buf;
+		if (buf != NULL) {
+			server->sw_tiles[i].thumb = wlr_scene_buffer_create(
+				out->layer_trees[
+					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+				buf);
+			if (server->sw_tiles[i].thumb != NULL) {
+				wlr_scene_node_set_position(
+					&server->sw_tiles[i].thumb->node, x, y);
+				wlr_scene_buffer_set_dest_size(
+					server->sw_tiles[i].thumb,
+					cell_w, cell_h);
+			}
+			wlr_buffer_unlock(buf);
+			server->sw_tiles[i].buf = NULL;
+		} else {
+			float fb_col[4] = {0.25f, 0.27f, 0.32f, 1.0f};
+			server->sw_tiles[i].fallback = wlr_scene_rect_create(
+				out->layer_trees[
+					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+				cell_w, cell_h, fb_col);
+			if (server->sw_tiles[i].fallback != NULL) {
+				wlr_scene_node_set_position(
+					&server->sw_tiles[i].fallback->node,
+					x, y);
+			}
+		}
+		server->sw_tiles[i].box = (struct wlr_box){
+			.x = x, .y = y, .width = cell_w, .height = cell_h };
+	}
+
+	server->sw_count = n;
+	server->sw_cols = cols;
+	server->sw_output = out;
+	server->sw_active = true;
+	switcher_select(server, 0);
+	wlr_log(WLR_INFO, "switcher: %zu windows", n);
+}
+
 static struct wlr_box screenshot_selection_box(struct amber_server *server) {
 	double cx = server->cursor->x - server->shot_output->layout_box.x;
 	double cy = server->cursor->y - server->shot_output->layout_box.y;
@@ -2849,6 +3160,12 @@ static void keyboard_handle_key(
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
 		if (!is_repeat) {
+			if (server->sw_active) {
+				keyboard_mark_swallowed(keyboard,
+					event->keycode);
+				switcher_key(server, syms, nsyms);
+				return;
+			}
 			if (server->shot_active) {
 				/* Region screenshot grabs all keys while
 				 * active; releases are swallowed via the
@@ -3364,6 +3681,11 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
+
+	if (server->sw_active) {
+		switcher_button(server, event);
+		return;
+	}
 
 	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
 		screenshot_button(server, event);
