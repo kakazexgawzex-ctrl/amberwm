@@ -64,6 +64,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBIW_ASSERT(x)
 #include "vendor/stb_image_write.h"
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "vendor/stb_truetype.h"
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 /* SceneFX provides the scene graph (drop-in wlr_scene replacement) with
@@ -300,8 +302,13 @@ struct amber_server {
 	struct wlr_box shot_box; // committed selection, output-local coords
 	double shot_sx, shot_sy; // selection start, layout coords
 	struct amber_output *shot_output;
-	struct wlr_scene_rect *shot_dim;
+	struct wlr_scene_rect *shot_shade[4]; // dim strips around selection
 	struct wlr_scene_rect *shot_borders[4];
+	/* Hint card (Material You): bg + optional icon + two text lines. */
+	struct wlr_scene_buffer *shot_hint_bg;
+	struct wlr_scene_buffer *shot_hint_icon;
+	struct wlr_scene_buffer *shot_hint_l1;
+	struct wlr_scene_buffer *shot_hint_l2;
 	struct wlr_scene_buffer *shot_freeze; // frozen frame under the dim
 	bool shot_moving; // dragging the committed rectangle around
 	double shot_move_ax, shot_move_ay; // grab anchor, output-local
@@ -2101,6 +2108,245 @@ static struct wlr_buffer *rgba_buffer_take(int width, int height,
 	return &buf->base;
 }
 
+/* ==================== tiny UI kit ====================
+ * Software-rendered cards / rings / text / glyphs for compositor-drawn
+ * overlays. Everything ends life as a straight-alpha RGBA wlr_buffer;
+ * the scene scales it via dest_size. */
+
+static stbtt_fontinfo ui_font;
+static bool ui_font_ready = false;
+
+static bool ui_font_init(void) {
+	static bool tried = false;
+	if (tried) {
+		return ui_font_ready;
+	}
+	tried = true;
+	static const char *const paths[] = {
+		"/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+		"/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+		"/usr/share/fonts/dejavu/DejaVuSans.ttf",
+	};
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		FILE *f = fopen(paths[i], "rb");
+		if (f == NULL) {
+			continue;
+		}
+		fseek(f, 0, SEEK_END);
+		long size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		unsigned char *data = size > 0 ? malloc((size_t)size) : NULL;
+		if (data != NULL && fread(data, 1, (size_t)size, f) ==
+				(size_t)size &&
+			stbtt_InitFont(&ui_font, data,
+				stbtt_GetFontOffsetForIndex(data, 0)) > 0) {
+			ui_font_ready = true;
+			fclose(f);
+			break;
+		}
+		free(data);
+		fclose(f);
+	}
+	return ui_font_ready;
+}
+
+static void ui_blit(unsigned char *dst, int dw, int dh,
+		const unsigned char *src, int sw, int sh,
+		int x, int y, float col[4]) {
+	for (int sy = 0; sy < sh; sy++) {
+		int dy = y + sy;
+		if (dy < 0 || dy >= dh) {
+			continue;
+		}
+		for (int sx = 0; sx < sw; sx++) {
+			int dx = x + sx;
+			if (dx < 0 || dx >= dw) {
+				continue;
+			}
+			float sa = (src[sy * sw + sx] / 255.0f) * col[3];
+			unsigned char *d = &dst[(dy * dw + dx) * 4];
+			float da = d[3] / 255.0f;
+			float oa = sa + da * (1.0f - sa);
+			if (oa <= 0.0f) {
+				continue;
+			}
+			for (int c = 0; c < 3; c++) {
+				d[c] = (unsigned char)(
+					(col[c] * sa +
+						d[c] / 255.0f * da *
+							(1.0f - sa)) /
+					oa * 255.0f);
+			}
+			d[3] = (unsigned char)(oa * 255.0f);
+		}
+	}
+}
+
+static bool ui_in_rounded(int x, int y, int w, int h, int r) {
+	int dx = x < 0 ? -x : (x >= w ? x - (w - 1) : 0);
+	int dy = y < 0 ? -y : (y >= h ? y - (h - 1) : 0);
+	if (dx <= 0 || dy <= 0) {
+		return true; // middle region
+	}
+	int mx = r - dx, my = r - dy;
+	return mx * mx + my * my <= r * r;
+}
+
+static struct wlr_buffer *ui_rounded_card(int w, int h, int r,
+		float col[4]) {
+	unsigned char *px = calloc((size_t)w * h, 4);
+	if (px == NULL) {
+		return NULL;
+	}
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			if (!ui_in_rounded(x, y, w, h, r)) {
+				continue;
+			}
+			unsigned char *d = &px[(y * (size_t)w + x) * 4];
+			d[0] = (unsigned char)(col[0] * 255);
+			d[1] = (unsigned char)(col[1] * 255);
+			d[2] = (unsigned char)(col[2] * 255);
+			d[3] = (unsigned char)(col[3] * 255);
+		}
+	}
+	return rgba_buffer_take(w, h, px);
+}
+
+static struct wlr_buffer *ui_rounded_ring(int w, int h, int r, int t,
+		float col[4]) {
+	unsigned char *px = calloc((size_t)w * h, 4);
+	if (px == NULL) {
+		return NULL;
+	}
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			bool outer = ui_in_rounded(x, y, w, h, r);
+			bool inner = ui_in_rounded(x - t, y - t,
+				w - 2 * t, h - 2 * t,
+				r > t ? r - t : 1);
+			if (!outer || inner) {
+				continue;
+			}
+			unsigned char *d = &px[(y * (size_t)w + x) * 4];
+			d[0] = (unsigned char)(col[0] * 255);
+			d[1] = (unsigned char)(col[1] * 255);
+			d[2] = (unsigned char)(col[2] * 255);
+			d[3] = (unsigned char)(col[3] * 255);
+		}
+	}
+	return rgba_buffer_take(w, h, px);
+}
+
+static struct wlr_scene_buffer *ui_attach(struct wlr_scene_tree *tree,
+		struct wlr_buffer *buf) {
+	return buf != NULL ? wlr_scene_buffer_create(tree, buf) : NULL;
+}
+
+/* Render one string; small static cache since overlay texts repeat. */
+static struct wlr_buffer *ui_text_buffer(const char *text, int px_h,
+		float col[4]) {
+	static struct {
+		char txt[64];
+		int px;
+		struct wlr_buffer *buf;
+	} cache[12];
+	static size_t n;
+	for (size_t i = 0; i < n; i++) {
+		if (cache[i].px == px_h &&
+				strcmp(cache[i].txt, text) == 0) {
+			return cache[i].buf;
+		}
+	}
+	if (!ui_font_init()) {
+		return NULL;
+	}
+	float scale = stbtt_ScaleForPixelHeight(&ui_font,
+		(float)px_h);
+	int ascent = 0, descent = 0, linegap = 0;
+	stbtt_GetFontVMetrics(&ui_font, &ascent, &descent, &linegap);
+	size_t len = strlen(text);
+	int w = 8, h = (int)((ascent - descent) * scale) + 6;
+	for (size_t i = 0; i < len; i++) {
+		int adv = 0, lsb = 0;
+		stbtt_GetCodepointHMetrics(&ui_font, text[i], &adv,
+			&lsb);
+		w += (int)(adv * scale);
+	}
+	unsigned char *img = calloc((size_t)w * h, 4);
+	if (img == NULL) {
+		return NULL;
+	}
+	int baseline = (int)(ascent * scale) + 2;
+	int cx = 4;
+	for (size_t i = 0; i < len; i++) {
+		int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;
+		stbtt_GetCodepointBitmapBoxSubpixel(&ui_font, text[i],
+			scale, scale, 0, 0, &ix0, &iy0, &ix1, &iy1);
+		int bw = ix1 - ix0, bh = iy1 - iy0;
+		if (bw > 0 && bh > 0) {
+			unsigned char *bm = stbtt_GetCodepointBitmap(
+				&ui_font, 0, scale, text[i], &bw, &bh,
+				0, 0);
+			ui_blit(img, w, h, bm, bw, bh, cx + ix0,
+				baseline + iy0, col);
+			stbtt_FreeBitmap(bm, NULL);
+		}
+		int adv = 0, lsb = 0;
+		stbtt_GetCodepointHMetrics(&ui_font, text[i], &adv,
+			&lsb);
+		cx += (int)(adv * scale);
+		(void)lsb;
+	}
+	struct wlr_buffer *buf = rgba_buffer_take(w, h, img);
+	if (buf != NULL && len < sizeof(cache[0].txt) &&
+			n < sizeof(cache) / sizeof(cache[0])) {
+		memcpy(cache[n].txt, text, len + 1);
+		cache[n].px = px_h;
+		cache[n].buf = buf;
+		n++;
+	}
+	return buf;
+}
+
+/* Download arrow (shaft + head + underline), drawn by hand. */
+static struct wlr_buffer *ui_download_icon(int s, float col[4]) {
+	unsigned char *px = calloc((size_t)s * s, 4);
+	if (px == NULL) {
+		return NULL;
+	}
+	for (int y = 0; y < s; y++) {
+		for (int x = 0; x < s; x++) {
+			bool in = false;
+			int cx = s / 2, t = s / 10 + 1;
+			if (x >= cx - t && x < cx + t && y >= s * 15 / 100 &&
+					y < s * 52 / 100) {
+				in = true; // shaft
+			}
+			int hy = y - s * 45 / 100;
+			if (hy >= 0 && y < s * 70 / 100 &&
+					x >= cx - hy - t &&
+					x < cx + hy + t) {
+				in = true; // arrowhead
+			}
+			if (y >= s * 82 / 100 && y < s * 92 / 100 &&
+					x >= s * 15 / 100 &&
+					x < s * 85 / 100) {
+				in = true; // underline
+			}
+			if (in) {
+				unsigned char *d =
+					&px[(y * (size_t)s + x) * 4];
+				d[0] = (unsigned char)(col[0] * 255);
+				d[1] = (unsigned char)(col[1] * 255);
+				d[2] = (unsigned char)(col[2] * 255);
+				d[3] = (unsigned char)(col[3] * 255);
+			}
+		}
+	}
+	return rgba_buffer_take(s, s, px);
+}
+
 struct amber_png_mem {
 	unsigned char *data;
 	size_t len;
@@ -2208,8 +2454,14 @@ static void clipboard_set(struct amber_server *server,
 		return;
 	}
 	wlr_data_source_init(source, &clipboard_impl);
-	const char *mimes[] = {"image/png", "text/plain"};
-	for (size_t i = 0; i < sizeof(mimes) / sizeof(mimes[0]); i++) {
+	/* text/plain only when a file backs it: an empty-text offer gets
+	 * read as a 0-byte payload and clipboard managers drop the whole
+	 * entry (why Ctrl+C shots never reached noctalia's history). */
+	const char *mimes[2] = {"image/png", NULL};
+	if (shot_clipboard_text[0] != '\0') {
+		mimes[1] = "text/plain";
+	}
+	for (size_t i = 0; i < 2 && mimes[i] != NULL; i++) {
 		char *copy = strdup(mimes[i]);
 		char **slot = copy != NULL
 			? wl_array_add(&source->mime_types, sizeof(copy))
@@ -2413,8 +2665,11 @@ static void screenshot_freeze_attach(struct amber_server *server,
 				&server->shot_borders[i]->node, false);
 		}
 	}
-	if (server->shot_dim != NULL) {
-		wlr_scene_node_set_enabled(&server->shot_dim->node, false);
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_set_enabled(
+				&server->shot_shade[i]->node, false);
+		}
 	}
 	int ow = output->wlr_output->width;
 	int oh = output->wlr_output->height;
@@ -2422,8 +2677,11 @@ static void screenshot_freeze_attach(struct amber_server *server,
 		? screenshot_capture(server, output,
 			(struct wlr_box){ .width = ow, .height = oh })
 		: NULL;
-	if (server->shot_dim != NULL) {
-		wlr_scene_node_set_enabled(&server->shot_dim->node, true);
+	for (int i = 0; i < 4; i++) {
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_set_enabled(
+				&server->shot_shade[i]->node, true);
+		}
 	}
 	for (int i = 0; i < 4; i++) {
 		if (border_on[i]) {
@@ -2456,11 +2714,12 @@ static void screenshot_freeze_attach(struct amber_server *server,
 }
 
 static void screenshot_hide_ui(struct amber_server *server) {
-	if (server->shot_dim != NULL) {
-		wlr_scene_node_destroy(&server->shot_dim->node);
-		server->shot_dim = NULL;
-	}
 	for (int i = 0; i < 4; i++) {
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_destroy(
+				&server->shot_shade[i]->node);
+			server->shot_shade[i] = NULL;
+		}
 		if (server->shot_borders[i] != NULL) {
 			wlr_scene_node_destroy(&server->shot_borders[i]->node);
 			server->shot_borders[i] = NULL;
@@ -2469,6 +2728,22 @@ static void screenshot_hide_ui(struct amber_server *server) {
 	if (server->shot_freeze != NULL) {
 		wlr_scene_node_destroy(&server->shot_freeze->node);
 		server->shot_freeze = NULL;
+	}
+	if (server->shot_hint_bg != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_bg->node);
+		server->shot_hint_bg = NULL;
+	}
+	if (server->shot_hint_icon != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_icon->node);
+		server->shot_hint_icon = NULL;
+	}
+	if (server->shot_hint_l1 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l1->node);
+		server->shot_hint_l1 = NULL;
+	}
+	if (server->shot_hint_l2 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l2->node);
+		server->shot_hint_l2 = NULL;
 	}
 	if (server->shot_has_sel && server->shot_output != NULL &&
 			server->shot_box.width > 1) {
@@ -2886,16 +3161,146 @@ static struct wlr_box screenshot_selection_box(struct amber_server *server) {
 	return out;
 }
 
+/* Hint card: stage 0 = intro (nothing selected yet), 1 = copy/save. */
+static void screenshot_hint_show(struct amber_server *server, int stage) {
+	struct amber_output *out = server->shot_output;
+	if (out == NULL) {
+		return;
+	}
+	/* Stage 1 carries l2; skip rebuild when already showing it so
+	 * per-motion ui_update calls don't recreate buffers. */
+	if (stage == 1 && server->shot_hint_l2 != NULL &&
+			server->shot_hint_bg != NULL) {
+		return;
+	}
+	if (stage == 0 && server->shot_hint_bg != NULL &&
+			server->shot_hint_l2 == NULL) {
+		return;
+	}
+	if (server->shot_hint_bg != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_bg->node);
+		server->shot_hint_bg = NULL;
+	}
+	if (server->shot_hint_icon != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_icon->node);
+		server->shot_hint_icon = NULL;
+	}
+	if (server->shot_hint_l1 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l1->node);
+		server->shot_hint_l1 = NULL;
+	}
+	if (server->shot_hint_l2 != NULL) {
+		wlr_scene_node_destroy(&server->shot_hint_l2->node);
+		server->shot_hint_l2 = NULL;
+	}
+	float card_col[4] = {0.11f, 0.11f, 0.13f, 0.94f};
+	float text_col[4] = {0.95f, 0.95f, 0.96f, 1.0f};
+	float dim_text[4] = {0.72f, 0.73f, 0.77f, 1.0f};
+	int pad = 18, gap = 10;
+	struct wlr_buffer *l1b = NULL, *l2b = NULL, *icon = NULL;
+	if (stage == 0) {
+		l1b = ui_text_buffer("Drag an area to screenshot",
+			16, text_col);
+	} else {
+		icon = ui_download_icon(42, text_col);
+		l1b = ui_text_buffer(
+			"Press Ctrl+C to copy to clipboard", 15,
+			text_col);
+		l2b = ui_text_buffer(
+			"Space saves the shot to ~/Pictures", 14,
+			dim_text);
+	}
+	if (l1b == NULL) {
+		return;
+	}
+	struct wlr_scene_tree *tree =
+		out->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
+	int iw = icon != NULL ? icon->width : 0;
+	int cw = l1b->width + pad * 2;
+	if (l2b != NULL && l2b->width + pad * 2 > cw) {
+		cw = l2b->width + pad * 2;
+	}
+	if (iw + pad * 2 > cw) {
+		cw = iw + pad * 2;
+	}
+	int ch = pad * 2 + l1b->height;
+	if (l2b != NULL) {
+		ch += gap + l2b->height;
+	}
+	if (icon != NULL) {
+		ch += gap + icon->height;
+	}
+	int lim_w = out->layout_box.width, lim_h =
+		out->layout_box.height;
+	int ox = (lim_w - cw) / 2, oy = (lim_h - ch) / 2;
+	{
+		struct wlr_buffer *card = ui_rounded_card(cw, ch, 18,
+			card_col);
+		server->shot_hint_bg = ui_attach(tree, card);
+	}
+	if (server->shot_hint_bg == NULL) {
+		return;
+	}
+	wlr_scene_node_set_position(&server->shot_hint_bg->node, ox, oy);
+	int y = oy + pad, x;
+	if (icon != NULL) {
+		server->shot_hint_icon = ui_attach(tree, icon);
+		x = ox + (cw - icon->width) / 2;
+		y += gap;
+		if (server->shot_hint_icon != NULL) {
+			wlr_scene_node_set_position(
+				&server->shot_hint_icon->node, x, y);
+		}
+		y += icon->height;
+	}
+	server->shot_hint_l1 = ui_attach(tree, l1b);
+	x = ox + (cw - l1b->width) / 2;
+	if (server->shot_hint_l1 != NULL) {
+		wlr_scene_node_set_position(
+			&server->shot_hint_l1->node, x, y);
+	}
+	y += l1b->height + (l2b != NULL ? gap : 0);
+	if (l2b != NULL) {
+		server->shot_hint_l2 = ui_attach(tree, l2b);
+		x = ox + (cw - l2b->width) / 2;
+		if (server->shot_hint_l2 != NULL) {
+			wlr_scene_node_set_position(
+				&server->shot_hint_l2->node, x, y);
+		}
+	}
+}
+
 static void screenshot_ui_update(struct amber_server *server) {
 	if (!server->shot_active || server->shot_output == NULL) {
 		return;
 	}
+	struct wlr_box lim = server->shot_output->layout_box;
+	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.35f};
+	struct wlr_scene_rect *s[4] = {
+		server->shot_shade[0], server->shot_shade[1],
+		server->shot_shade[2], server->shot_shade[3],
+	};
+	if (s[0] == NULL || s[1] == NULL || s[2] == NULL ||
+			s[3] == NULL) {
+		return;
+	}
+
 	/* Armed state: nothing is drawn until the user starts a drag. */
 	if (!server->shot_has_sel) {
+		wlr_scene_rect_set_size(s[0], lim.width, lim.height);
+		wlr_scene_node_set_position(&s[0]->node, 0, 0);
+		wlr_scene_rect_set_color(s[0], dim_col);
+		for (int i = 1; i < 4; i++) {
+			wlr_scene_rect_set_size(s[i], 1, 1);
+			wlr_scene_node_set_enabled(&s[i]->node, false);
+			wlr_scene_rect_set_color(s[i], dim_col);
+		}
+		wlr_scene_node_set_enabled(&s[0]->node, true);
 		for (int i = 0; i < 4; i++) {
 			wlr_scene_node_set_enabled(
 				&server->shot_borders[i]->node, false);
 		}
+		screenshot_hint_show(server, 0);
 		return;
 	}
 	/* While dragging the box tracks the cursor; after release it must
@@ -2908,8 +3313,30 @@ static void screenshot_ui_update(struct amber_server *server) {
 			wlr_scene_node_set_enabled(
 				&server->shot_borders[i]->node, false);
 		}
+		screenshot_hint_show(server, 0);
 		return;
 	}
+
+	/* Four shade strips surround the selection so its interior stays
+	 * at full brightness (the frozen frame shows through undimmed). */
+	int bottom_y = sel.y + sel.height;
+	wlr_scene_rect_set_size(s[0], lim.width, sel.y > 0 ? sel.y : 1);
+	wlr_scene_node_set_position(&s[0]->node, 0, 0);
+	wlr_scene_rect_set_size(s[1], lim.width,
+		lim.height - bottom_y > 0 ? lim.height - bottom_y : 1);
+	wlr_scene_node_set_position(&s[1]->node, 0, bottom_y);
+	wlr_scene_rect_set_size(s[2], sel.x > 0 ? sel.x : 1, sel.height);
+	wlr_scene_node_set_position(&s[2]->node, 0, sel.y);
+	wlr_scene_rect_set_size(s[3],
+		lim.width - (sel.x + sel.width) > 0
+			? lim.width - (sel.x + sel.width) : 1,
+		sel.height);
+	wlr_scene_node_set_position(&s[3]->node, sel.x + sel.width, sel.y);
+	for (int i = 0; i < 4; i++) {
+		wlr_scene_rect_set_color(s[i], dim_col);
+		wlr_scene_node_set_enabled(&s[i]->node, true);
+	}
+
 	float border[4] = {1.00f, 1.00f, 1.00f, 0.95f}; // white outline
 	int bw = 2;
 	struct wlr_scene_rect *r[4] = {
@@ -2933,6 +3360,8 @@ static void screenshot_ui_update(struct amber_server *server) {
 	wlr_scene_rect_set_size(r[3], bw, sel.height);
 	wlr_scene_node_set_position(&r[3]->node, sel.x + sel.width, sel.y);
 	wlr_scene_node_set_enabled(&r[3]->node, true);
+
+	screenshot_hint_show(server, 1);
 }
 
 static void screenshot_start_region(struct amber_server *server) {
@@ -2954,9 +3383,15 @@ static void screenshot_start_region(struct amber_server *server) {
 	screenshot_freeze_attach(server, output);
 
 	float dim[4] = {0, 0, 0, 0.35f};
-	server->shot_dim = wlr_scene_rect_create(
-		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-		output->layout_box.width, output->layout_box.height, dim);
+	for (int i = 0; i < 4; i++) {
+		server->shot_shade[i] = wlr_scene_rect_create(
+			output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+			2, 2, dim);
+		if (server->shot_shade[i] != NULL) {
+			wlr_scene_node_set_enabled(
+				&server->shot_shade[i]->node, false);
+		}
+	}
 
 	float invisible[4] = {1.00f, 1.00f, 1.00f, 0.95f};
 	for (int i = 0; i < 4; i++) {
