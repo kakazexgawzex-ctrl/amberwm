@@ -1,0 +1,13 @@
+[Unit]
+Description=AmberWM compositor
+
+[Service]
+Type=simple
+ExecStart=/home/watrib/Projects/amberwm/amberwm
+Restart=on-failure
+RestartSec=2
+# SIGTERM at session end (logout) exits 143: that is clean, never restart.
+SuccessExitStatus=143
+
+[Install]
+WantedBy=graphical-session.target
