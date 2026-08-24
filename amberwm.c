@@ -143,11 +143,6 @@ struct amber_animation {
 	/* ANIM_LAMP_CLOSE: owns a locked snapshot + detached strip nodes. */
 	struct wlr_buffer *snapshot;   // locked at unmap, ours until done
 	struct wlr_texture *mesh_tex;  // GPU import of snapshot (mesh mode)
-	/* Mesh mode: 4x4 compiz-style spring model + Bezier surface */
-	float mx[16], my[16], mvx[16], mvy[16];
-	bool m_pin[16];
-	int m_anchor;
-	float m_accum;
 	struct wlr_scene_buffer **strips; // live in output->fx_tree
 	int strip_count;
 	struct amber_output *output;
@@ -570,10 +565,6 @@ static void animation_destroy(struct amber_server *server,
 	struct amber_animation *anim, bool restore);
 static int64_t anim_now_usec(void);
 static void animations_kick(struct amber_server *server);
-struct amber_toplevel;
-struct amber_animation;
-static bool mesh_step(struct amber_animation *anim,
-	struct amber_toplevel *toplevel, float dt);
 
 static void focus_toplevel(struct amber_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -5253,13 +5244,6 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 
 #define WOB_COLS 8
 #define WOB_ROWS 6
-#define WOB2_MASS 15.0f
-#define WOB2_K 10.0f
-#define WOB2_FRICTION 3.5f
-#define WOB2_K_HOME 6.0f
-#define WOB2_DT 0.015f
-#define WOB2_SETTLE_V 0.6f
-#define WOB2_SETTLE_D 0.7f
 #define WOB_STIFFNESS 165.0f
 #define WOB_DAMPING 14.5f // zeta ~0.55: a couple of visible overshoots
 #define WOB_DT (ANIM_TICK_MS / 1000.0f)
@@ -5294,16 +5278,6 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 		float decay = expf(-dt * 9.0f);
 		anim->drag_x *= decay;
 		anim->drag_y *= decay;
-	}
-	if (anim->mesh_tex != NULL) {
-		if (anim->wobble_released) {
-			anim->m_anchor = -1;
-		}
-		bool settled = mesh_step(anim, toplevel, dt);
-		if (settled && anim->toplevel != NULL) {
-			toplevel_apply_fx(anim->toplevel);
-		}
-		return settled;
 	}
 	int nx = toplevel->scene_tree->node.x;
 	int ny = toplevel->scene_tree->node.y;
@@ -5728,6 +5702,13 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	anim->gh = surf_h;
 	anim->cols = WOB_COLS;
 	anim->rows = WOB_ROWS;
+	if (server->wobble_mesh) {
+		/* Mesh mode: 4x4 point grid = the Bezier control
+		 * surface; rendering is smooth, physics stays the
+		 * proven falloff-spring model. */
+		anim->cols = 3;
+		anim->rows = 3;
+	}
 	anim->start_usec = anim_now_usec();
 
 	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
@@ -5775,39 +5756,6 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 		wlr_log(WLR_INFO, "mesh: texture %dx%d import %s",
 			anim->snapshot->width, anim->snapshot->height,
 			anim->mesh_tex != NULL ? "ok" : "FAILED");
-	}
-	if (anim->mesh_tex != NULL) {
-		for (int j = 0; j < 4; j++) {
-			for (int i = 0; i < 4; i++) {
-				int idx = j * 4 + i;
-				anim->mx[idx] = anim->gx +
-					i * anim->gw / 3.0f;
-				anim->my[idx] = anim->gy +
-					j * anim->gh / 3.0f;
-				anim->mvx[idx] = 0.0f;
-				anim->mvy[idx] = 0.0f;
-				anim->m_pin[idx] = false;
-			}
-		}
-		float gox = anim->gx + anim->ax;
-		float goy = anim->gy + anim->ay;
-		int ai = 0;
-		float best = 1e9f;
-		for (int j = 0; j < 4; j++) {
-			for (int i = 0; i < 4; i++) {
-				int idx = j * 4 + i;
-				float ddx = anim->mx[idx] - gox;
-				float ddy = anim->my[idx] - goy;
-				float d = ddx * ddx + ddy * ddy;
-				if (d < best) {
-					best = d;
-					ai = idx;
-				}
-			}
-		}
-		anim->m_anchor = ai;
-		anim->m_pin[ai] = true;
-		anim->m_accum = 0.0f;
 	}
 
 	float buf_w = anim->snapshot->width;
@@ -5873,15 +5821,6 @@ void animation_wobble_nudge(struct amber_toplevel *toplevel,
 		}
 		anim->drag_x += (float)dx;
 		anim->drag_y += (float)dy;
-		if (anim->mesh_tex != NULL) {
-			for (int i = 0; i < 16; i++) {
-				if (anim->m_pin[i]) {
-					anim->mx[i] += (float)dx;
-					anim->my[i] += (float)dy;
-				}
-			}
-			continue;
-		}
 		int count = (anim->cols + 1) * (anim->rows + 1);
 		for (int i = 0; i < count; i++) {
 			float kick = 10.0f * (anim->wf != NULL
@@ -6071,100 +6010,6 @@ static void mesh_bezier(const float *mx, const float *my,
 	*oy = y;
 }
 
-/* One frame of the compiz spring model over the 4x4 control points,
- * in fixed 15ms quanta. The anchor object stays pinned while dragging;
- * after release every point is pulled to its home slot on the resting
- * window rect until velocities and displacements die out. */
-static bool mesh_step(struct amber_animation *anim,
-		struct amber_toplevel *toplevel, float dt) {
-	anim->m_accum += dt;
-	int steps = 0;
-	while (anim->m_accum >= WOB2_DT && steps < 8) {
-		anim->m_accum -= WOB2_DT;
-		steps++;
-		float fx[16] = {0}, fy[16] = {0};
-		float hw = anim->gw / 3.0f;
-		float hh = anim->gh / 3.0f;
-		for (int j = 0; j < 4; j++) {
-			for (int i = 0; i < 4; i++) {
-				int idx = j * 4 + i;
-				if (i > 0) {
-					int l = idx - 1;
-					float dx = anim->mx[l] -
-						anim->mx[idx] - hw;
-					float dy = anim->my[l] -
-						anim->my[idx];
-					fx[idx] += WOB2_K * 0.5f * dx;
-					fy[idx] += WOB2_K * 0.5f * dy;
-					fx[l] -= WOB2_K * 0.5f * dx;
-					fy[l] -= WOB2_K * 0.5f * dy;
-				}
-				if (j > 0) {
-					int u2 = idx - 4;
-					float dx = anim->mx[u2] -
-						anim->mx[idx];
-					float dy = anim->my[u2] -
-						anim->my[idx] - hh;
-					fx[idx] += WOB2_K * 0.5f * dx;
-					fy[idx] += WOB2_K * 0.5f * dy;
-					fx[u2] -= WOB2_K * 0.5f * dx;
-					fy[u2] -= WOB2_K * 0.5f * dy;
-				}
-			}
-		}
-		if (anim->m_anchor < 0) {
-			int nx = toplevel->scene_tree->node.x;
-			int ny = toplevel->scene_tree->node.y;
-			for (int j = 0; j < 4; j++) {
-				for (int i = 0; i < 4; i++) {
-					int idx = j * 4 + i;
-					fx[idx] += WOB2_K_HOME *
-						(nx + i * hw -
-							anim->mx[idx]);
-					fy[idx] += WOB2_K_HOME *
-						(ny + j * hh -
-							anim->my[idx]);
-				}
-			}
-		}
-		for (int idx = 0; idx < 16; idx++) {
-			if (anim->m_pin[idx]) {
-				anim->mvx[idx] = 0.0f;
-				anim->mvy[idx] = 0.0f;
-				continue;
-			}
-			anim->mvx[idx] += (fx[idx] - WOB2_FRICTION *
-				anim->mvx[idx]) / WOB2_MASS * WOB2_DT;
-			anim->mvy[idx] += (fy[idx] - WOB2_FRICTION *
-				anim->mvy[idx]) / WOB2_MASS * WOB2_DT;
-			anim->mx[idx] += anim->mvx[idx] * WOB2_DT;
-			anim->my[idx] += anim->mvy[idx] * WOB2_DT;
-		}
-	}
-	if (anim->m_anchor >= 0) {
-		return false;
-	}
-	int nx = toplevel->scene_tree->node.x;
-	int ny = toplevel->scene_tree->node.y;
-	float hw = anim->gw / 3.0f;
-	float hh = anim->gh / 3.0f;
-	float maxv = 0.0f, maxd = 0.0f;
-	for (int idx = 0; idx < 16; idx++) {
-		float v = fabsf(anim->mvx[idx]) + fabsf(anim->mvy[idx]);
-		if (v > maxv) {
-			maxv = v;
-		}
-		float hx = nx + (idx % 4) * hw;
-		float hy = ny + (idx / 4) * hh;
-		float d = fabsf(anim->mx[idx] - hx) +
-			fabsf(anim->my[idx] - hy);
-		if (d > maxd) {
-			maxd = d;
-		}
-	}
-	return maxv < WOB2_SETTLE_V && maxd < WOB2_SETTLE_D;
-}
-
 /* S1 proof: warped magenta quad over the rendered frame while a wobble
  * drag is live on this output. Raw GLES2 onto the scene buffer FBO,
  * GL state restored after. Becomes the full Bezier mesh pass in S3. */
@@ -6275,7 +6120,7 @@ static void mesh_test_draw(struct amber_server *server,
 				float u = (float)i / (SUB - 1);
 				float v = (float)j / (SUB - 1);
 				float px, py;
-				mesh_bezier(wob_anim->mx, wob_anim->my,
+				mesh_bezier(wob_anim->px, wob_anim->py,
 					u, v, &px, &py);
 				tva[o++] = 2.0f * px / W - 1.0f;
 				tva[o++] = 1.0f - 2.0f * py / H;
