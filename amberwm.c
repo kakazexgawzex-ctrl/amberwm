@@ -6032,6 +6032,19 @@ static void output_attach_wallpaper(struct amber_output *output) {
 	output->wallpaper_node = sb;
 }
 
+static void mesh_log_shader(GLuint shader, const char *what) {
+	GLint ok = GL_FALSE;
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+	if (ok) {
+		return;
+	}
+	char log[512];
+	GLsizei n = 0;
+	glGetShaderInfoLog(shader, sizeof(log), &n, log);
+	wlr_log(WLR_ERROR, "mesh: %s compile failed: %.*s", what,
+		(int)n, log);
+}
+
 /* Bicubic Bezier surface through the 4x4 control points (compiz
  * bezierPatchEvaluate): the drawn mesh is C1-continuous, which is the
  * entire reason this looks smooth where axis-aligned strips facet. */
@@ -6205,9 +6218,11 @@ static void mesh_test_draw(struct amber_server *server,
 			GLuint v = glCreateShader(GL_VERTEX_SHADER);
 			glShaderSource(v, 1, &tvs, NULL);
 			glCompileShader(v);
+			mesh_log_shader(v, "vertex");
 			GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
 			glShaderSource(f, 1, &tfs, NULL);
 			glCompileShader(f);
+			mesh_log_shader(f, "fragment");
 			tprog[ext] = glCreateProgram();
 			glAttachShader(tprog[ext], v);
 			glAttachShader(tprog[ext], f);
@@ -6215,9 +6230,15 @@ static void mesh_test_draw(struct amber_server *server,
 			GLint linked = GL_FALSE;
 			glGetProgramiv(tprog[ext], GL_LINK_STATUS,
 				&linked);
-			wlr_log(linked ? WLR_INFO : WLR_ERROR,
-				"mesh: shader[%d] link %s", ext,
-				linked ? "ok" : "FAILED");
+			if (!linked) {
+				char log[512];
+				GLsizei n = 0;
+				glGetProgramInfoLog(tprog[ext],
+					sizeof(log), &n, log);
+				wlr_log(WLR_ERROR,
+					"mesh: shader[%d] link: %.*s",
+					ext, (int)n, log);
+			}
 			glDeleteShader(v);
 			glDeleteShader(f);
 			tpos[ext] = glGetAttribLocation(tprog[ext],
@@ -6379,9 +6400,23 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 	/* Render the scene if needed and commit the output. Mesh mode
 	 * takes the split path: render into a state buffer, draw the
-	 * warped wobble mesh on top, commit manually. */
-	if (output->server->wobble_mesh &&
-			wlr_scene_output_needs_frame(scene_output)) {
+	 * warped wobble mesh on top, commit manually. During a mesh
+	 * drag the scene itself has no damage (window hidden, no
+	 * strips), so force frames while an anim is live and keep
+	 * scheduling vblanks - otherwise the drag freezes on screen
+	 * and the window seems to vanish until it settles. */
+	struct amber_animation *wob_anim = NULL, *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &output->server->animations,
+			link) {
+		if (anim->kind == ANIM_WOBBLE &&
+				anim->toplevel != NULL &&
+				anim->toplevel->output == output) {
+			wob_anim = anim;
+			break;
+		}
+	}
+	if (output->server->wobble_mesh && (wob_anim != NULL ||
+			wlr_scene_output_needs_frame(scene_output))) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
 		if (wlr_scene_output_build_state(scene_output, &state,
@@ -6390,6 +6425,12 @@ static void output_frame(struct wl_listener *listener, void *data) {
 				state.buffer);
 			wlr_output_commit_state(output->wlr_output,
 				&state);
+			if (wob_anim != NULL) {
+				wlr_output_schedule_frame(
+					output->wlr_output);
+			}
+		} else if (wob_anim != NULL) {
+			wlr_output_schedule_frame(output->wlr_output);
 		}
 		wlr_output_state_finish(&state);
 	} else {
