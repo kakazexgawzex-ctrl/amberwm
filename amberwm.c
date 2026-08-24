@@ -6293,6 +6293,16 @@ static void mesh_test_draw(struct amber_server *server,
 		GLboolean blend_was = glIsEnabled(GL_BLEND);
 		GLint prog_was = 0;
 		glGetIntegerv(GL_CURRENT_PROGRAM, &prog_was);
+		/* The scene pass leaves scissor (damage clipping) and
+		 * possibly depth enabled; inherited blindly they shred
+		 * the mesh into random rects. Save, park, restore. */
+		GLboolean scissor_was = glIsEnabled(GL_SCISSOR_TEST);
+		GLboolean depth_was = glIsEnabled(GL_DEPTH_TEST);
+		GLint bsrc = GL_ONE, bdst = GL_ZERO;
+		glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc);
+		glGetIntegerv(GL_BLEND_DST_RGB, &bdst);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_DEPTH_TEST);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		glViewport(0, 0, W, H);
 		glEnable(GL_BLEND);
@@ -6317,6 +6327,13 @@ static void mesh_test_draw(struct amber_server *server,
 		glUseProgram(prog_was);
 		if (!blend_was) {
 			glDisable(GL_BLEND);
+		}
+		glBlendFunc(bsrc, bdst);
+		if (scissor_was) {
+			glEnable(GL_SCISSOR_TEST);
+		}
+		if (depth_was) {
+			glEnable(GL_DEPTH_TEST);
 		}
 		glViewport(viewport[0], viewport[1], viewport[2],
 			viewport[3]);
@@ -6365,6 +6382,10 @@ static void mesh_test_draw(struct amber_server *server,
 	GLboolean blend_was = glIsEnabled(GL_BLEND);
 	GLint prog_was = 0;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog_was);
+	GLboolean scissor_was = glIsEnabled(GL_SCISSOR_TEST);
+	GLboolean depth_was = glIsEnabled(GL_DEPTH_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glViewport(0, 0, buffer->width, buffer->height);
 	glEnable(GL_BLEND);
@@ -6378,6 +6399,12 @@ static void mesh_test_draw(struct amber_server *server,
 	glUseProgram(prog_was);
 	if (!blend_was) {
 		glDisable(GL_BLEND);
+	}
+	if (scissor_was) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	if (depth_was) {
+		glEnable(GL_DEPTH_TEST);
 	}
 	glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
 }
