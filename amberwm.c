@@ -249,6 +249,7 @@ struct amber_server {
 
 	struct amber_toplevel *focused_toplevel;
 	volatile bool shutting_down; // set at every wl_display_terminate site
+	bool dyn_ws; // advertise only occupied/active workspaces (config)
 	struct amber_output *active_output;
 
 	struct wlr_cursor *cursor;
@@ -328,10 +329,10 @@ struct amber_server {
 	struct {
 		struct amber_toplevel *tl;
 		struct wlr_buffer *buf; // captured pre-dim, attached below
-		struct wlr_scene_rect *ring;
+		struct wlr_scene_buffer *ring; // rounded white outline
 		struct wlr_scene_buffer *thumb;
 		struct wlr_scene_buffer *icon_node;
-		struct wlr_scene_rect *fallback;
+		struct wlr_scene_buffer *fallback; // rounded card
 		struct wlr_box box; // output-local hit rect
 	} sw_tiles[20];
 
@@ -1801,6 +1802,8 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "center-focused-column") == 0) {
 			server->center_focused_column =
 				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "dynamic-workspaces") == 0) {
+			server->dyn_ws = strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "animations") == 0) {
 			server->animations_enabled =
 				strcmp(value, "yes") == 0;
@@ -2003,6 +2006,8 @@ static void config_watch_init(struct amber_server *server) {
 
 static void screenshot_start_region(struct amber_server *server);
 static void screenshot_full_screen(struct amber_server *server);
+static void ext_ws_dyn_sync(struct amber_output *output);
+
 static void switcher_open(struct amber_server *server);
 
 static void binding_exec(struct amber_server *server,
@@ -2770,6 +2775,42 @@ static void screenshot_cancel(struct amber_server *server) {
  * Dim + grid of STATIC thumbnails captured at open time (cheap on old
  * GPUs; no live compositing). Thumbnails are the labels: no text. */
 
+static void ext_ws_dyn_sync(struct amber_output *output) {
+	struct amber_server *server = output->server;
+	if (!server->dyn_ws || server->ext_ws_mgr == NULL ||
+			output->ext_group == NULL) {
+		return;
+	}
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		bool want = i == output->active_workspace ||
+			!wl_list_empty(&output->workspaces[i].toplevels);
+		if (want && output->ext_ws[i] == NULL) {
+			char id[16], name[16];
+			snprintf(id, sizeof(id), "amber-%d", i);
+			snprintf(name, sizeof(name), "%d", i + 1);
+			struct wlr_ext_workspace_handle_v1 *h =
+				wlr_ext_workspace_handle_v1_create(
+					server->ext_ws_mgr, id,
+					EXT_WORKSPACE_HANDLE_V1_WORKSPACE_CAPABILITIES_ACTIVATE);
+			if (h == NULL) {
+				continue;
+			}
+			wlr_ext_workspace_handle_v1_set_name(h, name);
+			uint32_t coords[2] = {0, (uint32_t)i};
+			wlr_ext_workspace_handle_v1_set_coordinates(h,
+				coords, 2);
+			wlr_ext_workspace_handle_v1_set_group(h,
+				output->ext_group);
+			output->ext_ws[i] = h;
+		} else if (!want && i != output->active_workspace &&
+				output->ext_ws[i] != NULL) {
+			wlr_ext_workspace_handle_v1_destroy(
+				output->ext_ws[i]);
+			output->ext_ws[i] = NULL;
+		}
+	}
+}
+
 static void switcher_close(struct amber_server *server) {
 	if (!server->sw_active && server->sw_dim == NULL) {
 		return;
@@ -3054,21 +3095,22 @@ static void switcher_open(struct amber_server *server) {
 		return;
 	}
 
+	struct wlr_scene_tree *ov =
+		out->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY];
 	for (size_t i = 0; i < n; i++) {
 		t = server->sw_tiles[i].tl;
 		int row = (int)(i / cols), col = (int)(i % cols);
 		int x = ox + col * (cell_w + gap);
 		int y = oy + row * (cell_h + gap);
 
-		float ring_col[4] = {1.0f, 0.72f, 0.25f, 1.0f};
-		server->sw_tiles[i].ring = wlr_scene_rect_create(
-			out->layer_trees[
-				ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-			cell_w + 2 * pad, cell_h + 2 * pad, ring_col);
+		struct wlr_buffer *rb = ui_rounded_ring(
+			cell_w + 2 * pad + 8, cell_h + 2 * pad + 8, 16, 3,
+			(float[4]){1.0f, 1.0f, 1.0f, 1.0f});
+		server->sw_tiles[i].ring = ui_attach(ov, rb);
 		if (server->sw_tiles[i].ring != NULL) {
 			wlr_scene_node_set_position(
 				&server->sw_tiles[i].ring->node,
-				x - pad, y - pad);
+				x - pad - 4, y - pad - 4);
 			wlr_scene_node_set_enabled(
 				&server->sw_tiles[i].ring->node, false);
 		}
@@ -3089,11 +3131,10 @@ static void switcher_open(struct amber_server *server) {
 			wlr_buffer_unlock(buf);
 			server->sw_tiles[i].buf = NULL;
 		} else {
-			float fb_col[4] = {0.25f, 0.27f, 0.32f, 1.0f};
-			server->sw_tiles[i].fallback = wlr_scene_rect_create(
-				out->layer_trees[
-					ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-				cell_w, cell_h, fb_col);
+			float fb_col[4] = {0.13f, 0.13f, 0.16f, 0.97f};
+			server->sw_tiles[i].fallback = ui_attach(ov,
+				ui_rounded_card(cell_w, cell_h, 14,
+					fb_col));
 			if (server->sw_tiles[i].fallback != NULL) {
 				wlr_scene_node_set_position(
 					&server->sw_tiles[i].fallback->node,
@@ -3112,18 +3153,14 @@ static void switcher_open(struct amber_server *server) {
 						ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
 					icon);
 			if (server->sw_tiles[i].icon_node != NULL) {
-				int isz = 36;
+				int isz = 64;
 				wlr_scene_buffer_set_dest_size(
 					server->sw_tiles[i].icon_node,
 					isz, isz);
 				wlr_scene_node_set_position(
 					&server->sw_tiles[i].icon_node->node,
-					server->sw_tiles[i].thumb != NULL
-						? x + 6
-						: x + (cell_w - isz) / 2,
-					server->sw_tiles[i].thumb != NULL
-						? y + 6
-						: y + (cell_h - isz) / 2);
+					x + (cell_w - isz) / 2,
+					y + (cell_h - isz) / 2);
 			}
 		}
 	}
@@ -4442,6 +4479,10 @@ static size_t ipc_monitor_json(struct amber_server *server,
 
 /* One JSON line describing every monitor; pushed on state changes. */
 static void ipc_broadcast(struct amber_server *server) {
+	struct amber_output *dyn_out;
+	wl_list_for_each(dyn_out, &server->outputs, link) {
+		ext_ws_dyn_sync(dyn_out);
+	}
 	if (wl_list_empty(&server->ipc_watchers)) {
 		return;
 	}
@@ -6059,6 +6100,10 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		output->ext_group = wlr_ext_workspace_group_handle_v1_create(
 			server->ext_ws_mgr, 0);
 		for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+			if (server->dyn_ws && i != output->active_workspace) {
+				output->ext_ws[i] = NULL;
+				continue;
+			}
 			char id[16], name[16];
 			snprintf(id, sizeof(id), "amber-%d", i);
 			snprintf(name, sizeof(name), "%d", i + 1);
