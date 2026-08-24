@@ -3080,7 +3080,6 @@ static void switcher_open(struct amber_server *server) {
 		server->sw_tiles[n++].tl = t;
 	}
 	if (n == 0) {
-		wlr_log(WLR_INFO, "switcher: no windows");
 		return;
 	}
 
@@ -3141,10 +3140,6 @@ static void switcher_open(struct amber_server *server) {
 		server->sw_tiles[i].ring = NULL;
 		server->sw_tiles[i].box = (struct wlr_box){0};
 		server->sw_tiles[i].buf = buf;
-		wlr_log(WLR_INFO,
-			"switcher: tile %zu region %dx%d@%d,%d buf=%s",
-			i, region.width, region.height, region.x, region.y,
-			buf != NULL ? "ok" : "MISS");
 	}
 
 	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.55f};
@@ -3237,7 +3232,6 @@ static void switcher_open(struct amber_server *server) {
 	server->sw_output = out;
 	server->sw_active = true;
 	switcher_select(server, 0);
-	wlr_log(WLR_INFO, "switcher: %zu windows", n);
 }
 
 static struct wlr_box screenshot_selection_box(struct amber_server *server) {

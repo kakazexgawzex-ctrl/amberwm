@@ -11,4 +11,4 @@ sid=$(loginctl list-sessions --no-legend 2>/dev/null |
 		echo "$s"
 	done | tail -n1)
 [ -n "$sid" ] && export XDG_SESSION_ID="$sid"
-exec /home/watrib/Projects/amberwm/amberwm
+exec /usr/local/bin/amberwm

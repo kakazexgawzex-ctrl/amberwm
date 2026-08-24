@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=AmberWM
+Comment=Lightweight scrolling Wayland compositor
+Exec=/bin/sh -c 'exec systemctl --user --wait start amberwm'
+TryExec=/usr/local/bin/amberwm
+Type=Application
+DesktopNames=amberwm
+Keywords=tiles;wayland;compositor;
