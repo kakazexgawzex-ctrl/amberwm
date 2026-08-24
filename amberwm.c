@@ -5326,7 +5326,8 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 		}
 	}
 
-	for (int iy = 0; iy < anim->rows; iy++) {
+	for (int iy = 0; anim->strip_count > 0 &&
+			iy < anim->rows; iy++) {
 		for (int ix = 0; ix < anim->cols; ix++) {
 			struct wlr_scene_buffer *cell =
 				anim->strips[iy * anim->cols + ix];
