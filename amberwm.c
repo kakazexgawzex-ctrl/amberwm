@@ -5523,6 +5523,11 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			toplevel->fullscreen ||
 			toplevel->workspace != output->active_workspace ||
 			toplevel->scene_tree == NULL) {
+		wlr_log(WLR_INFO, "wobble: bail flags (anim=%d wob=%d out=%p ws_match=%d)",
+			server->animations_enabled, server->wobbly_windows,
+			(void *)output,
+			toplevel->output != NULL &&
+				toplevel->workspace == output->active_workspace);
 		return;
 	}
 
@@ -5542,6 +5547,8 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	int surf_w = surface ? surface->current.width : 0;
 	int surf_h = surface ? surface->current.height : 0;
 	if (snap_buf == NULL || surf_w < 1 || surf_h < 1) {
+		wlr_log(WLR_INFO, "wobble: bail snapshot (buf=%p %dx%d)",
+			(void *)snap_buf, surf_w, surf_h);
 		return;
 	}
 
