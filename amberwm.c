@@ -244,6 +244,7 @@ struct amber_server {
 	struct xkb_context *xkb_context;
 
 	struct amber_toplevel *focused_toplevel;
+	volatile bool shutting_down; // set at every wl_display_terminate site
 	struct amber_output *active_output;
 
 	struct wlr_cursor *cursor;
@@ -1973,6 +1974,7 @@ static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
 	switch (binding->id) {
 	case AMBER_BINDING_QUIT:
+		server->shutting_down = true;
 		wl_display_terminate(server->wl_display);
 		break;
 	case AMBER_BINDING_CLOSE:
@@ -2986,6 +2988,9 @@ static void handle_xdg_activation_request(struct wl_listener *listener,
 	}
 	struct wlr_scene_tree *tree = toplevel->base->data;
 	struct amber_toplevel *t = tree->node.data;
+	if (t == NULL) {
+		return;
+	}
 	struct amber_workspace *ws = toplevel_workspace(t);
 	bool on_active_ws = ws != NULL && ws->output != NULL &&
 		(ws - ws->output->workspaces) ==
@@ -3856,6 +3861,7 @@ static bool ipc_handle_request(struct amber_server *server, int fd,
 		return false;
 	}
 	if (strcmp(req, "quit") == 0) {
+		server->shutting_down = true;
 		wl_display_terminate(server->wl_display);
 		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
 		return false;
@@ -3966,6 +3972,7 @@ static int ipc_hup_reload(int signal, void *data) {
 static int ipc_term_quit(int signal, void *data) {
 	struct amber_server *server = data;
 	wlr_log(WLR_INFO, "signal %d: shutting down", signal);
+	server->shutting_down = true;
 	wl_display_terminate(server->wl_display);
 	return 0;
 }
@@ -5493,6 +5500,9 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	if (toplevel == toplevel->server->grabbed_toplevel) {
 		reset_cursor_mode(toplevel->server);
 	}
+	/* Capture BEFORE clearing the pointer below — after that this
+	 * comparison is always false and vacuum never fires. */
+	bool was_focused = toplevel->server->focused_toplevel == toplevel;
 	if (toplevel->server->focused_toplevel == toplevel) {
 		toplevel->server->focused_toplevel = NULL;
 	}
@@ -5502,8 +5512,6 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 			workspace_update_top_layer(toplevel->output);
 		}
 	}
-
-	bool was_focused = toplevel->server->focused_toplevel == toplevel;
 
 	struct amber_workspace *ws = toplevel_workspace(toplevel);
 	animation_start_lamp_close(toplevel); // snapshot before teardown
@@ -5517,10 +5525,11 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	workspace_arrange(ws);
 	ipc_broadcast(toplevel->server); // occupancy changed
 
-	if (was_focused) {
+	if (was_focused && !toplevel->server->shutting_down) {
 		/* Closing the focused window must not leave the seat
 		 * focusless: hand focus to the neighbor that took the
-		 * slot (right one first, else left). */
+		 * slot (right one first, else left). Skipped during
+		 * teardown, where neighbors may already be freed. */
 		struct wl_list *pick = nb_next != &ws->toplevels
 			? nb_next : nb_prev;
 		if (pick != &ws->toplevels) {
@@ -5586,6 +5595,10 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	/* Destroy the container tree (and any popup subtrees with it);
 	 * tinywl leaked this per window open/close cycle. */
 	wlr_scene_node_destroy(&toplevel->scene_tree->node);
+	/* Invalidate the xdg_surface -> scene_tree backref NOW: the node
+	 * (and its node.data amber_toplevel) is freed above, and late
+	 * xdg-activation requests must not walk into freed memory. */
+	toplevel->xdg_toplevel->base->data = NULL;
 
 	free(toplevel);
 }
