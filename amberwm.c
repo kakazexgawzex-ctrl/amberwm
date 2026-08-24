@@ -74,6 +74,12 @@
 #include <scenefx/types/wlr_scene.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
 #include <GLES2/gl2.h>
+#include <wlr/render/egl.h>
+#include <wlr/render/gles2.h>
+
+/* Exported by libwlroots but undeclared in its 0.20 headers: raw GLES2
+ * draws outside a scene render pass need the context made current. */
+extern bool wlr_egl_make_current(struct wlr_egl *egl);
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -6179,6 +6185,14 @@ static void mesh_test_draw(struct amber_server *server,
 	}
 	if (wob_anim == NULL) {
 		return;
+	}
+	/* The EGL context is only current inside a scene render pass;
+	 * these raw draws run outside one (empty shader logs on real GPU
+	 * proved it - Mesa no-ops every call without a context). */
+	struct wlr_egl *egl = wlr_gles2_renderer_get_egl(
+		server->renderer);
+	if (egl != NULL) {
+		wlr_egl_make_current(egl);
 	}
 	if (wob_anim->mesh_tex != NULL) {
 		/* Full Bezier mesh pass: draw the snapshot texture over a
