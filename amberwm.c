@@ -74,7 +74,6 @@
 #include <scenefx/types/wlr_scene.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
 #include <GLES2/gl2.h>
-#include <wlr/render/gles2.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -5770,7 +5769,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	if (server->wobble_mesh && anim->mesh_tex == NULL) {
 		/* Zero-copy GPU import: dmabuf -> EGLImage. No CPU
 		 * readback; texture holds its own buffer reference. */
-		anim->mesh_tex = wlr_texture_from_buffer(
+		anim->mesh_tex = fx_texture_from_buffer(
 			server->renderer, anim->snapshot);
 		wlr_log(WLR_INFO, "mesh: texture %dx%d import %s",
 			anim->snapshot->width, anim->snapshot->height,
@@ -6172,8 +6171,8 @@ static void mesh_test_draw(struct amber_server *server,
 		/* Full Bezier mesh pass: draw the snapshot texture over a
 		 * 16x16-quadratic surface through the spring control
 		 * points. Snapshot buffers are premultiplied. */
-		struct wlr_gles2_texture_attribs ta;
-		wlr_gles2_texture_get_attribs(wob_anim->mesh_tex, &ta);
+		struct fx_texture_attribs ta;
+		fx_texture_get_attribs(wob_anim->mesh_tex, &ta);
 		int ext = ta.target == GL_TEXTURE_EXTERNAL_OES ? 1 : 0;
 		static GLuint tprog[2] = {0, 0};
 		static GLint tpos[2], tuv[2], ttex[2];
