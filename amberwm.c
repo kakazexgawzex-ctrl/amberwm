@@ -5762,13 +5762,17 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 		 * garbage/dead rows. Take ONE renderer readback of the
 		 * window rect (the proven screenshot path) and upload
 		 * our own buffer instead. */
-		struct wlr_box box = { anim->gx, anim->gy,
-			anim->gw, anim->gh };
+		int ow = output->wlr_output->width;
+		int oh = output->wlr_output->height;
+		/* Full-output snapshot: a window-rect capture fails once
+		 * the rect leaves output bounds (off-screen drags) and
+		 * silently dropped us back to strips. UVs handle the
+		 * rest. */
 		unsigned char *cap = screenshot_capture(server, output,
-			box);
+			(struct wlr_box){ 0, 0, ow, oh });
 		if (cap != NULL) {
 			struct wlr_buffer *own = rgba_buffer_take(
-				anim->gw, anim->gh, cap);
+				ow, oh, cap);
 			if (own != NULL) {
 				anim->mesh_tex = fx_texture_from_buffer(
 					server->renderer, own);
@@ -5778,8 +5782,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			}
 		}
 		wlr_log(WLR_INFO, "mesh: snapshot copy %dx%d %s",
-			anim->gw, anim->gh,
-			anim->mesh_tex != NULL ? "ok" : "FAILED");
+			ow, oh, anim->mesh_tex != NULL ? "ok" : "FAILED");
 	}
 
 	float buf_w = anim->snapshot->width;
@@ -6148,8 +6151,10 @@ static void mesh_test_draw(struct amber_server *server,
 					u, v, &px, &py);
 				tva[o++] = 2.0f * px / W - 1.0f;
 				tva[o++] = 1.0f - 2.0f * py / H;
-				tva[o++] = u;
-				tva[o++] = v;
+				/* Texture is the full-output snapshot: UVs
+				 * are the vertex's output-local position. */
+				tva[o++] = px / W;
+				tva[o++] = py / H;
 			}
 		}
 		GLuint fbo = fx_renderer_get_buffer_fbo(server->renderer,
