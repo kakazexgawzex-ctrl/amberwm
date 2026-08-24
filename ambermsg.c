@@ -1,17 +1,25 @@
-/* ambermsg: tiny command-line client for AmberWM's IPC socket.
+/* ambermsg: command-line client for AmberWM's IPC socket.
  *
  * Usage:
- *   ambermsg status
- *   ambermsg workspace 3          ambermsg focus next|prev
- *   ambermsg close                ambermsg reload
- *   ambermsg dispatch view,2      (raw mango-style pass-through)
- *   ambermsg watch                (stream state pushes until Ctrl+C)
+ *   ambermsg status                      compositor state JSON
+ *   ambermsg clients                     list open windows
+ *   ambermsg version                     print version
+ *   ambermsg workspace N                 switch to workspace N
+ *   ambermsg focus next|prev             cycle focus
+ *   ambermsg focus ID                    focus window by numeric id
+ *   ambermsg close [ID]                  close window (focused if no id)
+ *   ambermsg enable FEATURE              animations | blur | shadows |
+ *   ambermsg disable FEATURE             center-focused-column | ws-slide
+ *   ambermsg reload | quit
+ *   ambermsg watch                       stream state pushes until Ctrl+C
+ *   ambermsg call ARGS...                raw protocol pass-through
  *
  * Any other words are joined and sent verbatim, so new server-side
  * commands work without touching this file.
  */
 #include <errno.h>
 #include <glob.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,12 +51,18 @@ static int connect_ipc(void) {
 	if (matches > 1) {
 		fprintf(stderr,
 			"ambermsg: %zu amberwm instances, using %s "
-			"(set MANGO_INSTANCE_SIGNATURE to disambiguate)\n",
+			"(set AMBERWM_IPC_SOCKET to disambiguate)\n",
 			matches, path);
 	}
 
 	if (path[0] == '\0') {
-		/* No local amberwm socket: honour mango-style discovery. */
+		const char *own = getenv("AMBERWM_IPC_SOCKET");
+		if (own != NULL && own[0] != '\0') {
+			snprintf(path, sizeof(path), "%s", own);
+		}
+	}
+	if (path[0] == '\0') {
+		/* Legacy sessions still export the mango-style variable. */
 		const char *sig = getenv("MANGO_INSTANCE_SIGNATURE");
 		if (sig != NULL && sig[0] != '\0') {
 			if (sig[0] != '/') {
@@ -84,27 +98,81 @@ static int connect_ipc(void) {
 	return fd;
 }
 
+static void usage(FILE *out) {
+	fprintf(out,
+		"usage: ambermsg <command> [args...]\n"
+		"\n"
+		"  status                    compositor state as JSON\n"
+		"  clients                   list open windows\n"
+		"  version                   print compositor version\n"
+		"  workspace N               switch to workspace N (1-9)\n"
+		"  focus next|prev           cycle focus\n"
+		"  focus ID                  focus window by id\n"
+		"  close [ID]                close window (focused if no id)\n"
+		"\n"
+		"  enable FEATURE            toggle at runtime:\n"
+		"  disable FEATURE           animations blur shadows\n"
+		"                            center-focused-column ws-slide\n"
+		"\n"
+		"  reload                    hot-reload config\n"
+		"  quit                      exit the compositor\n"
+		"  watch                     stream state until Ctrl+C\n"
+		"  call ARGS...              raw protocol pass-through\n");
+}
+
 int main(int argc, char **argv) {
-	if (argc < 2) {
-		fprintf(stderr, "usage: ambermsg <command> [args...]\n"
-			"  status | reload | close | quit\n"
-			"  workspace N | focus next|prev\n"
-			"  dispatch view,N | focusid client,ID\n"
-			"  watch\n");
-		return 1;
+	if (argc < 2 || strcmp(argv[1], "help") == 0 ||
+			strcmp(argv[1], "--help") == 0) {
+		usage(argc < 2 ? stderr : stdout);
+		return argc < 2 ? 1 : 0;
 	}
 
 	char req[1024];
 	size_t len = 0;
-	for (int i = 1; i < argc && len < sizeof(req) - 2; i++) {
-		if (i > 1) {
-			req[len++] = ' ';
+
+	/* Friendly front-end: translate to wire commands. */
+	const char *cmd = argv[1];
+	if (strcmp(cmd, "clients") == 0) {
+		len = (size_t)snprintf(req, sizeof(req), "get all-clients\n");
+	} else if (strcmp(cmd, "version") == 0) {
+		len = (size_t)snprintf(req, sizeof(req), "get version\n");
+	} else if (strcmp(cmd, "focus") == 0 && argc >= 3 &&
+			strcmp(argv[2], "next") != 0 &&
+			strcmp(argv[2], "prev") != 0) {
+		len = (size_t)snprintf(req, sizeof(req),
+			"dispatch focusid client,%s\n", argv[2]);
+	} else if (strcmp(cmd, "call") == 0) {
+		for (int i = 2; i < argc && len < sizeof(req) - 2; i++) {
+			if (i > 2) {
+				req[len++] = ' ';
+			}
+			len += (size_t)snprintf(req + len,
+				sizeof(req) - len - 1, "%s", argv[i]);
 		}
-		len += (size_t)snprintf(req + len, sizeof(req) - len - 1,
-			"%s", argv[i]);
+		req[len++] = '\n';
+		req[len] = '\0';
+	} else if (strcmp(cmd, "enable") == 0 || strcmp(cmd, "disable") == 0) {
+		for (int i = 1; i < argc && len < sizeof(req) - 2; i++) {
+			if (i > 1) {
+				req[len++] = ' ';
+			}
+			len += (size_t)snprintf(req + len,
+				sizeof(req) - len - 1, "%s", argv[i]);
+		}
+		req[len++] = '\n';
+		req[len] = '\0';
+	} else {
+		/* Everything else maps 1:1 onto the wire protocol. */
+		for (int i = 1; i < argc && len < sizeof(req) - 2; i++) {
+			if (i > 1) {
+				req[len++] = ' ';
+			}
+			len += (size_t)snprintf(req + len,
+				sizeof(req) - len - 1, "%s", argv[i]);
+		}
+		req[len++] = '\n';
+		req[len] = '\0';
 	}
-	req[len++] = '\n';
-	req[len] = '\0';
 
 	int fd = connect_ipc();
 	if (fd < 0) {

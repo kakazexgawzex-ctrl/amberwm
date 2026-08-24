@@ -3319,8 +3319,9 @@ static void config_reload(struct amber_server *server);
  *
  * Line protocol over a Unix socket, wire-compatible with Mango's IPC so
  * noctalia's workspace widget works natively:
- *   - discovery: $MANGO_INSTANCE_SIGNATURE holds the socket path (we
- *     setenv it before spawning anything)
+ *   - discovery: $AMBERWM_IPC_SOCKET holds the socket path (we
+ *     setenv it before spawning anything; ambermsg also globs
+ *     amberwm-*.sock)
  *   - "watch all-monitors\n"  → persistent conn; we push one JSON line
  *     per state change: {"monitors":[...]}
  *   - "get all-clients\n"     → {"clients":[...]} (one-shot)
@@ -3659,6 +3660,93 @@ static bool ipc_handle_request(struct amber_server *server, int fd,
 		send(fd, "{\"success\":true}\n", 18, MSG_NOSIGNAL);
 		return false;
 	}
+	if (strncmp(req, "enable ", 7) == 0 ||
+			strncmp(req, "disable ", 8) == 0) {
+		bool enable = req[0] == 'e';
+		const char *key = req + (enable ? 7 : 8);
+		bool *target = NULL;
+		bool needs_fx = false, needs_arrange = false;
+		if (strcmp(key, "animations") == 0) {
+			target = &server->animations_enabled;
+		} else if (strcmp(key, "blur") == 0) {
+			target = &server->blur_enabled;
+			needs_fx = true;
+		} else if (strcmp(key, "shadows") == 0) {
+			target = &server->shadows_enabled;
+			needs_fx = true;
+		} else if (strcmp(key, "center-focused-column") == 0) {
+			target = &server->center_focused_column;
+			needs_arrange = true;
+		} else if (strcmp(key, "ws-slide") == 0) {
+			target = &server->ws_slide_enabled;
+		}
+		if (target == NULL) {
+			const char *bad =
+				"{\"success\":false,\"error\":\"unknown key\"}\n";
+			send(fd, bad, strlen(bad), MSG_NOSIGNAL);
+			return false;
+		}
+		bool changed = *target != enable;
+		*target = enable;
+		if (needs_fx) {
+			struct amber_output *output;
+			wl_list_for_each(output, &server->outputs, link) {
+				for (int i = 0; i < AMBER_WORKSPACE_COUNT;
+						i++) {
+					struct amber_toplevel *t;
+					wl_list_for_each(t,
+							&output->workspaces[i]
+								.toplevels,
+							link) {
+						toplevel_apply_fx(t);
+					}
+				}
+			}
+		}
+		if (needs_arrange && changed) {
+			struct amber_output *output;
+			wl_list_for_each(output, &server->outputs, link) {
+				workspace_arrange(&output->workspaces
+						[output->active_workspace]);
+			}
+		}
+		snprintf(reply, sizeof(reply), "{\"success\":true,\"%s\":%s}\n",
+			key, enable ? "true" : "false");
+		send(fd, reply, strlen(reply), MSG_NOSIGNAL);
+		return false;
+	}
+
+	if (strncmp(req, "close ", 6) == 0) {
+		long id;
+		bool ok = ipc_parse_long(req + 6, &id);
+		if (ok) {
+			ok = false;
+			struct amber_output *output;
+			wl_list_for_each(output, &server->outputs, link) {
+				for (int i = 0;
+						!ok && i < AMBER_WORKSPACE_COUNT;
+						i++) {
+					struct amber_toplevel *t;
+					wl_list_for_each(t,
+							&output->workspaces[i]
+								.toplevels,
+							link) {
+						if (t->ipc_id == id &&
+								toplevel_alive(t)) {
+							wlr_xdg_toplevel_send_close(
+								t->xdg_toplevel);
+							ok = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		send(fd, ok ? "{\"success\":true}\n" : "{\"success\":false}\n",
+			ok ? 18 : 19, MSG_NOSIGNAL);
+		return false;
+	}
+
 	if (strcmp(req, "close") == 0) {
 		if (server->focused_toplevel != NULL) {
 			wlr_xdg_toplevel_send_close(
@@ -3754,8 +3842,13 @@ void ipc_init(struct amber_server *server) {
 	server->ipc_source = wl_event_loop_add_fd(loop, listen_fd,
 		WL_EVENT_READABLE, ipc_connection_ready, server);
 
-	/* Mango-compatible discovery: clients spawned by us inherit this. */
-	setenv("MANGO_INSTANCE_SIGNATURE", server->ipc_path, true);
+	/* IPC discovery for our own tools (ambermsg globs amberwm-*.sock
+	 * first; this is the explicit fallback). Deliberately NOT exported
+	 * as MANGO_INSTANCE_SIGNATURE any more: noctalia keys compositor
+	 * detection on that variable, treated amber as mango and queried a
+	 * client list we never implemented ("no windows" in the switcher).
+	 * Unmatched, it falls back to ext-workspace + foreign-toplevel. */
+	setenv("AMBERWM_IPC_SOCKET", server->ipc_path, true);
 	wlr_log(WLR_INFO, "IPC listening on %s", server->ipc_path);
 }
 
