@@ -5359,7 +5359,8 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 		}
 	}
 
-	bool settled = max_disp < WOB_SETTLE_DISP &&
+	bool settled = anim->wobble_released &&
+		max_disp < WOB_SETTLE_DISP &&
 		max_vel < WOB_SETTLE_VEL;
 	if (settled && anim->toplevel != NULL) {
 		toplevel_apply_fx(anim->toplevel);
