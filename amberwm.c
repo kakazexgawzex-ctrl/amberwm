@@ -73,6 +73,7 @@
  * effects: rounded corners, blur, shadows. Must replace wlr_scene.h. */
 #include <scenefx/types/wlr_scene.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
+#include <GLES2/gl2.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -214,6 +215,8 @@ struct amber_server {
 	int corner_radius;
 	bool blur_enabled;
 	int blur_radius;
+	/* wobble-render=mesh: custom warped-mesh pass (S1: test quad) */
+	bool wobble_mesh;
 	struct wlr_buffer *wallpaper_buffer;
 
 	struct wlr_xdg_shell *xdg_shell;
@@ -1822,6 +1825,9 @@ static void config_load(struct amber_server *server) {
 				strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "dynamic-workspaces") == 0) {
 			server->dyn_ws = strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "wobble-render") == 0) {
+			server->wobble_mesh =
+				strcmp(value, "mesh") == 0;
 		} else if (strcmp(key, "animations") == 0) {
 			server->animations_enabled =
 				strcmp(value, "yes") == 0;
@@ -5940,6 +5946,83 @@ static void output_attach_wallpaper(struct amber_output *output) {
 	output->wallpaper_node = sb;
 }
 
+/* S1 proof: warped magenta quad over the rendered frame while a wobble
+ * drag is live on this output. Raw GLES2 onto the scene buffer FBO,
+ * GL state restored after. Becomes the full Bezier mesh pass in S3. */
+static void mesh_test_draw(struct amber_server *server,
+		struct amber_output *output, struct wlr_buffer *buffer) {
+	bool wob = false;
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind == ANIM_WOBBLE && anim->toplevel != NULL &&
+				anim->toplevel->output == output) {
+			wob = true;
+			break;
+		}
+	}
+	if (!wob) {
+		return;
+	}
+	static GLuint prog = 0;
+	static GLint pos_loc = -1;
+	if (prog == 0) {
+		const char *vs =
+			"attribute vec2 a_pos;"
+			"void main() {"
+			"	gl_Position = vec4(a_pos, 0.0, 1.0);"
+			"}";
+		const char *fs =
+			"precision mediump float;"
+			"void main() {"
+			"	gl_FragColor = vec4(1.0, 0.0, 1.0, 0.55);"
+			"}";
+		GLuint v = glCreateShader(GL_VERTEX_SHADER);
+		glShaderSource(v, 1, &vs, NULL);
+		glCompileShader(v);
+		GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+		glShaderSource(f, 1, &fs, NULL);
+		glCompileShader(f);
+		prog = glCreateProgram();
+		glAttachShader(prog, v);
+		glAttachShader(prog, f);
+		glLinkProgram(prog);
+		glDeleteShader(v);
+		glDeleteShader(f);
+		pos_loc = glGetAttribLocation(prog, "a_pos");
+	}
+	GLuint fbo = fx_renderer_get_buffer_fbo(server->renderer,
+		buffer);
+	if (fbo == 0) {
+		return;
+	}
+	const GLfloat verts[] = {
+		-0.4f, -0.2f,
+		 0.5f, -0.45f,
+		-0.5f,  0.45f,
+		 0.4f,  0.2f,
+	};
+	GLint viewport[4];
+	glGetIntegerv(GL_VIEWPORT, viewport);
+	GLboolean blend_was = glIsEnabled(GL_BLEND);
+	GLint prog_was = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog_was);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glViewport(0, 0, buffer->width, buffer->height);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glUseProgram(prog);
+	glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, verts);
+	glEnableVertexAttribArray(pos_loc);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glDisableVertexAttribArray(pos_loc);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glUseProgram(prog_was);
+	if (!blend_was) {
+		glDisable(GL_BLEND);
+	}
+	glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -5957,8 +6040,24 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		scene, output->wlr_output);
 
-	/* Render the scene if needed and commit the output */
-	wlr_scene_output_commit(scene_output, NULL);
+	/* Render the scene if needed and commit the output. Mesh mode
+	 * takes the split path: render into a state buffer, draw the
+	 * warped wobble mesh on top, commit manually. */
+	if (output->server->wobble_mesh &&
+			wlr_scene_output_needs_frame(scene_output)) {
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		if (wlr_scene_output_build_state(scene_output, &state,
+				NULL)) {
+			mesh_test_draw(output->server, output,
+				state.buffer);
+			wlr_output_commit_state(output->wlr_output,
+				&state);
+		}
+		wlr_output_state_finish(&state);
+	} else {
+		wlr_scene_output_commit(scene_output, NULL);
+	}
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
