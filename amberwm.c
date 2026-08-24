@@ -6420,16 +6420,31 @@ static void session_lock_new_lock(struct wl_listener *listener, void *data) {
 /* Cache the node that displays the window's main surface buffer (a
  * direct buffer child of the toplevel tree; popups live in their own
  * subtrees and blur/shadow are not buffer nodes). */
-static void toplevel_cache_scene_buffer(struct amber_toplevel *toplevel) {
-	toplevel->scene_buffer = NULL;
+static struct wlr_scene_buffer *toplevel_find_buffer(
+	struct wlr_scene_tree *tree) {
 	struct wlr_scene_node *node;
-	wl_list_for_each(node, &toplevel->scene_tree->children, link) {
+	wl_list_for_each(node, &tree->children, link) {
 		if (node->type == WLR_SCENE_NODE_BUFFER) {
-			toplevel->scene_buffer =
-				wlr_scene_buffer_from_node(node);
-			break;
+			return wlr_scene_buffer_from_node(node);
+		}
+		if (node->type == WLR_SCENE_NODE_TREE) {
+			struct wlr_scene_buffer *nested =
+				toplevel_find_buffer(
+					wlr_scene_tree_from_node(node));
+			if (nested != NULL) {
+				return nested;
+			}
 		}
 	}
+	return NULL;
+}
+
+static void toplevel_cache_scene_buffer(struct amber_toplevel *toplevel) {
+	/* The buffer lives inside the XDG surface's own subtree, not as a
+	 * direct child - a shallow scan always returned NULL and silently
+	 * killed wobble before its first frame. */
+	toplevel->scene_buffer =
+		toplevel_find_buffer(toplevel->scene_tree);
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
