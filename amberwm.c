@@ -25,6 +25,7 @@
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
 #include <wlr/types/wlr_ext_image_capture_source_v1.h>
+#include <wlr/types/wlr_ext_foreign_toplevel_list_v1.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
@@ -222,6 +223,9 @@ struct amber_server {
 
 	/* Foreign toplevel (taskbars/docks enumerate + control windows). */
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_mgr;
+	/* ext-foreign-toplevel-list: second enumeration protocol some
+	 * shells (Noctalia window switcher) key their models on. */
+	struct wlr_ext_foreign_toplevel_list_v1 *ext_toplevel_list;
 
 	/* ext-workspace-v1: bars like Noctalia render + switch workspaces. */
 	struct wlr_ext_workspace_manager_v1 *ext_ws_mgr;
@@ -377,6 +381,7 @@ struct amber_toplevel {
 
 	/* Foreign toplevel handle for bars/docks. */
 	struct wlr_foreign_toplevel_handle_v1 *foreign_handle;
+	struct wlr_ext_foreign_toplevel_handle_v1 *ext_handle;
 	struct wl_listener foreign_activate;
 	struct wl_listener foreign_close;
 	char *foreign_title;
@@ -915,6 +920,27 @@ static void ext_workspace_sync_active(struct amber_output *output,
 			output->ext_ws[new_index] != NULL) {
 		wlr_ext_workspace_handle_v1_set_active(
 			output->ext_ws[new_index], true);
+		/* Visiting a workspace acknowledges attention requests
+		 * pointed at it; leaving the flag set would keep the bar
+		 * pill lit forever. */
+		wlr_ext_workspace_handle_v1_set_urgent(
+			output->ext_ws[new_index], false);
+	}
+}
+
+/* Mark/unmark the workspace holding this window as demanding
+ * attention (bar pill lights up). */
+static void ext_workspace_set_urgent_by_toplevel(
+		struct amber_toplevel *t, bool urgent) {
+	if (t->server->ext_ws_mgr == NULL || t->output == NULL ||
+			t->workspace < 0 ||
+			t->workspace >= AMBER_WORKSPACE_COUNT) {
+		return;
+	}
+	struct wlr_ext_workspace_handle_v1 *h =
+		t->output->ext_ws[t->workspace];
+	if (h != NULL) {
+		wlr_ext_workspace_handle_v1_set_urgent(h, urgent);
 	}
 }
 
@@ -2959,7 +2985,18 @@ static void handle_xdg_activation_request(struct wl_listener *listener,
 		return;
 	}
 	struct wlr_scene_tree *tree = toplevel->base->data;
-	focus_toplevel(tree->node.data);
+	struct amber_toplevel *t = tree->node.data;
+	struct amber_workspace *ws = toplevel_workspace(t);
+	bool on_active_ws = ws != NULL && ws->output != NULL &&
+		(ws - ws->output->workspaces) ==
+			ws->output->active_workspace;
+	if (on_active_ws) {
+		focus_toplevel(t);
+	} else {
+		/* Attention ping from an off-screen workspace: never steal
+		 * focus; light up that workspace's pill instead. */
+		ext_workspace_set_urgent_by_toplevel(t, true);
+	}
 }
 
 static void seat_request_cursor(struct wl_listener *listener, void *data) {
@@ -5217,28 +5254,49 @@ static void foreign_handle_close(struct wl_listener *listener, void *data) {
 
 static void toplevel_foreign_init(struct amber_toplevel *toplevel) {
 	struct amber_server *server = toplevel->server;
-	if (server->foreign_toplevel_mgr == NULL) {
-		return;
-	}
-	toplevel->foreign_handle = wlr_foreign_toplevel_handle_v1_create(
-		server->foreign_toplevel_mgr);
-	wlr_foreign_toplevel_handle_v1_set_app_id(toplevel->foreign_handle,
-		toplevel->xdg_toplevel->app_id);
 	const char *title = toplevel->xdg_toplevel->title;
+
+	if (server->foreign_toplevel_mgr != NULL) {
+		toplevel->foreign_handle =
+			wlr_foreign_toplevel_handle_v1_create(
+				server->foreign_toplevel_mgr);
+		wlr_foreign_toplevel_handle_v1_set_app_id(
+			toplevel->foreign_handle,
+			toplevel->xdg_toplevel->app_id);
+		if (title != NULL) {
+			wlr_foreign_toplevel_handle_v1_set_title(
+				toplevel->foreign_handle, title);
+		}
+		toplevel->foreign_activate.notify = foreign_handle_activate;
+		wl_signal_add(&toplevel->foreign_handle->events.request_activate,
+			&toplevel->foreign_activate);
+		toplevel->foreign_close.notify = foreign_handle_close;
+		wl_signal_add(&toplevel->foreign_handle->events.request_close,
+			&toplevel->foreign_close);
+	}
+
+	/* Second enumeration protocol: shells like Noctalia build their
+	 * switcher model from this even when zwlr management exists. */
+	if (server->ext_toplevel_list != NULL) {
+		const struct wlr_ext_foreign_toplevel_handle_v1_state st = {
+			.title = title,
+			.app_id = toplevel->xdg_toplevel->app_id,
+		};
+		toplevel->ext_handle = wlr_ext_foreign_toplevel_handle_v1_create(
+			server->ext_toplevel_list, &st);
+	}
+
 	if (title != NULL) {
-		wlr_foreign_toplevel_handle_v1_set_title(
-			toplevel->foreign_handle, title);
 		toplevel->foreign_title = strdup(title);
 	}
-	toplevel->foreign_activate.notify = foreign_handle_activate;
-	wl_signal_add(&toplevel->foreign_handle->events.request_activate,
-		&toplevel->foreign_activate);
-	toplevel->foreign_close.notify = foreign_handle_close;
-	wl_signal_add(&toplevel->foreign_handle->events.request_close,
-		&toplevel->foreign_close);
 }
 
 static void toplevel_foreign_destroy(struct amber_toplevel *toplevel) {
+	if (toplevel->ext_handle != NULL) {
+		wlr_ext_foreign_toplevel_handle_v1_destroy(
+			toplevel->ext_handle);
+		toplevel->ext_handle = NULL;
+	}
 	if (toplevel->foreign_handle == NULL) {
 		return;
 	}
@@ -5253,7 +5311,8 @@ static void toplevel_foreign_destroy(struct amber_toplevel *toplevel) {
 /* Push title changes to taskbars, deduplicated: terminals commit every
  * frame and set_title is a broadcast to every bar client. */
 static void toplevel_foreign_update_title(struct amber_toplevel *toplevel) {
-	if (toplevel->foreign_handle == NULL) {
+	if (toplevel->foreign_handle == NULL &&
+			toplevel->ext_handle == NULL) {
 		return;
 	}
 	const char *title = toplevel->xdg_toplevel->title;
@@ -5261,8 +5320,18 @@ static void toplevel_foreign_update_title(struct amber_toplevel *toplevel) {
 			strcmp(toplevel->foreign_title, title) == 0)) {
 		return;
 	}
-	wlr_foreign_toplevel_handle_v1_set_title(
-		toplevel->foreign_handle, title);
+	if (toplevel->foreign_handle != NULL) {
+		wlr_foreign_toplevel_handle_v1_set_title(
+			toplevel->foreign_handle, title);
+	}
+	if (toplevel->ext_handle != NULL) {
+		const struct wlr_ext_foreign_toplevel_handle_v1_state st = {
+			.title = title,
+			.app_id = toplevel->xdg_toplevel->app_id,
+		};
+		wlr_ext_foreign_toplevel_handle_v1_update_state(
+			toplevel->ext_handle, &st);
+	}
 	free(toplevel->foreign_title);
 	toplevel->foreign_title = strdup(title);
 }
@@ -5949,6 +6018,9 @@ int main(int argc, char *argv[]) {
 		wl_signal_add(&server.ext_ws_mgr->events.commit,
 			&server.ext_ws_commit);
 	}
+
+	server.ext_toplevel_list = wlr_ext_foreign_toplevel_list_v1_create(
+		server.wl_display, 1);
 
 	/* Screen capture: grim/slurp + wayshot (screencopy), OBS dmabuf
 	 * (export-dmabuf), portals + modern tools (ext-image-copy-capture
