@@ -177,6 +177,27 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	/* Only known verbs reach the wire; typos get roasted here
+	 * instead of producing cryptic JSON from the compositor. Raw
+	 * protocol access stays available via 'call'. */
+	static const char *const known[] = {
+		"status", "clients", "version", "workspace", "focus",
+		"close", "enable", "disable", "reload", "quit", "watch",
+		"call", "help", "--help",
+	};
+	bool known_verb = false;
+	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		if (strcmp(cmd0, known[i]) == 0) {
+			known_verb = true;
+			break;
+		}
+	}
+	if (!known_verb) {
+		printf("what are you TALKING about bro "
+			"(ok use --help if u need help)\n");
+		return 1;
+	}
+
 	char req[1024];
 	size_t len = 0;
 
