@@ -5744,7 +5744,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 		/* Zero-copy GPU import: dmabuf -> EGLImage. No CPU
 		 * readback; texture holds its own buffer reference. */
 		anim->mesh_tex = wlr_texture_from_buffer(
-			server->renderer, anim->snapshot, NULL);
+			server->renderer, anim->snapshot);
 		wlr_log(WLR_INFO, "mesh: texture %dx%d import %s",
 			anim->snapshot->width, anim->snapshot->height,
 			anim->mesh_tex != NULL ? "ok" : "FAILED");
