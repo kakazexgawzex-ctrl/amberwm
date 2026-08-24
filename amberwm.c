@@ -323,6 +323,7 @@ struct amber_server {
 		struct wlr_buffer *buf; // captured pre-dim, attached below
 		struct wlr_scene_rect *ring;
 		struct wlr_scene_buffer *thumb;
+		struct wlr_scene_buffer *icon_node;
 		struct wlr_scene_rect *fallback;
 		struct wlr_box box; // output-local hit rect
 	} sw_tiles[20];
@@ -2503,6 +2504,10 @@ static void switcher_close(struct amber_server *server) {
 			wlr_scene_node_destroy(
 				&server->sw_tiles[i].thumb->node);
 		}
+		if (server->sw_tiles[i].icon_node != NULL) {
+			wlr_scene_node_destroy(
+				&server->sw_tiles[i].icon_node->node);
+		}
 		if (server->sw_tiles[i].fallback != NULL) {
 			wlr_scene_node_destroy(
 				&server->sw_tiles[i].fallback->node);
@@ -2554,6 +2559,11 @@ static void switcher_activate_selected(struct amber_server *server) {
 		workspace_switch(t->output, t->workspace);
 	}
 	focus_toplevel(t);
+	if (!t->floating && t->output != NULL) {
+		/* Same as click-focus: re-arrange so the camera scrolls the
+		 * activated column into view even when it was off-screen. */
+		workspace_arrange(toplevel_workspace(t));
+	}
 }
 
 static void switcher_key(struct amber_server *server,
@@ -2617,6 +2627,50 @@ static void switcher_button(struct amber_server *server,
 		}
 	}
 	switcher_close(server);
+}
+
+/* App-icon badges for the switcher: loaded once per app_id and cached
+ * across opens (buffers persist by design). hicolor covers most apps;
+ * pixmaps catches the rest. */
+static struct {
+	char app_id[64];
+	struct wlr_buffer *buf;
+} sw_icons[32];
+static size_t sw_icons_n;
+
+static struct wlr_buffer *switcher_icon_for(const char *app_id) {
+	if (app_id == NULL || *app_id == '\0') {
+		return NULL;
+	}
+	for (size_t i = 0; i < sw_icons_n; i++) {
+		if (strcmp(sw_icons[i].app_id, app_id) == 0) {
+			return sw_icons[i].buf;
+		}
+	}
+	static const char *const dirs[] = {
+		"/usr/share/icons/hicolor/64x64/apps",
+		"/usr/share/icons/hicolor/48x48/apps",
+		"/usr/share/icons/hicolor/32x32/apps",
+		"/usr/share/pixmaps",
+	};
+	char path[512];
+	struct wlr_buffer *out = NULL;
+	for (size_t d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+		snprintf(path, sizeof(path), "%s/%s.png", dirs[d], app_id);
+		int iw = 0, ih = 0;
+		unsigned char *px = stbi_load(path, &iw, &ih, NULL, 4);
+		if (px != NULL) {
+			out = rgba_buffer_take(iw, ih, px);
+			break;
+		}
+	}
+	if (out != NULL && sw_icons_n < sizeof(sw_icons) / sizeof(sw_icons[0])) {
+		snprintf(sw_icons[sw_icons_n].app_id,
+			sizeof(sw_icons[sw_icons_n].app_id), "%s", app_id);
+		sw_icons[sw_icons_n].buf = out;
+		sw_icons_n++;
+	}
+	return out;
 }
 
 static void switcher_open(struct amber_server *server) {
@@ -2699,10 +2753,15 @@ static void switcher_open(struct amber_server *server) {
 			}
 		}
 		server->sw_tiles[i].thumb = NULL;
+		server->sw_tiles[i].icon_node = NULL;
 		server->sw_tiles[i].fallback = NULL;
 		server->sw_tiles[i].ring = NULL;
 		server->sw_tiles[i].box = (struct wlr_box){0};
 		server->sw_tiles[i].buf = buf;
+		wlr_log(WLR_INFO,
+			"switcher: tile %zu region %dx%d@%d,%d buf=%s",
+			i, region.width, region.height, region.x, region.y,
+			buf != NULL ? "ok" : "MISS");
 	}
 
 	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.55f};
@@ -2768,6 +2827,30 @@ static void switcher_open(struct amber_server *server) {
 		}
 		server->sw_tiles[i].box = (struct wlr_box){
 			.x = x, .y = y, .width = cell_w, .height = cell_h };
+
+		struct wlr_buffer *icon = switcher_icon_for(
+			t->xdg_toplevel->app_id);
+		if (icon != NULL) {
+			server->sw_tiles[i].icon_node =
+				wlr_scene_buffer_create(
+					out->layer_trees[
+						ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+					icon);
+			if (server->sw_tiles[i].icon_node != NULL) {
+				int isz = 36;
+				wlr_scene_buffer_set_dest_size(
+					server->sw_tiles[i].icon_node,
+					isz, isz);
+				wlr_scene_node_set_position(
+					&server->sw_tiles[i].icon_node->node,
+					server->sw_tiles[i].thumb != NULL
+						? x + 6
+						: x + (cell_w - isz) / 2,
+					server->sw_tiles[i].thumb != NULL
+						? y + 6
+						: y + (cell_h - isz) / 2);
+			}
+		}
 	}
 
 	server->sw_count = n;
