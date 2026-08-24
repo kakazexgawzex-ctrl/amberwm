@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
@@ -2473,6 +2474,15 @@ static void clipboard_send(struct wlr_data_source *source,
 		ssize_t n = write(fd, data, len);
 		if (n < 0) {
 			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				/* Transfer pipes are non-blocking; wait for
+				 * write-space instead of truncating at the
+				 * 64KB pipe capacity. */
+				struct pollfd p = { .fd = fd,
+					.events = POLLOUT };
+				poll(&p, 1, -1);
 				continue;
 			}
 			break;
