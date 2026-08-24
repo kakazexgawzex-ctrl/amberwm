@@ -1301,6 +1301,20 @@ static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
 	} else {
 		rule_resolve(server, toplevel, &blur, &radius);
 	}
+	if (!fullscreen) {
+		struct amber_animation *wa, *wtmp;
+		wl_list_for_each_safe(wa, wtmp, &server->animations,
+				link) {
+			if (wa->kind == ANIM_WOBBLE &&
+					wa->toplevel == toplevel) {
+				/* Blur re-samples per cell during wobble
+				 * and draws grid seams - park it until
+				 * the sheet settles. */
+				blur = false;
+				break;
+			}
+		}
+	}
 	wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
 		fx_corner_cb, &radius);
 
@@ -2409,18 +2423,29 @@ static char shot_clipboard_text[600];
 
 static void clipboard_send(struct wlr_data_source *source,
 		const char *mime_type, int32_t fd) {
+	const void *data = NULL;
+	size_t len = 0;
 	if (strcmp(mime_type, "image/png") == 0) {
 		if (shot_clipboard.data != NULL) {
-			ssize_t rc = write(fd, shot_clipboard.data,
-				(ssize_t)shot_clipboard.len);
-			(void)rc;
+			data = shot_clipboard.data;
+			len = shot_clipboard.len;
 		}
 	} else if (shot_clipboard_text[0] != '\0') {
-		/* text/plain / text/uri-list: what clipboard managers and
-		 * paste targets actually read for a usable entry. */
-		ssize_t rc = write(fd, shot_clipboard_text,
-			strlen(shot_clipboard_text));
-		(void)rc;
+		data = shot_clipboard_text;
+		len = strlen(shot_clipboard_text);
+	}
+	/* A single write() truncates large payloads at the socket buffer
+	 * (~64 KB) - paste targets saw every screenshot capped there. */
+	while (len > 0) {
+		ssize_t n = write(fd, data, len);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			break;
+		}
+		data = (const char *)data + n;
+		len -= (size_t)n;
 	}
 	close(fd);
 }
@@ -3498,8 +3523,36 @@ static void screenshot_finish(struct amber_server *server, bool save_file) {
 		screenshot_cancel(server);
 		return;
 	}
-	unsigned char *rgba = screenshot_capture(server, server->shot_output,
-		sel);
+	/* Crop from the frozen pre-UI frame when possible: hint card,
+	 * shade strips and borders were drawn after the freeze, so they
+	 * can never bake into the shot - and the live scene stays
+	 * untouched (the last attempt reordered teardown and crashed). */
+	unsigned char *rgba = NULL;
+	struct wlr_buffer *fb = server->shot_freeze != NULL
+		? server->shot_freeze->buffer : NULL;
+	void *fdata;
+	uint32_t ffmt;
+	size_t fstride;
+	if (fb != NULL && wlr_buffer_begin_data_ptr_access(fb, 0,
+			&fdata, &ffmt, &fstride)) {
+		rgba = malloc((size_t)sel.width * sel.height * 4);
+		if (rgba == NULL) {
+			wlr_buffer_end_data_ptr_access(fb);
+		} else {
+			for (int r = 0; r < sel.height; r++) {
+				memcpy(rgba + (size_t)r * sel.width * 4,
+					(unsigned char *)fdata +
+					(size_t)(sel.y + r) * fstride +
+					(size_t)sel.x * 4,
+					(size_t)sel.width * 4);
+			}
+			wlr_buffer_end_data_ptr_access(fb);
+		}
+	}
+	if (rgba == NULL) {
+		rgba = screenshot_capture(server, server->shot_output,
+			sel);
+	}
 	screenshot_hide_ui(server);
 	if (rgba == NULL) {
 		wlr_log(WLR_ERROR, "screenshot failed");
@@ -5130,7 +5183,7 @@ static void animation_lamp_tick(struct amber_animation *anim, float p) {
 }
 
 #define WOB_COLS 8
-#define WOB_ROWS 6
+#define WOB_ROWS 8
 #define WOB_STIFFNESS 120.0f
 #define WOB_DAMPING 11.0f // zeta ~0.55: a couple of visible overshoots
 #define WOB_DT (ANIM_TICK_MS / 1000.0f)
@@ -5179,10 +5232,15 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 			float wgt = anim->wf[idx];
 			/* Away-from-grip points lag the rigid node:
 			 * target = rigid - drag*(1-w) -> shear/bend. */
-			float tx = nx + ix * cell_w +
-				anim->drag_x * (wgt - 1.0f);
-			float ty = ny + iy * cell_h +
-				anim->drag_y * (wgt - 1.0f);
+			float lx = anim->drag_x * (wgt - 1.0f);
+			float ly = anim->drag_y * (wgt - 1.0f);
+			float ll = sqrtf(lx * lx + ly * ly);
+			if (ll > 110.0f) {
+				lx *= 110.0f / ll;
+				ly *= 110.0f / ll;
+			}
+			float tx = nx + ix * cell_w + lx;
+			float ty = ny + iy * cell_h + ly;
 			float ax = k * (tx - anim->px[idx]) - c * anim->vx[idx];
 			float ay = k * (ty - anim->py[idx]) - c * anim->vy[idx];
 			anim->vx[idx] += ax * dt;
@@ -5242,6 +5300,9 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 
 	bool settled = max_disp < WOB_SETTLE_DISP &&
 		max_vel < WOB_SETTLE_VEL;
+	if (settled && anim->toplevel != NULL) {
+		toplevel_apply_fx(anim->toplevel);
+	}
 	bool expired = anim_now_usec() - anim->start_usec > 5000000;
 	return (anim->wobble_released && settled) || expired;
 }
@@ -5537,13 +5598,6 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			toplevel->scene_tree == NULL) {
 		return;
 	}
-	{
-		bool bl; int rad;
-		rule_resolve(server, toplevel, &bl, &rad);
-		if (bl) {
-			return;
-		}
-	}
 	if (false) {
 		wlr_log(WLR_INFO, "wobble: bail flags (anim=%d wob=%d out=%p ws_match=%d)",
 			server->animations_enabled, server->wobbly_windows,
@@ -5624,6 +5678,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 				1.0f / (1.0f + dist / 160.0f);
 		}
 	}
+	toplevel_apply_fx(toplevel);
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
 
