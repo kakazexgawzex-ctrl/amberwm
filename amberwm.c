@@ -6212,6 +6212,12 @@ static void mesh_test_draw(struct amber_server *server,
 			glAttachShader(tprog[ext], v);
 			glAttachShader(tprog[ext], f);
 			glLinkProgram(tprog[ext]);
+			GLint linked = GL_FALSE;
+			glGetProgramiv(tprog[ext], GL_LINK_STATUS,
+				&linked);
+			wlr_log(linked ? WLR_INFO : WLR_ERROR,
+				"mesh: shader[%d] link %s", ext,
+				linked ? "ok" : "FAILED");
 			glDeleteShader(v);
 			glDeleteShader(f);
 			tpos[ext] = glGetAttribLocation(tprog[ext],
