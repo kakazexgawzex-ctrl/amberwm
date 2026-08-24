@@ -150,6 +150,9 @@ struct amber_animation {
 	int gx, gy, gw, gh;             // window rect at grab (output-local)
 	int cols, rows;                 // grid cell dimensions
 	float *px, *py, *vx, *vy;       // point state ((cols+1)*(rows+1))
+	float *wf;                      // grab-falloff weight per point
+	float drag_x, drag_y;           // accumulated drag offset
+	float ax, ay;                   // grab point inside window
 	bool wobble_released;           // button up: settle then finish
 	int64_t last_usec;              // previous tick (adaptive spring dt)
 	/* Last applied rect per strip/cell [x,y,w,h]*4 — skips redundant
@@ -2170,19 +2173,12 @@ static void ui_blit(unsigned char *dst, int dw, int dh,
 			}
 			float sa = (src[sy * sw + sx] / 255.0f) * col[3];
 			unsigned char *d = &dst[(dy * dw + dx) * 4];
-			float da = d[3] / 255.0f;
-			float oa = sa + da * (1.0f - sa);
-			if (oa <= 0.0f) {
-				continue;
-			}
+			/* Scene buffers want PREMULTIPLIED alpha; straight
+			 * alpha made glyph edges read as dark burn marks. */
 			for (int c = 0; c < 3; c++) {
-				d[c] = (unsigned char)(
-					(col[c] * sa +
-						d[c] / 255.0f * da *
-							(1.0f - sa)) /
-					oa * 255.0f);
+				d[c] = (unsigned char)(col[c] * sa * 255.0f);
 			}
-			d[3] = (unsigned char)(oa * 255.0f);
+			d[3] = (unsigned char)(sa * 255.0f);
 		}
 	}
 }
@@ -2209,9 +2205,9 @@ static struct wlr_buffer *ui_rounded_card(int w, int h, int r,
 				continue;
 			}
 			unsigned char *d = &px[(y * (size_t)w + x) * 4];
-			d[0] = (unsigned char)(col[0] * 255);
-			d[1] = (unsigned char)(col[1] * 255);
-			d[2] = (unsigned char)(col[2] * 255);
+			d[0] = (unsigned char)(col[0] * col[3] * 255);
+			d[1] = (unsigned char)(col[1] * col[3] * 255);
+			d[2] = (unsigned char)(col[2] * col[3] * 255);
 			d[3] = (unsigned char)(col[3] * 255);
 		}
 	}
@@ -2234,9 +2230,9 @@ static struct wlr_buffer *ui_rounded_ring(int w, int h, int r, int t,
 				continue;
 			}
 			unsigned char *d = &px[(y * (size_t)w + x) * 4];
-			d[0] = (unsigned char)(col[0] * 255);
-			d[1] = (unsigned char)(col[1] * 255);
-			d[2] = (unsigned char)(col[2] * 255);
+			d[0] = (unsigned char)(col[0] * col[3] * 255);
+			d[1] = (unsigned char)(col[1] * col[3] * 255);
+			d[2] = (unsigned char)(col[2] * col[3] * 255);
 			d[3] = (unsigned char)(col[3] * 255);
 		}
 	}
@@ -2342,9 +2338,12 @@ static struct wlr_buffer *ui_download_icon(int s, float col[4]) {
 			if (in) {
 				unsigned char *d =
 					&px[(y * (size_t)s + x) * 4];
-				d[0] = (unsigned char)(col[0] * 255);
-				d[1] = (unsigned char)(col[1] * 255);
-				d[2] = (unsigned char)(col[2] * 255);
+				d[0] = (unsigned char)(col[0] * col[3]
+					* 255);
+				d[1] = (unsigned char)(col[1] * col[3]
+					* 255);
+				d[2] = (unsigned char)(col[2] * col[3]
+					* 255);
 				d[3] = (unsigned char)(col[3] * 255);
 			}
 		}
@@ -5161,6 +5160,12 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 		dt = 0.032f;
 	}
 	anim->last_usec = now;
+	if (anim->wobble_released) {
+		/* Straighten onto the real node after release. */
+		float decay = expf(-dt * 9.0f);
+		anim->drag_x *= decay;
+		anim->drag_y *= decay;
+	}
 	int nx = toplevel->scene_tree->node.x;
 	int ny = toplevel->scene_tree->node.y;
 	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
@@ -5171,8 +5176,13 @@ static bool animation_wobble_tick(struct amber_animation *anim) {
 	for (int iy = 0; iy < pts_y; iy++) {
 		for (int ix = 0; ix < pts_x; ix++) {
 			int idx = iy * pts_x + ix;
-			float tx = nx + ix * cell_w;
-			float ty = ny + iy * cell_h;
+			float wgt = anim->wf[idx];
+			/* Away-from-grip points lag the rigid node:
+			 * target = rigid - drag*(1-w) -> shear/bend. */
+			float tx = nx + ix * cell_w +
+				anim->drag_x * (wgt - 1.0f);
+			float ty = ny + iy * cell_h +
+				anim->drag_y * (wgt - 1.0f);
 			float ax = k * (tx - anim->px[idx]) - c * anim->vx[idx];
 			float ay = k * (ty - anim->py[idx]) - c * anim->vy[idx];
 			anim->vx[idx] += ax * dt;
@@ -5471,7 +5481,6 @@ static void animation_start_lamp_close(struct amber_toplevel *toplevel) {
 		output->usable_area.height;
 	anim->start_usec = anim_now_usec();
 	anim->duration_ms = server->lamp_close_duration_ms;
-
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
 
@@ -5526,6 +5535,16 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			toplevel->fullscreen ||
 			toplevel->workspace != output->active_workspace ||
 			toplevel->scene_tree == NULL) {
+		return;
+	}
+	{
+		bool bl; int rad;
+		rule_resolve(server, toplevel, &bl, &rad);
+		if (bl) {
+			return;
+		}
+	}
+	if (false) {
 		wlr_log(WLR_INFO, "wobble: bail flags (anim=%d wob=%d out=%p ws_match=%d)",
 			server->animations_enabled, server->wobbly_windows,
 			(void *)output,
@@ -5577,18 +5596,34 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	anim->py = calloc(point_count, sizeof(float));
 	anim->vx = calloc(point_count, sizeof(float));
 	anim->vy = calloc(point_count, sizeof(float));
+	anim->wf = calloc(point_count, sizeof(float));
+	anim->ax = server->grab_x;
+	anim->ay = server->grab_y;
+	anim->drag_x = 0.0f;
+	anim->drag_y = 0.0f;
 	anim->strips = calloc(anim->cols * anim->rows,
 		sizeof(*anim->strips));
 	anim->strip_rect = calloc(anim->cols * anim->rows * 4,
 		sizeof(*anim->strip_rect));
 	if (anim->px == NULL || anim->py == NULL || anim->vx == NULL ||
-			anim->vy == NULL || anim->strips == NULL ||
-			anim->strip_rect == NULL) {
+			anim->vy == NULL || anim->wf == NULL ||
+			anim->strips == NULL || anim->strip_rect == NULL) {
 		animation_destroy(server, anim, false);
 		return;
 	}
 	anim->last_usec = anim_now_usec();
 
+	float cell_w0 = (float)anim->gw / anim->cols;
+	float cell_h0 = (float)anim->gh / anim->rows;
+	for (int iy = 0; iy < pts_y; iy++) {
+		for (int ix = 0; ix < pts_x; ix++) {
+			float dxp = ix * cell_w0 - anim->ax;
+			float dyp = iy * cell_h0 - anim->ay;
+			float dist = sqrtf(dxp * dxp + dyp * dyp);
+			anim->wf[iy * pts_x + ix] =
+				1.0f / (1.0f + dist / 160.0f);
+		}
+	}
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
 
@@ -5649,10 +5684,14 @@ void animation_wobble_nudge(struct amber_toplevel *toplevel,
 		if (anim->kind != ANIM_WOBBLE || anim->toplevel != toplevel) {
 			continue;
 		}
+		anim->drag_x += (float)dx;
+		anim->drag_y += (float)dy;
 		int count = (anim->cols + 1) * (anim->rows + 1);
 		for (int i = 0; i < count; i++) {
-			float nvx = anim->vx[i] + dx * 10.0f;
-			float nvy = anim->vy[i] + dy * 10.0f;
+			float kick = 10.0f * (anim->wf != NULL
+					? anim->wf[i] : 1.0f);
+			float nvx = anim->vx[i] + dx * kick;
+			float nvy = anim->vy[i] + dy * kick;
 			if (nvx > WOB_MAX_VEL) nvx = WOB_MAX_VEL;
 			if (nvx < -WOB_MAX_VEL) nvx = -WOB_MAX_VEL;
 			if (nvy > WOB_MAX_VEL) nvy = WOB_MAX_VEL;
