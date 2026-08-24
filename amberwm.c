@@ -73,8 +73,6 @@
  * effects: rounded corners, blur, shadows. Must replace wlr_scene.h. */
 #include <scenefx/types/wlr_scene.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
-#include <GLES2/gl2.h>
-#include <wlr/render/pass.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -142,8 +140,6 @@ struct amber_animation {
 	int from_dx;        // horizontal offset applied at progress 0
 	/* ANIM_LAMP_CLOSE: owns a locked snapshot + detached strip nodes. */
 	struct wlr_buffer *snapshot;   // locked at unmap, ours until done
-	struct wlr_texture *mesh_tex;  // GPU import of snapshot (mesh mode)
-	struct wlr_buffer *mesh_buf;   // our own copy backing mesh_tex
 	struct wlr_scene_buffer **strips; // live in output->fx_tree
 	int strip_count;
 	struct amber_output *output;
@@ -218,8 +214,6 @@ struct amber_server {
 	int corner_radius;
 	bool blur_enabled;
 	int blur_radius;
-	/* wobble-render=mesh: custom warped-mesh pass (S1: test quad) */
-	bool wobble_mesh;
 	struct wlr_buffer *wallpaper_buffer;
 
 	struct wlr_xdg_shell *xdg_shell;
@@ -1828,9 +1822,6 @@ static void config_load(struct amber_server *server) {
 				strcmp(value, "yes") == 0;
 		} else if (strcmp(key, "dynamic-workspaces") == 0) {
 			server->dyn_ws = strcmp(value, "yes") == 0;
-		} else if (strcmp(key, "wobble-render") == 0) {
-			server->wobble_mesh =
-				strcmp(value, "mesh") == 0;
 		} else if (strcmp(key, "animations") == 0) {
 			server->animations_enabled =
 				strcmp(value, "yes") == 0;
@@ -5089,14 +5080,6 @@ static void animation_lamp_cleanup(struct amber_animation *anim) {
 		wlr_buffer_unlock(anim->snapshot);
 		anim->snapshot = NULL;
 	}
-	if (anim->mesh_tex != NULL) {
-		wlr_texture_destroy(anim->mesh_tex);
-		anim->mesh_tex = NULL;
-	}
-	if (anim->mesh_buf != NULL) {
-		wlr_buffer_drop(anim->mesh_buf);
-		anim->mesh_buf = NULL;
-	}
 	free(anim->strip_rect);
 	anim->strip_rect = NULL;
 }
@@ -5709,13 +5692,6 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	anim->gh = surf_h;
 	anim->cols = WOB_COLS;
 	anim->rows = WOB_ROWS;
-	if (server->wobble_mesh) {
-		/* Mesh mode: 4x4 point grid = the Bezier control
-		 * surface; rendering is smooth, physics stays the
-		 * proven falloff-spring model. */
-		anim->cols = 3;
-		anim->rows = 3;
-	}
 	anim->start_usec = anim_now_usec();
 
 	int pts_x = anim->cols + 1, pts_y = anim->rows + 1;
@@ -5755,39 +5731,9 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 	toplevel_apply_fx(toplevel);
 	anim->snapshot = snap_buf;
 	wlr_buffer_lock(anim->snapshot);
-	if (server->wobble_mesh && anim->mesh_tex == NULL) {
-		/* Importing the client's own buffer melts on crocus:
-		 * scenefx's shm path trips GL_INVALID_VALUE in
-		 * glCopyTexSubImage2D and the texture ends up with
-		 * garbage/dead rows. Take ONE renderer readback of the
-		 * window rect (the proven screenshot path) and upload
-		 * our own buffer instead. */
-		int ow = output->wlr_output->width;
-		int oh = output->wlr_output->height;
-		/* Full-output snapshot: a window-rect capture fails once
-		 * the rect leaves output bounds (off-screen drags) and
-		 * silently dropped us back to strips. UVs handle the
-		 * rest. */
-		unsigned char *cap = screenshot_capture(server, output,
-			(struct wlr_box){ 0, 0, ow, oh });
-		if (cap != NULL) {
-			struct wlr_buffer *own = rgba_buffer_take(
-				ow, oh, cap);
-			if (own != NULL) {
-				anim->mesh_tex = fx_texture_from_buffer(
-					server->renderer, own);
-				anim->mesh_buf = own;
-			} else {
-				free(cap);
-			}
-		}
-		wlr_log(WLR_INFO, "mesh: snapshot copy %dx%d %s",
-			ow, oh, anim->mesh_tex != NULL ? "ok" : "FAILED");
-	}
 
 	float buf_w = anim->snapshot->width;
 	float buf_h = anim->snapshot->height;
-	if (!server->wobble_mesh || anim->mesh_tex == NULL) {
 	for (int iy = 0; iy < anim->rows; iy++) {
 		for (int ix = 0; ix < anim->cols; ix++) {
 			struct wlr_scene_buffer *cell =
@@ -5815,10 +5761,7 @@ void animation_start_wobble(struct amber_toplevel *toplevel) {
 			anim->strips[iy * anim->cols + ix] = cell;
 		}
 	}
-	}
-	anim->strip_count =
-		(server->wobble_mesh && anim->mesh_tex != NULL)
-		? 0 : anim->cols * anim->rows;
+	anim->strip_count = anim->cols * anim->rows;
 
 	for (int iy = 0; iy < pts_y; iy++) {
 		for (int ix = 0; ix < pts_x; ix++) {
@@ -5999,311 +5942,6 @@ static void output_attach_wallpaper(struct amber_output *output) {
 	output->wallpaper_node = sb;
 }
 
-static void mesh_log_shader(GLuint shader, const char *what) {
-	GLint ok = GL_FALSE;
-	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-	if (ok) {
-		return;
-	}
-	char log[512];
-	GLsizei n = 0;
-	glGetShaderInfoLog(shader, sizeof(log), &n, log);
-	wlr_log(WLR_ERROR, "mesh: %s compile failed: %.*s", what,
-		(int)n, log);
-}
-
-/* Bicubic Bezier surface through the 4x4 control points (compiz
- * bezierPatchEvaluate): the drawn mesh is C1-continuous, which is the
- * entire reason this looks smooth where axis-aligned strips facet. */
-static void mesh_bezier(const float *mx, const float *my,
-		float u, float v, float *ox, float *oy) {
-	float cu[4], cv[4];
-	cu[0] = (1 - u) * (1 - u) * (1 - u);
-	cu[1] = 3 * u * (1 - u) * (1 - u);
-	cu[2] = 3 * u * u * (1 - u);
-	cu[3] = u * u * u;
-	cv[0] = (1 - v) * (1 - v) * (1 - v);
-	cv[1] = 3 * v * (1 - v) * (1 - v);
-	cv[2] = 3 * v * v * (1 - v);
-	cv[3] = v * v * v;
-	float x = 0.0f, y = 0.0f;
-	for (int i = 0; i < 4; i++) {
-		for (int j = 0; j < 4; j++) {
-			x += cu[i] * cv[j] * mx[j * 4 + i];
-			y += cu[i] * cv[j] * my[j * 4 + i];
-		}
-	}
-	*ox = x;
-	*oy = y;
-}
-
-/* S1 proof: warped magenta quad over the rendered frame while a wobble
- * drag is live on this output. Raw GLES2 onto the scene buffer FBO,
- * GL state restored after. Becomes the full Bezier mesh pass in S3. */
-static void mesh_test_draw(struct amber_server *server,
-		struct amber_output *output, struct wlr_buffer *buffer) {
-	struct amber_animation *wob_anim = NULL, *anim, *tmp;
-	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
-		if (anim->kind == ANIM_WOBBLE && anim->toplevel != NULL &&
-				anim->toplevel->output == output) {
-			wob_anim = anim;
-			break;
-		}
-	}
-	if (wob_anim == NULL) {
-		return;
-	}
-	if (wob_anim->mesh_tex != NULL) {
-		/* Full Bezier mesh pass: draw the snapshot texture over a
-		 * 16x16-quadratic surface through the spring control
-		 * points. Snapshot buffers are premultiplied. */
-		struct fx_texture_attribs ta;
-		fx_texture_get_attribs(wob_anim->mesh_tex, &ta);
-		int ext = ta.target == GL_TEXTURE_EXTERNAL_OES ? 1 : 0;
-		static GLuint tprog[2] = {0, 0};
-		static GLint tpos[2], tuv[2], ttex[2];
-		if (tprog[ext] == 0) {
-			const char *tvs =
-				"attribute vec2 a_pos;"
-				"attribute vec2 a_uv;"
-				"varying vec2 v_uv;"
-				"void main() {"
-				"	v_uv = a_uv;"
-				"	gl_Position = vec4(a_pos, 0.0, 1.0);"
-				"}";
-			const char *tfs = ext
-				? "#extension GL_OES_EGL_image_external :"
-				  " require\n"
-				  "precision mediump float;"
-				  "varying vec2 v_uv;"
-				  "uniform samplerExternalOES u_tex;"
-				  "void main() {"
-				  "	gl_FragColor ="
-				  " texture2D(u_tex, v_uv);"
-				  "}"
-				: "precision mediump float;"
-				  "varying vec2 v_uv;"
-				  "uniform sampler2D u_tex;"
-				  "void main() {"
-				  "	gl_FragColor ="
-				  " texture2D(u_tex, v_uv);"
-				  "}";
-			GLuint v = glCreateShader(GL_VERTEX_SHADER);
-			glShaderSource(v, 1, &tvs, NULL);
-			glCompileShader(v);
-			mesh_log_shader(v, "vertex");
-			GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-			glShaderSource(f, 1, &tfs, NULL);
-			glCompileShader(f);
-			mesh_log_shader(f, "fragment");
-			tprog[ext] = glCreateProgram();
-			glAttachShader(tprog[ext], v);
-			glAttachShader(tprog[ext], f);
-			glLinkProgram(tprog[ext]);
-			GLint linked = GL_FALSE;
-			glGetProgramiv(tprog[ext], GL_LINK_STATUS,
-				&linked);
-			if (!linked) {
-				char log[512];
-				GLsizei n = 0;
-				glGetProgramInfoLog(tprog[ext],
-					sizeof(log), &n, log);
-				wlr_log(WLR_ERROR,
-					"mesh: shader[%d] link: %.*s",
-					ext, (int)n, log);
-			}
-			glDeleteShader(v);
-			glDeleteShader(f);
-			tpos[ext] = glGetAttribLocation(tprog[ext],
-				"a_pos");
-			tuv[ext] = glGetAttribLocation(tprog[ext],
-				"a_uv");
-			ttex[ext] = glGetUniformLocation(tprog[ext],
-				"u_tex");
-		}
-		enum { SUB = 16 };
-		static GLushort tidx[(SUB - 1) * (SUB - 1) * 6];
-		static bool tidx_init = false;
-		if (!tidx_init) {
-			int o = 0;
-			for (int j = 0; j < SUB - 1; j++) {
-				for (int i = 0; i < SUB - 1; i++) {
-					GLushort a = j * SUB + i;
-					tidx[o++] = a;
-					tidx[o++] = a + SUB;
-					tidx[o++] = a + 1;
-					tidx[o++] = a + 1;
-					tidx[o++] = a + SUB;
-					tidx[o++] = a + SUB + 1;
-				}
-			}
-			tidx_init = true;
-		}
-		static GLfloat tva[SUB * SUB * 4];
-		int W = buffer->width, H = buffer->height;
-		int o = 0;
-		for (int j = 0; j < SUB; j++) {
-			for (int i = 0; i < SUB; i++) {
-				float u = (float)i / (SUB - 1);
-				float v = (float)j / (SUB - 1);
-				float px, py;
-				mesh_bezier(wob_anim->px, wob_anim->py,
-					u, v, &px, &py);
-				tva[o++] = 2.0f * px / W - 1.0f;
-				tva[o++] = 1.0f - 2.0f * py / H;
-				/* Texture is the full-output snapshot: UVs
-				 * are the vertex's output-local position. */
-				tva[o++] = px / W;
-				tva[o++] = py / H;
-			}
-		}
-		GLuint fbo = fx_renderer_get_buffer_fbo(server->renderer,
-			buffer);
-		if (fbo == 0) {
-			return;
-		}
-		GLint viewport[4];
-		glGetIntegerv(GL_VIEWPORT, viewport);
-		GLboolean blend_was = glIsEnabled(GL_BLEND);
-		GLint prog_was = 0;
-		glGetIntegerv(GL_CURRENT_PROGRAM, &prog_was);
-		/* The scene pass leaves scissor (damage clipping) and
-		 * possibly depth enabled; inherited blindly they shred
-		 * the mesh into random rects. Save, park, restore. */
-		GLboolean scissor_was = glIsEnabled(GL_SCISSOR_TEST);
-		GLboolean depth_was = glIsEnabled(GL_DEPTH_TEST);
-		GLint bsrc = GL_ONE, bdst = GL_ZERO;
-		glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc);
-		glGetIntegerv(GL_BLEND_DST_RGB, &bdst);
-		glDisable(GL_SCISSOR_TEST);
-		glDisable(GL_DEPTH_TEST);
-		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		glViewport(0, 0, W, H);
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		glUseProgram(tprog[ext]);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(ta.target, ta.tex);
-		glUniform1i(ttex[ext], 0);
-		/* Backdrop first: repaint the whole output from the
-		 * snapshot every frame. The scene's damage-based redraws
-		 * leave stale mesh trails behind under the mesh - this
-		 * makes each frame deterministic. */
-		glDisable(GL_BLEND);
-		{
-			const GLfloat bv[] = {
-				-1.0f, -1.0f, 0.0f, 0.0f,
-				 1.0f, -1.0f, 1.0f, 0.0f,
-				-1.0f,  1.0f, 0.0f, 1.0f,
-				 1.0f,  1.0f, 1.0f, 1.0f,
-			};
-			glVertexAttribPointer(tpos[ext], 2, GL_FLOAT,
-				GL_FALSE, 4 * sizeof(GLfloat), bv);
-			glVertexAttribPointer(tuv[ext], 2, GL_FLOAT,
-				GL_FALSE, 4 * sizeof(GLfloat), bv + 2);
-			glEnableVertexAttribArray(tpos[ext]);
-			glEnableVertexAttribArray(tuv[ext]);
-			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-		}
-		glEnable(GL_BLEND);
-		glVertexAttribPointer(tpos[ext], 2, GL_FLOAT, GL_FALSE,
-			4 * sizeof(GLfloat), tva);
-		glVertexAttribPointer(tuv[ext], 2, GL_FLOAT, GL_FALSE,
-			4 * sizeof(GLfloat), tva + 2);
-		glEnableVertexAttribArray(tpos[ext]);
-		glEnableVertexAttribArray(tuv[ext]);
-		glDrawElements(GL_TRIANGLES,
-			(SUB - 1) * (SUB - 1) * 6, GL_UNSIGNED_SHORT,
-			tidx);
-		glDisableVertexAttribArray(tpos[ext]);
-		glDisableVertexAttribArray(tuv[ext]);
-		glBindTexture(ta.target, 0);
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		glUseProgram(prog_was);
-		if (!blend_was) {
-			glDisable(GL_BLEND);
-		}
-		glBlendFunc(bsrc, bdst);
-		if (scissor_was) {
-			glEnable(GL_SCISSOR_TEST);
-		}
-		if (depth_was) {
-			glEnable(GL_DEPTH_TEST);
-		}
-		glViewport(viewport[0], viewport[1], viewport[2],
-			viewport[3]);
-		return;
-	}
-	static GLuint prog = 0;
-	static GLint pos_loc = -1;
-	if (prog == 0) {
-		const char *vs =
-			"attribute vec2 a_pos;"
-			"void main() {"
-			"	gl_Position = vec4(a_pos, 0.0, 1.0);"
-			"}";
-		const char *fs =
-			"precision mediump float;"
-			"void main() {"
-			"	gl_FragColor = vec4(1.0, 0.0, 1.0, 0.55);"
-			"}";
-		GLuint v = glCreateShader(GL_VERTEX_SHADER);
-		glShaderSource(v, 1, &vs, NULL);
-		glCompileShader(v);
-		GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-		glShaderSource(f, 1, &fs, NULL);
-		glCompileShader(f);
-		prog = glCreateProgram();
-		glAttachShader(prog, v);
-		glAttachShader(prog, f);
-		glLinkProgram(prog);
-		glDeleteShader(v);
-		glDeleteShader(f);
-		pos_loc = glGetAttribLocation(prog, "a_pos");
-	}
-	GLuint fbo = fx_renderer_get_buffer_fbo(server->renderer,
-		buffer);
-	if (fbo == 0) {
-		return;
-	}
-	const GLfloat verts[] = {
-		-0.4f, -0.2f,
-		 0.5f, -0.45f,
-		-0.5f,  0.45f,
-		 0.4f,  0.2f,
-	};
-	GLint viewport[4];
-	glGetIntegerv(GL_VIEWPORT, viewport);
-	GLboolean blend_was = glIsEnabled(GL_BLEND);
-	GLint prog_was = 0;
-	glGetIntegerv(GL_CURRENT_PROGRAM, &prog_was);
-	GLboolean scissor_was = glIsEnabled(GL_SCISSOR_TEST);
-	GLboolean depth_was = glIsEnabled(GL_DEPTH_TEST);
-	glDisable(GL_SCISSOR_TEST);
-	glDisable(GL_DEPTH_TEST);
-	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-	glViewport(0, 0, buffer->width, buffer->height);
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glUseProgram(prog);
-	glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, verts);
-	glEnableVertexAttribArray(pos_loc);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	glDisableVertexAttribArray(pos_loc);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glUseProgram(prog_was);
-	if (!blend_was) {
-		glDisable(GL_BLEND);
-	}
-	if (scissor_was) {
-		glEnable(GL_SCISSOR_TEST);
-	}
-	if (depth_was) {
-		glEnable(GL_DEPTH_TEST);
-	}
-	glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-}
-
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -6321,66 +5959,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		scene, output->wlr_output);
 
-	/* Render the scene if needed and commit the output. Mesh mode
-	 * takes the split path: render into a state buffer, draw the
-	 * warped wobble mesh on top, commit manually. During a mesh
-	 * drag the scene itself has no damage (window hidden, no
-	 * strips), so force frames while an anim is live and keep
-	 * scheduling vblanks - otherwise the drag freezes on screen
-	 * and the window seems to vanish until it settles. */
-	struct amber_animation *wob_anim = NULL, *anim, *tmp;
-	wl_list_for_each_safe(anim, tmp, &output->server->animations,
-			link) {
-		if (anim->kind == ANIM_WOBBLE &&
-				anim->toplevel != NULL &&
-				anim->toplevel->output == output) {
-			wob_anim = anim;
-			break;
-		}
-	}
-	if (output->server->wobble_mesh && (wob_anim != NULL ||
-			wlr_scene_output_needs_frame(scene_output))) {
-		struct wlr_output_state state;
-		wlr_output_state_init(&state);
-		if (wob_anim != NULL) {
-			/* The scene only redraws damaged regions; during
-			 * a mesh drag almost nothing in the scene is
-			 * damaged, so the mesh would draw over a
-			 * half-stale buffer - random glitch rects.
-			 * Force a full redraw under the mesh. */
-			wlr_damage_ring_add_whole(
-				&scene_output->damage_ring);
-		}
-		if (wlr_scene_output_build_state(scene_output, &state,
-				NULL)) {
-			/* Draw inside a proper render pass: beginning
-			 * one makes the renderer's EGL context current
-			 * through its own code path - raw GL outside a
-			 * pass runs with no context (Mesa no-ops it,
-			 * and the wlr_gles2_* accessors assert on
-			 * fx_renderers anyway). */
-			struct wlr_render_pass *pass = wob_anim != NULL
-				? wlr_output_begin_render_pass(
-					output->wlr_output, &state, NULL)
-				: NULL;
-			if (pass != NULL) {
-				mesh_test_draw(output->server, output,
-					state.buffer);
-				wlr_render_pass_submit(pass);
-			}
-			wlr_output_commit_state(output->wlr_output,
-				&state);
-			if (wob_anim != NULL) {
-				wlr_output_schedule_frame(
-					output->wlr_output);
-			}
-		} else if (wob_anim != NULL) {
-			wlr_output_schedule_frame(output->wlr_output);
-		}
-		wlr_output_state_finish(&state);
-	} else {
-		wlr_scene_output_commit(scene_output, NULL);
-	}
+	wlr_scene_output_commit(scene_output, NULL);
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);

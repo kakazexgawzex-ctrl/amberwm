@@ -9,7 +9,7 @@ PKGS = scenefx-0.5 wlroots-0.20 wayland-server xkbcommon
 CFLAGS := -g -O3 -Werror -march=x86-64 -mtune=generic \
           $(shell $(PKG_CONFIG) --cflags $(PKGS)) \
           -I. -DWLR_USE_UNSTABLE
-LDLIBS := $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm -lGLESv2
+LDLIBS := $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
 
 all: amberwm ambermsg
 
