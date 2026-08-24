@@ -6293,6 +6293,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
 			wlr_scene_output_needs_frame(scene_output))) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
+		if (wob_anim != NULL) {
+			/* The scene only redraws damaged regions; during
+			 * a mesh drag almost nothing in the scene is
+			 * damaged, so the mesh would draw over a
+			 * half-stale buffer - random glitch rects.
+			 * Force a full redraw under the mesh. */
+			wlr_damage_ring_add_whole(
+				&scene_output->damage_ring);
+		}
 		if (wlr_scene_output_build_state(scene_output, &state,
 				NULL)) {
 			/* Draw inside a proper render pass: beginning
