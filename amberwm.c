@@ -43,13 +43,18 @@
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_output_management_v1.h>
+#include <wlr/types/wlr_output_power_management_v1.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_security_context_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_session_lock_v1.h>
 #include <wlr/types/wlr_viewporter.h>
+#include <wlr/types/wlr_virtual_keyboard_v1.h>
+#include <wlr/types/wlr_virtual_pointer_v1.h>
 #include <wlr/types/wlr_xdg_activation_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
@@ -62,13 +67,9 @@
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
 #include "vendor/stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STBIW_ASSERT(x)
-#include "vendor/stb_image_write.h"
-#define STB_TRUETYPE_IMPLEMENTATION
-#include "vendor/stb_truetype.h"
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
 /* SceneFX provides the scene graph (drop-in wlr_scene replacement) with
  * effects: rounded corners, blur, shadows. Must replace wlr_scene.h. */
 #include <scenefx/types/wlr_scene.h>
@@ -93,7 +94,6 @@ enum amber_cursor_mode {
 	AMBER_CURSOR_PASSTHROUGH,
 	AMBER_CURSOR_MOVE,
 	AMBER_CURSOR_RESIZE,
-	AMBER_CURSOR_SCREENSHOT,
 };
 
 /* Per-app window rule from the config:
@@ -266,6 +266,24 @@ struct amber_server {
 	struct wl_listener cursor_axis;
 	struct wl_listener cursor_frame;
 
+	/* Protocol extras: output reconfiguration (kanshi), monitor power
+	 * (wlopm), raw relative motion, and virtual input devices. */
+	struct wlr_relative_pointer_manager_v1 *relative_pointer_mgr;
+	struct wlr_output_manager_v1 *output_manager;
+	struct wl_listener output_manager_apply;
+	struct wl_listener output_manager_test;
+	struct wlr_output_power_manager_v1 *output_power_mgr;
+	struct wl_listener output_power_set_mode;
+	struct wl_listener virtual_keyboard_new;
+	struct wl_listener virtual_pointer_new;
+
+	/* Pointer constraints (games): the compositor enforces the lock /
+	 * confine itself in wlroots 0.20 (no seat/cursor helpers left). */
+	struct wlr_pointer_constraints_v1 *pointer_constraints_mgr;
+	struct wl_listener pointer_constraints_new;
+	struct wlr_pointer_constraint_v1 *active_constraint;
+	double constraint_anchor_x, constraint_anchor_y; // layout coords
+
 	struct wlr_seat *seat;
 	struct wl_listener new_input;
 	struct wl_listener request_cursor;
@@ -299,30 +317,6 @@ struct amber_server {
 	/* Per-app window rules (config "rule=" lines). Matched by app-id;
 	 * a rule with empty app_id matches every window. */
 	struct wl_list window_rules; // amber_window_rule.link
-	/* Interactive region screenshot state (niri-style: drag to select,
-	 * Ctrl+C copies, Space saves to file, Esc cancels). */
-	bool shot_active;
-	bool shot_dragging;
-	bool shot_has_sel; // rectangle drawn and committed (survives release)
-	struct wlr_box shot_box; // committed selection, output-local coords
-	double shot_sx, shot_sy; // selection start, layout coords
-	struct amber_output *shot_output;
-	struct wlr_scene_rect *shot_shade[4]; // dim strips around selection
-	struct wlr_scene_rect *shot_borders[4];
-	/* Hint card (Material You): bg + optional icon + two text lines. */
-	struct wlr_scene_buffer *shot_hint_bg;
-	struct wlr_scene_buffer *shot_hint_icon;
-	struct wlr_scene_buffer *shot_hint_l1;
-	struct wlr_scene_buffer *shot_hint_l2;
-	struct wlr_scene_buffer *shot_freeze; // frozen frame under the dim
-	bool shot_moving; // dragging the committed rectangle around
-	double shot_move_ax, shot_move_ay; // grab anchor, output-local
-	struct wlr_box shot_move_orig; // box at grab time
-	bool shot_have_last; // keep last selection for the next session
-	struct wlr_box shot_last_box;
-	struct amber_output *shot_last_output; // identity compare only
-	bool shot_show_pointer; // stamp the cursor into the frozen frame
-	char *screenshot_dir; // config override, NULL = default
 
 	/* Built-in window switcher: static thumbnail grid over a dim
 	 * layer on the active output; nodes live in the overlay tree. */
@@ -428,6 +422,13 @@ struct amber_toplevel {
 	struct wl_listener request_fullscreen;
 };
 
+/* Per-constraint destroy bookkeeping; lives in constraint->data. */
+struct amber_constraint_trk {
+	struct amber_server *server;
+	struct wlr_pointer_constraint_v1 *constraint;
+	struct wl_listener destroy;
+};
+
 struct amber_layer_surface {
 	struct wl_list link;
 	struct amber_server *server;
@@ -463,14 +464,13 @@ struct amber_keyboard {
 	/* Modifier bits that are locks (caps/num), stripped before matching
 	 * bindings so NumLock does not break Super+key combos. */
 	uint32_t lock_mask;
-	/* Keycodes whose press was consumed by us (bind, VT combo, or
-	 * screenshot grab); the matching releases are swallowed too, or
-	 * clients see a release for a key they never received. */
+	/* Keycodes whose press was consumed by us (bind or VT combo);
+	 * the matching releases are swallowed too, or clients see a
+	 * release for a key they never received. */
 	uint32_t swallowed[16];
 	size_t n_swallowed;
 	/* Physically-held keycodes; a PRESSED event for an already-held
-	 * keycode is auto-repeat and must never re-trigger one-shot binds
-	 * (PRINT re-entering screenshot mode spawned cancel loops). */
+	 * keycode is auto-repeat and must never re-trigger one-shot binds. */
 	uint32_t held[32];
 	size_t n_held;
 
@@ -1414,8 +1414,6 @@ enum amber_binding_id {
 	AMBER_BINDING_TOGGLE_FLOAT,
 	AMBER_BINDING_TOGGLE_FULLSCREEN,
 	AMBER_BINDING_TOGGLE_MAXIMIZE,
-	AMBER_BINDING_SCREENSHOT,
-	AMBER_BINDING_SCREENSHOT_REGION,
 	AMBER_BINDING_SWITCHER,
 };
 
@@ -1491,8 +1489,6 @@ static const struct amber_binding_defaults amber_default_bindings[] = {
 	{ "SUPER+T", AMBER_BINDING_TERMINAL, 0, NULL },
 	{ "SUPER+SPACE", AMBER_BINDING_EXEC, 0,
 			"noctalia msg panel-toggle launcher" },
-	{ "Print", AMBER_BINDING_SCREENSHOT_REGION, 0, NULL },
-	{ "SHIFT+Print", AMBER_BINDING_SCREENSHOT, 0, NULL },
 	/* Noctalia-driven hardware keys (OSDs included). */
 	{ "XF86AudioRaiseVolume", AMBER_BINDING_EXEC, 0,
 			"noctalia msg volume-up" },
@@ -1605,10 +1601,6 @@ static bool parse_action(struct amber_server *server,
 		b->id = AMBER_BINDING_TOGGLE_FULLSCREEN;
 	} else if (strcmp(buf, "toggle-maximize") == 0) {
 		b->id = AMBER_BINDING_TOGGLE_MAXIMIZE;
-	} else if (strcmp(buf, "screenshot") == 0) {
-		b->id = AMBER_BINDING_SCREENSHOT_REGION;
-	} else if (strcmp(buf, "screenshot-screen") == 0) {
-		b->id = AMBER_BINDING_SCREENSHOT;
 	} else if (strcmp(buf, "switcher") == 0) {
 		b->id = AMBER_BINDING_SWITCHER;
 	} else if (strcmp(buf, "workspace") == 0 || strcmp(buf,
@@ -1723,6 +1715,7 @@ static void config_load(struct amber_server *server) {
 	server->ws_slide_enabled = true;
 	server->ws_slide_duration_ms = 250;
 	server->wobbly_windows = true; // Compiz-style spring grid on drag
+	server->dyn_ws = true; // advertise only active/occupied workspaces
 	const char *env_theme = getenv("XCURSOR_THEME");
 	server->cursor_theme = env_theme != NULL ? strdup(env_theme) : NULL;
 	const char *env_size = getenv("XCURSOR_SIZE");
@@ -1802,10 +1795,6 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "wallpaper") == 0) {
 			free(server->wallpaper_path);
 			server->wallpaper_path = *value == '\0'
-				? NULL : expand_path(value);
-		} else if (strcmp(key, "screenshot-dir") == 0) {
-			free(server->screenshot_dir);
-			server->screenshot_dir = *value == '\0'
 				? NULL : expand_path(value);
 		} else if (strcmp(key, "corner-radius") == 0) {
 			server->corner_radius = atoi(value);
@@ -2022,8 +2011,6 @@ static void config_watch_init(struct amber_server *server) {
 	wlr_log(WLR_INFO, "watching %s for changes", server->config_path);
 }
 
-static void screenshot_start_region(struct amber_server *server);
-static void screenshot_full_screen(struct amber_server *server);
 static void ext_ws_dyn_sync(struct amber_output *output);
 
 static void switcher_open(struct amber_server *server);
@@ -2031,38 +2018,6 @@ static void switcher_open(struct amber_server *server);
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
 
-	/* Fast PRINT re-entry can land here with the previous shot's
-	 * card/strips still on screen; tear the overlay down BEFORE
-	 * capturing or it bakes into the frozen frame. Node teardown
-	 * only - state flags stay untouched (unlike hide_ui). */
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_destroy(
-				&server->shot_shade[i]->node);
-			server->shot_shade[i] = NULL;
-		}
-		if (server->shot_borders[i] != NULL) {
-			wlr_scene_node_destroy(&server->shot_borders[i]->node);
-			server->shot_borders[i] = NULL;
-		}
-	}
-	if (server->shot_hint_bg != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_bg->node);
-		server->shot_hint_bg = NULL;
-	}
-	if (server->shot_hint_icon != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_icon->node);
-		server->shot_hint_icon = NULL;
-	}
-	if (server->shot_hint_l1 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l1->node);
-		server->shot_hint_l1 = NULL;
-	}
-	if (server->shot_hint_l2 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l2->node);
-		server->shot_hint_l2 = NULL;
-	}
-	server->shot_show_pointer = true;
 	switch (binding->id) {
 	case AMBER_BINDING_QUIT:
 		server->shutting_down = true;
@@ -2120,26 +2075,11 @@ static void binding_exec(struct amber_server *server,
 			toplevel_toggle_maximize(server->focused_toplevel);
 		}
 		break;
-	case AMBER_BINDING_SCREENSHOT_REGION:
-		screenshot_start_region(server);
-		break;
-	case AMBER_BINDING_SCREENSHOT:
-		screenshot_full_screen(server);
-		break;
 	}
 }
 
-/* ==================== Built-in screenshots (niri-style) ==================
- * Print enters region mode niri-style: the frame freezes under a dim
- * layer, nothing is selected until you drag, and the rectangle stays
- * after release. Then
- *   Ctrl+C  copy the image to the clipboard (image/png)
- *   Space / Enter  save to ~/Pictures/Screenshots and copy
- *   Esc / right click  cancel
- * Shift+Print captures the whole screen instantly. */
-
-/* RGBA pixel memory wrapped as a wlr_buffer; shared by the built-in
- * wallpaper and the screenshot freeze-frame. */
+ /* RGBA pixel memory wrapped as a wlr_buffer; shared by the built-in
+ * wallpaper and the window switcher. */
 struct amber_wallpaper_buffer {
 	struct wlr_buffer base;
 	void *data;
@@ -2162,73 +2102,6 @@ static struct wlr_buffer *rgba_buffer_take(int width, int height,
 	buf->width = width;
 	buf->height = height;
 	return &buf->base;
-}
-
-/* ==================== tiny UI kit ====================
- * Software-rendered cards / rings / text / glyphs for compositor-drawn
- * overlays. Everything ends life as a straight-alpha RGBA wlr_buffer;
- * the scene scales it via dest_size. */
-
-static stbtt_fontinfo ui_font;
-static bool ui_font_ready = false;
-
-static bool ui_font_init(void) {
-	static bool tried = false;
-	if (tried) {
-		return ui_font_ready;
-	}
-	tried = true;
-	static const char *const paths[] = {
-		"/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-		"/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-		"/usr/share/fonts/dejavu/DejaVuSans.ttf",
-	};
-	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-		FILE *f = fopen(paths[i], "rb");
-		if (f == NULL) {
-			continue;
-		}
-		fseek(f, 0, SEEK_END);
-		long size = ftell(f);
-		fseek(f, 0, SEEK_SET);
-		unsigned char *data = size > 0 ? malloc((size_t)size) : NULL;
-		if (data != NULL && fread(data, 1, (size_t)size, f) ==
-				(size_t)size &&
-			stbtt_InitFont(&ui_font, data,
-				stbtt_GetFontOffsetForIndex(data, 0)) > 0) {
-			ui_font_ready = true;
-			fclose(f);
-			break;
-		}
-		free(data);
-		fclose(f);
-	}
-	return ui_font_ready;
-}
-
-static void ui_blit(unsigned char *dst, int dw, int dh,
-		const unsigned char *src, int sw, int sh,
-		int x, int y, float col[4]) {
-	for (int sy = 0; sy < sh; sy++) {
-		int dy = y + sy;
-		if (dy < 0 || dy >= dh) {
-			continue;
-		}
-		for (int sx = 0; sx < sw; sx++) {
-			int dx = x + sx;
-			if (dx < 0 || dx >= dw) {
-				continue;
-			}
-			float sa = (src[sy * sw + sx] / 255.0f) * col[3];
-			unsigned char *d = &dst[(dy * dw + dx) * 4];
-			/* Scene buffers want PREMULTIPLIED alpha; straight
-			 * alpha made glyph edges read as dark burn marks. */
-			for (int c = 0; c < 3; c++) {
-				d[c] = (unsigned char)(col[c] * sa * 255.0f);
-			}
-			d[3] = (unsigned char)(sa * 255.0f);
-		}
-	}
 }
 
 static bool ui_in_rounded(int x, int y, int w, int h, int r) {
@@ -2293,205 +2166,14 @@ static struct wlr_scene_buffer *ui_attach(struct wlr_scene_tree *tree,
 }
 
 /* Render one string; small static cache since overlay texts repeat. */
-static struct wlr_buffer *ui_text_buffer(const char *text, int px_h,
-		float col[4]) {
-	static struct {
-		char txt[64];
-		int px;
-		struct wlr_buffer *buf;
-	} cache[12];
-	static size_t n;
-	for (size_t i = 0; i < n; i++) {
-		if (cache[i].px == px_h &&
-				strcmp(cache[i].txt, text) == 0) {
-			return cache[i].buf;
-		}
-	}
-	if (!ui_font_init()) {
-		return NULL;
-	}
-	float scale = stbtt_ScaleForPixelHeight(&ui_font,
-		(float)px_h);
-	int ascent = 0, descent = 0, linegap = 0;
-	stbtt_GetFontVMetrics(&ui_font, &ascent, &descent, &linegap);
-	size_t len = strlen(text);
-	int w = 8, h = (int)((ascent - descent) * scale) + 6;
-	for (size_t i = 0; i < len; i++) {
-		int adv = 0, lsb = 0;
-		stbtt_GetCodepointHMetrics(&ui_font, text[i], &adv,
-			&lsb);
-		w += (int)(adv * scale);
-	}
-	unsigned char *img = calloc((size_t)w * h, 4);
-	if (img == NULL) {
-		return NULL;
-	}
-	int baseline = (int)(ascent * scale) + 2;
-	int cx = 4;
-	for (size_t i = 0; i < len; i++) {
-		int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;
-		stbtt_GetCodepointBitmapBoxSubpixel(&ui_font, text[i],
-			scale, scale, 0, 0, &ix0, &iy0, &ix1, &iy1);
-		int bw = ix1 - ix0, bh = iy1 - iy0;
-		if (bw > 0 && bh > 0) {
-			unsigned char *bm = stbtt_GetCodepointBitmap(
-				&ui_font, 0, scale, text[i], &bw, &bh,
-				0, 0);
-			ui_blit(img, w, h, bm, bw, bh, cx + ix0,
-				baseline + iy0, col);
-			stbtt_FreeBitmap(bm, NULL);
-		}
-		int adv = 0, lsb = 0;
-		stbtt_GetCodepointHMetrics(&ui_font, text[i], &adv,
-			&lsb);
-		cx += (int)(adv * scale);
-		(void)lsb;
-	}
-	struct wlr_buffer *buf = rgba_buffer_take(w, h, img);
-	if (buf != NULL && len < sizeof(cache[0].txt) &&
-			n < sizeof(cache) / sizeof(cache[0])) {
-		memcpy(cache[n].txt, text, len + 1);
-		cache[n].px = px_h;
-		cache[n].buf = buf;
-		n++;
-	}
-	return buf;
-}
 
 /* Download arrow (shaft + head + underline), drawn by hand. */
-static struct wlr_buffer *ui_download_icon(int s, float col[4]) {
-	unsigned char *px = calloc((size_t)s * s, 4);
-	if (px == NULL) {
-		return NULL;
-	}
-	for (int y = 0; y < s; y++) {
-		for (int x = 0; x < s; x++) {
-			bool in = false;
-			int cx = s / 2, t = s / 10 + 1;
-			if (x >= cx - t && x < cx + t && y >= s * 15 / 100 &&
-					y < s * 52 / 100) {
-				in = true; // shaft
-			}
-			int hy = y - s * 45 / 100;
-			if (hy >= 0 && y < s * 70 / 100 &&
-					x >= cx - hy - t &&
-					x < cx + hy + t) {
-				in = true; // arrowhead
-			}
-			if (y >= s * 82 / 100 && y < s * 92 / 100 &&
-					x >= s * 15 / 100 &&
-					x < s * 85 / 100) {
-				in = true; // underline
-			}
-			if (in) {
-				unsigned char *d =
-					&px[(y * (size_t)s + x) * 4];
-				d[0] = (unsigned char)(col[0] * col[3]
-					* 255);
-				d[1] = (unsigned char)(col[1] * col[3]
-					* 255);
-				d[2] = (unsigned char)(col[2] * col[3]
-					* 255);
-				d[3] = (unsigned char)(col[3] * 255);
-			}
-		}
-	}
-	return rgba_buffer_take(s, s, px);
-}
 
-struct amber_png_mem {
-	unsigned char *data;
-	size_t len;
-};
 
-/* Payload of the clipboard source; replaced on every copy, freed when
- * the source is destroyed or a new one takes its place. */
-static struct amber_png_mem shot_clipboard = {0};
 
-static void screenshot_png_write(void *ctx, void *data, int size) {
-	struct amber_png_mem *mem = ctx;
-	unsigned char *grown = realloc(mem->data, mem->len + size);
-	if (grown == NULL) {
-		return;
-	}
-	memcpy(grown + mem->len, data, size);
-	mem->data = grown;
-	mem->len += size;
-}
 
-static bool mkdir_p(const char *path) {
-	char buf[512];
-	size_t len = strlen(path);
-	if (len == 0 || len >= sizeof(buf)) {
-		return false;
-	}
-	memcpy(buf, path, len + 1);
-	for (char *p = buf + 1; *p != '\0'; p++) {
-		if (*p != '/') {
-			continue;
-		}
-		*p = '\0';
-		if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
-			return false;
-		}
-		*p = '/';
-	}
-	if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
-		return false;
-	}
-	return true;
-}
 
-static const char *screenshot_dir(struct amber_server *server) {
-	if (server->screenshot_dir != NULL) {
-		return server->screenshot_dir;
-	}
-	static char fallback[400];
-	const char *home = getenv("HOME");
-	snprintf(fallback, sizeof(fallback), "%s/Pictures/Screenshots",
-		home ? home : ".");
-	return fallback;
-}
 
-static char shot_clipboard_text[600];
-
-static void clipboard_send(struct wlr_data_source *source,
-		const char *mime_type, int32_t fd) {
-	const void *data = NULL;
-	size_t len = 0;
-	if (strcmp(mime_type, "image/png") == 0) {
-		if (shot_clipboard.data != NULL) {
-			data = shot_clipboard.data;
-			len = shot_clipboard.len;
-		}
-	} else if (shot_clipboard_text[0] != '\0') {
-		data = shot_clipboard_text;
-		len = strlen(shot_clipboard_text);
-	}
-	/* A single write() truncates large payloads at the socket buffer
-	 * (~64 KB) - paste targets saw every screenshot capped there. */
-	while (len > 0) {
-		ssize_t n = write(fd, data, len);
-		if (n < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				/* Transfer pipes are non-blocking; wait for
-				 * write-space instead of truncating at the
-				 * 64KB pipe capacity. */
-				struct pollfd p = { .fd = fd,
-					.events = POLLOUT };
-				poll(&p, 1, -1);
-				continue;
-			}
-			break;
-		}
-		data = (const char *)data + n;
-		len -= (size_t)n;
-	}
-	close(fd);
-}
 
 /* Intentionally frees nothing: wlroots runs this whenever the seat
  * swaps selections, possibly while clipboard managers still hold
@@ -2499,55 +2181,8 @@ static void clipboard_send(struct wlr_data_source *source,
  * loop. Sources are tiny and copies are human-rate; the leak is the
  * safe tradeoff. The payload is owned by clipboard_set, not the
  * source, so nothing else needs releasing either. */
-static void clipboard_destroy(struct wlr_data_source *source) {
-	(void)source;
-}
 
-static const struct wlr_data_source_impl clipboard_impl = {
-	.send = clipboard_send,
-	.destroy = clipboard_destroy,
-};
 
-static void clipboard_set(struct amber_server *server,
-		struct amber_png_mem png, const char *saved_path) {
-	/* Payload ownership stays here across copies; sources come and go
-	 * with each selection swap and are never freed (see above). */
-	free(shot_clipboard.data);
-	shot_clipboard = png;
-
-	shot_clipboard_text[0] = '\0';
-	if (saved_path != NULL && saved_path[0] != '\0') {
-		snprintf(shot_clipboard_text, sizeof(shot_clipboard_text),
-			"file://%s", saved_path);
-	}
-
-	struct wlr_data_source *source = calloc(1, sizeof(*source));
-	if (source == NULL) {
-		return;
-	}
-	wlr_data_source_init(source, &clipboard_impl);
-	/* text/plain only when a file backs it: an empty-text offer gets
-	 * read as a 0-byte payload and clipboard managers drop the whole
-	 * entry (why Ctrl+C shots never reached noctalia's history). */
-	const char *mimes[2] = {"image/png", NULL};
-	if (shot_clipboard_text[0] != '\0') {
-		mimes[1] = "text/plain";
-	}
-	for (size_t i = 0; i < 2 && mimes[i] != NULL; i++) {
-		char *copy = strdup(mimes[i]);
-		char **slot = copy != NULL
-			? wl_array_add(&source->mime_types, sizeof(copy))
-			: NULL;
-		if (slot != NULL) {
-			*slot = copy;
-		} else {
-			free(copy);
-		}
-	}
-
-	wlr_seat_set_selection(server->seat, source,
-		wl_display_next_serial(server->wl_display));
-}
 
 /* Render the given output-local box from the scene graph into fresh RGBA
  * memory (8 bit/channel). The whole output frame is composed offscreen via
@@ -2663,180 +2298,14 @@ static unsigned char *screenshot_capture(struct amber_server *server,
 	return result;
 }
 
-static struct amber_png_mem screenshot_encode(unsigned char *rgba,
-		int width, int height) {
-	struct amber_png_mem png = {0};
-	stbi_write_png_compression_level = 3;
-	stbi_write_png_to_func(screenshot_png_write, &png,
-		width, height, 4, rgba, width * 4);
-	return png;
-}
 
 /* Alpha-blend the default arrow cursor into a captured frame so "P" can
  * include the pointer position in the saved image. */
-static void screenshot_stamp_cursor(struct amber_server *server,
-		struct amber_output *output, unsigned char *frame,
-		int fw, int fh) {
-	struct wlr_xcursor *xc = wlr_xcursor_manager_get_xcursor(
-		server->cursor_mgr, "left_ptr", output->wlr_output->scale);
-	if (xc == NULL || xc->image_count == 0) {
-		return;
-	}
-	struct wlr_xcursor_image *img = xc->images[0];
-	int px = (int)((server->cursor->x - output->layout_box.x)
-			* output->wlr_output->scale) - img->hotspot_x;
-	int py = (int)((server->cursor->y - output->layout_box.y)
-			* output->wlr_output->scale) - img->hotspot_y;
-	for (int y = 0; y < img->height; y++) {
-		int fy = py + y;
-		if (fy < 0 || fy >= fh) {
-			continue;
-		}
-		for (int x = 0; x < img->width; x++) {
-			int fx = px + x;
-			if (fx < 0 || fx >= fw) {
-				continue;
-			}
-			const unsigned char *src =
-				img->buffer + (y * img->width + x) * 4;
-			unsigned char a = src[3];
-			if (a == 0) {
-				continue;
-			}
-			unsigned char *dst = frame + (fy * fw + fx) * 4;
-			/* xcursor pixels are ARGB bytes (B,G,R,A); frame is
-			 * RGBA, so channels swap on copy. */
-			if (a == 255) {
-				dst[0] = src[2];
-				dst[1] = src[1];
-				dst[2] = src[0];
-				dst[3] = 255;
-			} else {
-				dst[0] = (src[2] * a + dst[0] * (255 - a)) / 255;
-				dst[1] = (src[1] * a + dst[1] * (255 - a)) / 255;
-				dst[2] = (src[0] * a + dst[2] * (255 - a)) / 255;
-				dst[3] = 255;
-			}
-		}
-	}
-}
 
 /* (Re)capture and attach the frozen frame. Live UI nodes are hidden for
  * the capture so dim/borders never bake into the image. */
-static void screenshot_freeze_attach(struct amber_server *server,
-		struct amber_output *output) {
-	if (server->shot_freeze != NULL) {
-		wlr_scene_node_destroy(&server->shot_freeze->node);
-		server->shot_freeze = NULL;
-	}
-	bool border_on[4] = {false, false, false, false};
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_borders[i] != NULL) {
-			border_on[i] = server->shot_borders[i]->node.enabled;
-			wlr_scene_node_set_enabled(
-				&server->shot_borders[i]->node, false);
-		}
-	}
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_set_enabled(
-				&server->shot_shade[i]->node, false);
-		}
-	}
-	int ow = output->wlr_output->width;
-	int oh = output->wlr_output->height;
-	unsigned char *frame = ow > 0 && oh > 0
-		? screenshot_capture(server, output,
-			(struct wlr_box){ .width = ow, .height = oh })
-		: NULL;
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_set_enabled(
-				&server->shot_shade[i]->node, true);
-		}
-	}
-	for (int i = 0; i < 4; i++) {
-		if (border_on[i]) {
-			wlr_scene_node_set_enabled(
-				&server->shot_borders[i]->node, true);
-		}
-	}
-	if (frame == NULL) {
-		return;
-	}
-	if (server->shot_show_pointer) {
-		screenshot_stamp_cursor(server, output, frame, ow, oh);
-	}
-	struct wlr_buffer *buf = rgba_buffer_take(ow, oh, frame);
-	if (buf == NULL) {
-		return;
-	}
-	struct wlr_scene_buffer *node = wlr_scene_buffer_create(
-		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-		buf);
-	if (node != NULL) {
-		server->shot_freeze = node;
-		wlr_scene_node_set_position(&node->node, 0, 0);
-		wlr_scene_buffer_set_dest_size(node,
-			output->layout_box.width, output->layout_box.height);
-	}
-	/* The scene holds its own reference once attached; dropping ours
-	 * also cleans up failed attaches. */
-	wlr_buffer_unlock(buf);
-}
 
-static void screenshot_hide_ui(struct amber_server *server) {
-	for (int i = 0; i < 4; i++) {
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_destroy(
-				&server->shot_shade[i]->node);
-			server->shot_shade[i] = NULL;
-		}
-		if (server->shot_borders[i] != NULL) {
-			wlr_scene_node_destroy(&server->shot_borders[i]->node);
-			server->shot_borders[i] = NULL;
-		}
-	}
-	if (server->shot_freeze != NULL) {
-		wlr_scene_node_destroy(&server->shot_freeze->node);
-		server->shot_freeze = NULL;
-	}
-	if (server->shot_hint_bg != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_bg->node);
-		server->shot_hint_bg = NULL;
-	}
-	if (server->shot_hint_icon != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_icon->node);
-		server->shot_hint_icon = NULL;
-	}
-	if (server->shot_hint_l1 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l1->node);
-		server->shot_hint_l1 = NULL;
-	}
-	if (server->shot_hint_l2 != NULL) {
-		wlr_scene_node_destroy(&server->shot_hint_l2->node);
-		server->shot_hint_l2 = NULL;
-	}
-	if (server->shot_has_sel && server->shot_output != NULL &&
-			server->shot_box.width > 1) {
-		server->shot_have_last = true;
-		server->shot_last_box = server->shot_box;
-		server->shot_last_output = server->shot_output;
-	}
-	server->shot_active = false;
-	server->shot_dragging = false;
-	server->shot_moving = false;
-	server->shot_has_sel = false;
-	server->shot_output = NULL;
-	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
-		server->cursor_mode = AMBER_CURSOR_PASSTHROUGH;
-	}
-}
 
-static void screenshot_cancel(struct amber_server *server) {
-	screenshot_hide_ui(server);
-	wlr_log(WLR_INFO, "screenshot canceled");
-}
 
 /* ==================== Built-in window switcher ====================
  * Dim + grid of STATIC thumbnails captured at open time (cheap on old
@@ -3234,403 +2703,15 @@ static void switcher_open(struct amber_server *server) {
 	switcher_select(server, 0);
 }
 
-static struct wlr_box screenshot_selection_box(struct amber_server *server) {
-	double cx = server->cursor->x - server->shot_output->layout_box.x;
-	double cy = server->cursor->y - server->shot_output->layout_box.y;
-	int x1 = (int)server->shot_sx, y1 = (int)server->shot_sy;
-	int x2 = (int)cx, y2 = (int)cy;
-	if (x2 < x1) { int t = x1; x1 = x2; x2 = t; }
-	if (y2 < y1) { int t = y1; y1 = y2; y2 = t; }
-	struct wlr_box out = { .x = x1, .y = y1,
-		.width = x2 - x1 + 1, .height = y2 - y1 + 1 };
-	// Clamp to the output.
-	if (out.x < 0) { out.width += out.x; out.x = 0; }
-	if (out.y < 0) { out.height += out.y; out.y = 0; }
-	struct wlr_box lim = server->shot_output->layout_box;
-	if (out.x + out.width > lim.width) {
-		out.width = lim.width - out.x;
-	}
-	if (out.y + out.height > lim.height) {
-		out.height = lim.height - out.y;
-	}
-	if (out.width < 1 || out.height < 1) {
-		out.width = out.height = 0;
-	}
-	return out;
-}
 
 
 
-static void screenshot_ui_update(struct amber_server *server) {
-	if (!server->shot_active || server->shot_output == NULL) {
-		return;
-	}
-	struct wlr_box lim = server->shot_output->layout_box;
-	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.35f};
-	struct wlr_scene_rect *s[4] = {
-		server->shot_shade[0], server->shot_shade[1],
-		server->shot_shade[2], server->shot_shade[3],
-	};
-	if (s[0] == NULL || s[1] == NULL || s[2] == NULL ||
-			s[3] == NULL) {
-		return;
-	}
 
-	/* Armed state: nothing is drawn until the user starts a drag. */
-	if (!server->shot_has_sel) {
-		wlr_scene_rect_set_size(s[0], lim.width, lim.height);
-		wlr_scene_node_set_position(&s[0]->node, 0, 0);
-		wlr_scene_rect_set_color(s[0], dim_col);
-		for (int i = 1; i < 4; i++) {
-			wlr_scene_rect_set_size(s[i], 1, 1);
-			wlr_scene_node_set_enabled(&s[i]->node, false);
-			wlr_scene_rect_set_color(s[i], dim_col);
-		}
-		wlr_scene_node_set_enabled(&s[0]->node, true);
-		for (int i = 0; i < 4; i++) {
-			wlr_scene_node_set_enabled(
-				&server->shot_borders[i]->node, false);
-		}
-		return;
-	}
-	/* While dragging the box tracks the cursor; after release it must
-	 * stay put, so the committed box is used instead. */
-	struct wlr_box sel = server->shot_dragging
-		? screenshot_selection_box(server)
-		: server->shot_box;
-	if (sel.width < 1) {
-		for (int i = 0; i < 4; i++) {
-			wlr_scene_node_set_enabled(
-				&server->shot_borders[i]->node, false);
-		}
-		return;
-	}
 
-	/* Four shade strips surround the selection so its interior stays
-	 * at full brightness (the frozen frame shows through undimmed). */
-	int bottom_y = sel.y + sel.height;
-	wlr_scene_rect_set_size(s[0], lim.width, sel.y > 0 ? sel.y : 1);
-	wlr_scene_node_set_position(&s[0]->node, 0, 0);
-	wlr_scene_rect_set_size(s[1], lim.width,
-		lim.height - bottom_y > 0 ? lim.height - bottom_y : 1);
-	wlr_scene_node_set_position(&s[1]->node, 0, bottom_y);
-	wlr_scene_rect_set_size(s[2], sel.x > 0 ? sel.x : 1, sel.height);
-	wlr_scene_node_set_position(&s[2]->node, 0, sel.y);
-	wlr_scene_rect_set_size(s[3],
-		lim.width - (sel.x + sel.width) > 0
-			? lim.width - (sel.x + sel.width) : 1,
-		sel.height);
-	wlr_scene_node_set_position(&s[3]->node, sel.x + sel.width, sel.y);
-	for (int i = 0; i < 4; i++) {
-		wlr_scene_rect_set_color(s[i], dim_col);
-		wlr_scene_node_set_enabled(&s[i]->node, true);
-	}
 
-	float border[4] = {1.00f, 1.00f, 1.00f, 0.95f}; // white outline
-	int bw = 2;
-	struct wlr_scene_rect *r[4] = {
-		server->shot_borders[0], server->shot_borders[1],
-		server->shot_borders[2], server->shot_borders[3],
-	};
-	wlr_scene_rect_set_color(r[0], border);
-	wlr_scene_rect_set_size(r[0], sel.width + bw*2, bw);
-	wlr_scene_node_set_position(&r[0]->node, sel.x - bw, sel.y - bw);
-	wlr_scene_node_set_enabled(&r[0]->node, true);
 
-	wlr_scene_rect_set_size(r[1], sel.width + bw*2, bw);
-	wlr_scene_node_set_position(&r[1]->node, sel.x - bw,
-		sel.y + sel.height);
-	wlr_scene_node_set_enabled(&r[1]->node, true);
 
-	wlr_scene_rect_set_size(r[2], bw, sel.height);
-	wlr_scene_node_set_position(&r[2]->node, sel.x - bw, sel.y);
-	wlr_scene_node_set_enabled(&r[2]->node, true);
 
-	wlr_scene_rect_set_size(r[3], bw, sel.height);
-	wlr_scene_node_set_position(&r[3]->node, sel.x + sel.width, sel.y);
-	wlr_scene_node_set_enabled(&r[3]->node, true);
-
-}
-
-static void screenshot_start_region(struct amber_server *server) {
-	struct amber_output *output = active_output(server);
-	if (output == NULL) {
-		return;
-	}
-	if (server->shot_active) {
-		screenshot_cancel(server); // re-press restarts cleanly
-	}
-	server->shot_output = output;
-	server->shot_dragging = false;
-	server->shot_has_sel = false;
-	server->shot_box = (struct wlr_box){0};
-
-	/* Freeze the live frame into a static scene buffer so windows
-	 * cannot move mid-selection; created before the dim rect so the
-	 * image renders beneath it. */
-	screenshot_freeze_attach(server, output);
-
-	float dim[4] = {0, 0, 0, 0.35f};
-	for (int i = 0; i < 4; i++) {
-		server->shot_shade[i] = wlr_scene_rect_create(
-			output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-			2, 2, dim);
-		if (server->shot_shade[i] != NULL) {
-			wlr_scene_node_set_enabled(
-				&server->shot_shade[i]->node, false);
-		}
-	}
-
-	float invisible[4] = {1.00f, 1.00f, 1.00f, 0.95f};
-	for (int i = 0; i < 4; i++) {
-		server->shot_borders[i] = wlr_scene_rect_create(
-			output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
-			2, 2, invisible);
-	}
-	server->shot_active = true;
-	server->cursor_mode = AMBER_CURSOR_SCREENSHOT;
-	/* Bring back the previous rectangle when re-entering on the same
-	 * output (niri keeps it too); Esc still clears everything. */
-	if (server->shot_have_last &&
-			server->shot_last_output == output &&
-			server->shot_last_box.width > 1 &&
-			server->shot_last_box.x + server->shot_last_box.width
-				<= output->layout_box.width &&
-			server->shot_last_box.y + server->shot_last_box.height
-				<= output->layout_box.height) {
-		server->shot_has_sel = true;
-		server->shot_box = server->shot_last_box;
-	}
-	screenshot_ui_update(server);
-	wlr_log(WLR_INFO, "screenshot: screen frozen — drag to select, "
-		"drag inside to move, P toggles pointer, Ctrl+C copy, "
-		"Space save, Esc cancel");
-}
-
-static void screenshot_full_screen(struct amber_server *server) {
-	struct amber_output *output = active_output(server);
-	if (output == NULL) {
-		return;
-	}
-	struct wlr_box full = output->layout_box;
-	full.x = full.y = 0;
-	unsigned char *rgba = screenshot_capture(server, output, full);
-	if (rgba == NULL) {
-		wlr_log(WLR_ERROR, "screenshot failed");
-		return;
-	}
-	struct amber_png_mem png = screenshot_encode(rgba,
-		full.width, full.height);
-	free(rgba);
-	if (png.data == NULL) {
-		wlr_log(WLR_ERROR, "screenshot PNG encoding failed");
-		return;
-	}
-	mkdir_p(screenshot_dir(server));
-	char ts[32];
-	time_t now = time(NULL);
-	strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&now));
-	char path[560];
-	snprintf(path, sizeof(path), "%s/amberwm-%s.png",
-		screenshot_dir(server), ts);
-	FILE *f = fopen(path, "wb");
-	if (f == NULL) {
-		wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
-	} else {
-		fwrite(png.data, 1, png.len, f);
-		fclose(f);
-		wlr_log(WLR_INFO, "saved %s (%zu bytes)", path, png.len);
-	}
-	clipboard_set(server, png, path);
-}
-
-static void screenshot_finish(struct amber_server *server, bool save_file) {
-	struct wlr_box sel = server->shot_box;
-	if (!server->shot_has_sel || sel.width < 1 || sel.height < 1) {
-		screenshot_cancel(server);
-		return;
-	}
-	/* Crop from the frozen pre-UI frame when possible: hint card,
-	 * shade strips and borders were drawn after the freeze, so they
-	 * can never bake into the shot - and the live scene stays
-	 * untouched (the last attempt reordered teardown and crashed). */
-	unsigned char *rgba = NULL;
-	struct wlr_buffer *fb = server->shot_freeze != NULL
-		? server->shot_freeze->buffer : NULL;
-	void *fdata;
-	uint32_t ffmt;
-	size_t fstride;
-	if (fb != NULL && wlr_buffer_begin_data_ptr_access(fb, 0,
-			&fdata, &ffmt, &fstride)) {
-		rgba = malloc((size_t)sel.width * sel.height * 4);
-		if (rgba == NULL) {
-			wlr_buffer_end_data_ptr_access(fb);
-		} else {
-			for (int r = 0; r < sel.height; r++) {
-				memcpy(rgba + (size_t)r * sel.width * 4,
-					(unsigned char *)fdata +
-					(size_t)(sel.y + r) * fstride +
-					(size_t)sel.x * 4,
-					(size_t)sel.width * 4);
-			}
-			wlr_buffer_end_data_ptr_access(fb);
-		}
-	}
-	if (rgba == NULL) {
-		rgba = screenshot_capture(server, server->shot_output,
-			sel);
-	}
-	screenshot_hide_ui(server);
-	if (rgba == NULL) {
-		wlr_log(WLR_ERROR, "screenshot failed");
-		return;
-	}
-	struct amber_png_mem png = screenshot_encode(rgba,
-		sel.width, sel.height);
-	free(rgba);
-	if (png.data == NULL) {
-		wlr_log(WLR_ERROR, "screenshot PNG encoding failed");
-		return;
-	}
-	char ts[32];
-	char path[560];
-	path[0] = '\0';
-	if (save_file) {
-		mkdir_p(screenshot_dir(server));
-		time_t now = time(NULL);
-		strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&now));
-		snprintf(path, sizeof(path), "%s/amberwm-%s.png",
-			screenshot_dir(server), ts);
-		FILE *f = fopen(path, "wb");
-		if (f == NULL) {
-			wlr_log(WLR_ERROR, "screenshot: cannot write %s", path);
-		} else {
-			fwrite(png.data, 1, png.len, f);
-			fclose(f);
-			wlr_log(WLR_INFO, "saved %s (%zux%zu px)",
-				path, (size_t)sel.width, (size_t)sel.height);
-		}
-	} else {
-		path[0] = '\0';
-	}
-	clipboard_set(server, png, path);
-}
-
-static void screenshot_motion(struct amber_server *server) {
-	if (server->shot_active && server->shot_moving) {
-		double cx = server->cursor->x -
-			server->shot_output->layout_box.x;
-		double cy = server->cursor->y -
-			server->shot_output->layout_box.y;
-		struct wlr_box lim = server->shot_output->layout_box;
-		struct wlr_box *b = &server->shot_box;
-		b->x = server->shot_move_orig.x +
-			(int)(cx - server->shot_move_ax);
-		b->y = server->shot_move_orig.y +
-			(int)(cy - server->shot_move_ay);
-		if (b->x < 0) {
-			b->x = 0;
-		}
-		if (b->y < 0) {
-			b->y = 0;
-		}
-		if (b->x + b->width > lim.width) {
-			b->x = lim.width - b->width;
-		}
-		if (b->y + b->height > lim.height) {
-			b->y = lim.height - b->height;
-		}
-	}
-	screenshot_ui_update(server);
-}
-
-static void screenshot_button(struct amber_server *server,
-		const struct wlr_pointer_button_event *event) {
-	if (event->button == BTN_LEFT) {
-		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-			double cx = server->cursor->x -
-				server->shot_output->layout_box.x;
-			double cy = server->cursor->y -
-				server->shot_output->layout_box.y;
-			/* Pressing inside the committed rectangle moves it
-			 * instead of starting a fresh selection (niri). */
-			if (server->shot_has_sel &&
-					cx >= server->shot_box.x &&
-					cy >= server->shot_box.y &&
-					cx < server->shot_box.x +
-						server->shot_box.width &&
-					cy < server->shot_box.y +
-						server->shot_box.height) {
-				server->shot_moving = true;
-				server->shot_move_ax = cx;
-				server->shot_move_ay = cy;
-				server->shot_move_orig = server->shot_box;
-				return;
-			}
-			/* A rectangle appears only on an explicit drag. */
-			server->shot_sx = server->cursor->x -
-				server->shot_output->layout_box.x;
-			server->shot_sy = server->cursor->y -
-				server->shot_output->layout_box.y;
-			server->shot_dragging = true;
-			server->shot_has_sel = true;
-			screenshot_ui_update(server);
-		} else if (server->shot_moving) {
-			server->shot_moving = false;
-		} else if (server->shot_dragging) {
-			server->shot_dragging = false;
-			/* Freeze the rectangle where the drag ended so it
-			 * stays put while the mouse keeps moving. */
-			server->shot_box = screenshot_selection_box(server);
-			screenshot_ui_update(server);
-		}
-	} else if (event->button == BTN_RIGHT) {
-		screenshot_cancel(server);
-	}
-}
-
-static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
-		const xkb_keysym_t *syms, int nsyms) {
-	for (int i = 0; i < nsyms; i++) {
-		xkb_keysym_t sym = syms[i];
-		if (sym == XKB_KEY_Escape) {
-			screenshot_cancel(server);
-			return true;
-		}
-		bool ctrl = modifiers & WLR_MODIFIER_CTRL;
-		if (sym == XKB_KEY_p && !ctrl &&
-				server->shot_output != NULL) {
-			server->shot_show_pointer =
-				!server->shot_show_pointer;
-			screenshot_freeze_attach(server,
-				server->shot_output);
-			return true;
-		}
-		/* Act only once a rectangle exists and no gesture is
-		 * running; without this, Space before any drag would save
-		 * a 1x1 box. */
-		bool ready = server->shot_has_sel && !server->shot_dragging
-			&& !server->shot_moving;
-		if (sym == XKB_KEY_p || sym == XKB_KEY_P) {
-			server->shot_show_pointer =
-				!server->shot_show_pointer;
-			screenshot_freeze_attach(server,
-				server->shot_output);
-			return true;
-		}
-		if ((ctrl && (sym == XKB_KEY_c || sym == XKB_KEY_C)) &&
-				ready) {
-			screenshot_finish(server, false);
-			return true;
-		}
-		if ((sym == XKB_KEY_space || sym == XKB_KEY_Return ||
-				sym == XKB_KEY_KP_Enter) && ready) {
-			screenshot_finish(server, true);
-			return true;
-		}
-	}
-	return true; // swallow all keys while selecting
-}
 
 static bool keyboard_held_has(struct amber_keyboard *keyboard,
 		uint32_t keycode) {
@@ -3717,16 +2798,6 @@ static void keyboard_handle_key(
 				keyboard_mark_swallowed(keyboard,
 					event->keycode);
 				switcher_key(server, syms, nsyms);
-				return;
-			}
-			if (server->shot_active) {
-				/* Region screenshot grabs all keys while
-				 * active; releases are swallowed via the
-				 * mark below. */
-				keyboard_mark_swallowed(keyboard,
-					event->keycode);
-				screenshot_key(server, modifiers, syms,
-					nsyms);
 				return;
 			}
 			for (int i = 0; i < nsyms && !handled; i++) {
@@ -3855,6 +2926,16 @@ static void server_new_pointer(struct amber_server *server,
 	wlr_cursor_attach_input_device(server->cursor, device);
 }
 
+static void update_seat_capabilities(struct amber_server *server) {
+	/* In AmberWM we always have a cursor, even if there are no pointer
+	 * devices, so we always include that capability. */
+	uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
+	if (!wl_list_empty(&server->keyboards)) {
+		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
+	}
+	wlr_seat_set_capabilities(server->seat, caps);
+}
+
 static void server_new_input(struct wl_listener *listener, void *data) {
 	/* This event is raised by the backend when a new input device becomes
 	 * available. */
@@ -3872,13 +2953,33 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		break;
 	}
 	/* We need to let the wlr_seat know what our capabilities are, which is
-	 * communiciated to the client. In AmberWM we always have a cursor, even if
-	 * there are no pointer devices, so we always include that capability. */
-	uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
-	if (!wl_list_empty(&server->keyboards)) {
-		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
-	}
-	wlr_seat_set_capabilities(server->seat, caps);
+	 * communicated to the client. */
+	update_seat_capabilities(server);
+}
+
+static void server_new_virtual_keyboard(struct wl_listener *listener,
+		void *data) {
+	/* zwp_virtual_keyboard_manager_v1: key remappers (kanata, kmonad,
+	 * ydotool) inject keys by creating a virtual keyboard bound to our
+	 * seat; route it exactly like a hardware keyboard. */
+	struct amber_server *server =
+		wl_container_of(listener, server, virtual_keyboard_new);
+	struct wlr_virtual_keyboard_v1 *vk = data;
+	server_new_keyboard(server, &vk->keyboard.base);
+	update_seat_capabilities(server);
+}
+
+static void server_new_virtual_pointer(struct wl_listener *listener,
+		void *data) {
+	/* zwp_virtual_pointer_manager_v1: automation (ydotool, kmonad) moves
+	 * the cursor by creating a virtual pointer on the seat; wlr_cursor
+	 * forwards it like a real mouse. */
+	struct amber_server *server =
+		wl_container_of(listener, server, virtual_pointer_new);
+	struct wlr_virtual_pointer_v1_new_pointer_event *event = data;
+	wlr_cursor_attach_input_device(server->cursor,
+		&event->new_pointer->pointer.base);
+	update_seat_capabilities(server);
 }
 
 /* wp_cursor_shape-v1: clients ask us to show a named cursor shape
@@ -3953,6 +3054,8 @@ static void seat_request_cursor(struct wl_listener *listener, void *data) {
 	}
 }
 
+static void constraint_deactivate(struct amber_server *server);
+
 static void seat_pointer_focus_change(struct wl_listener *listener, void *data) {
 	struct amber_server *server = wl_container_of(
 			listener, server, pointer_focus_change);
@@ -3963,6 +3066,129 @@ static void seat_pointer_focus_change(struct wl_listener *listener, void *data) 
 	if (event->new_surface == NULL) {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
 	}
+	/* Leaving the constrained surface releases the lock/confine. */
+	if (server->active_constraint != NULL &&
+			event->new_surface != server->active_constraint->surface) {
+		constraint_deactivate(server);
+	}
+}
+
+static void handle_pointer_constraint_destroy(struct wl_listener *listener,
+		void *data) {
+	struct amber_constraint_trk *trk =
+		wl_container_of(listener, trk, destroy);
+	if (trk->server->active_constraint == trk->constraint) {
+		trk->server->active_constraint = NULL;
+		if (trk->constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+			wlr_cursor_set_xcursor(trk->server->cursor,
+				trk->server->cursor_mgr, "default");
+		}
+	}
+	trk->constraint->data = NULL;
+	free(trk);
+}
+
+static void constraint_deactivate(struct amber_server *server) {
+	struct wlr_pointer_constraint_v1 *c = server->active_constraint;
+	if (c == NULL) {
+		return;
+	}
+	/* Clear before send: for transient constraints send_deactivated
+	 * destroys the constraint, which fires our destroy listener. */
+	bool was_locked = c->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
+	server->active_constraint = NULL;
+	wlr_pointer_constraint_v1_send_deactivated(c);
+	if (was_locked) {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			"default");
+	}
+}
+
+static void constraint_set_active(struct amber_server *server,
+		struct wlr_pointer_constraint_v1 *constraint) {
+	if (server->active_constraint == constraint) {
+		return;
+	}
+	if (server->active_constraint != NULL) {
+		constraint_deactivate(server);
+	}
+	/* A constraint only takes hold while the pointer hovers the surface
+	 * that requested it (games lock on the frame of a click). */
+	struct wlr_seat_pointer_state *ps = &server->seat->pointer_state;
+	if (ps->focused_surface != constraint->surface) {
+		return;
+	}
+	server->active_constraint = constraint;
+	server->constraint_anchor_x = server->cursor->x;
+	server->constraint_anchor_y = server->cursor->y;
+	wlr_pointer_constraint_v1_send_activated(constraint);
+	if (constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		wlr_cursor_unset_image(server->cursor);
+	}
+}
+
+static void handle_pointer_constraint_new(struct wl_listener *listener,
+		void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, pointer_constraints_new);
+	struct wlr_pointer_constraint_v1 *constraint = data;
+
+	struct amber_constraint_trk *trk = calloc(1, sizeof(*trk));
+	if (trk == NULL) {
+		return;
+	}
+	trk->server = server;
+	trk->constraint = constraint;
+	trk->destroy.notify = handle_pointer_constraint_destroy;
+	wl_signal_add(&constraint->events.destroy, &trk->destroy);
+	constraint->data = trk;
+
+	constraint_set_active(server, constraint);
+}
+
+/* Enforce the active constraint after the cursor moved. Runs before the
+ * hover recompute so the client sees the clamped position. */
+static void constraint_enforce(struct amber_server *server) {
+	struct wlr_pointer_constraint_v1 *c = server->active_constraint;
+	if (c == NULL || server->cursor_mode != AMBER_CURSOR_PASSTHROUGH) {
+		return;
+	}
+	struct wlr_seat_pointer_state *ps = &server->seat->pointer_state;
+	if (ps->focused_surface == NULL) {
+		return;
+	}
+
+	if (c->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		/* Pin the cursor to the spot where the lock was taken; the
+		 * deltas still flow to the client for camera control. */
+		wlr_cursor_warp(server->cursor, NULL,
+			server->constraint_anchor_x, server->constraint_anchor_y);
+		return;
+	}
+
+	/* CONFINED: keep the pointer inside the client's surface-local
+	 * region (its bounding box), feeding it only in-region motion. The
+	 * surface coordinates are constants of the rendering surface, so
+	 * they compare directly against the constraint region. */
+	if (ps->focused_surface != c->surface) {
+		return;
+	}
+	pixman_box32_t ext =
+		*pixman_region32_extents(&c->current.region);
+	double cx = ps->sx < ext.x1 ? ext.x1
+		: (ps->sx > ext.x2 ? ext.x2 : ps->sx);
+	double cy = ps->sy < ext.y1 ? ext.y1
+		: (ps->sy > ext.y2 ? ext.y2 : ps->sy);
+	if (cx == ps->sx && cy == ps->sy) {
+		return;
+	}
+	struct wlr_output *out = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	double scale = out != NULL ? out->scale : 1.0;
+	/* Move by the (scale-normalized) delta; this also notifies the
+	 * client, which sees the corrected in-region position. */
+	wlr_cursor_move(server->cursor, NULL,
+		(cx - ps->sx) / scale, (cy - ps->sy) / scale);
 }
 
 static void seat_request_set_selection(struct wl_listener *listener, void *data) {
@@ -4155,9 +3381,6 @@ static void process_cursor_motion(struct amber_server *server, uint32_t time) {
 	} else if (server->cursor_mode == AMBER_CURSOR_RESIZE) {
 		process_cursor_resize(server);
 		return;
-	} else if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
-		screenshot_motion(server);
-		return;
 	}
 
 	/* Otherwise, find the toplevel under the pointer and send the event along. */
@@ -4206,7 +3429,20 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
 	 * the cursor around without any input. */
 	wlr_cursor_move(server->cursor, &event->pointer->base,
 			event->delta_x, event->delta_y);
+	if (server->active_constraint != NULL) {
+		constraint_enforce(server);
+	}
 	process_cursor_motion(server, event->time_msec);
+
+	/* Forward raw deltas to relative-pointer clients (games and 3D
+	 * viewports use the unaccelerated deltas for camera control). */
+	if (server->relative_pointer_mgr != NULL) {
+		wlr_relative_pointer_manager_v1_send_relative_motion(
+			server->relative_pointer_mgr, server->seat,
+			(uint64_t)event->time_msec * 1000,
+			event->delta_x, event->delta_y,
+			event->unaccel_dx, event->unaccel_dy);
+	}
 }
 
 static void server_cursor_motion_absolute(
@@ -4222,6 +3458,9 @@ static void server_cursor_motion_absolute(
 	struct wlr_pointer_motion_absolute_event *event = data;
 	wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x,
 		event->y);
+	if (server->active_constraint != NULL) {
+		constraint_enforce(server);
+	}
 	process_cursor_motion(server, event->time_msec);
 }
 
@@ -4237,11 +3476,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
 	if (server->sw_active) {
 		switcher_button(server, event);
-		return;
-	}
-
-	if (server->cursor_mode == AMBER_CURSOR_SCREENSHOT) {
-		screenshot_button(server, event);
 		return;
 	}
 
@@ -4356,13 +3590,6 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 
 static void arrange_layers(struct amber_output *output);
 static void output_update_geometry(struct amber_output *output);
-static void screenshot_start_region(struct amber_server *server);
-static void screenshot_full_screen(struct amber_server *server);
-static void screenshot_motion(struct amber_server *server);
-static void screenshot_button(struct amber_server *server,
-	const struct wlr_pointer_button_event *event);
-static bool screenshot_key(struct amber_server *server, uint32_t modifiers,
-	const xkb_keysym_t *syms, int nsyms);
 static void config_reload(struct amber_server *server);
 
 /* ==================== IPC (mango-compatible JSON lines) ===================
@@ -4458,8 +3685,9 @@ static size_t ipc_monitor_json(struct amber_server *server,
 			i == output->active_workspace ? "true" : "false",
 			count);
 	}
-	o += (size_t)snprintf(buf + o, len - o, "],\"active_tags\":[%d]}",
-		output->active_workspace + 1);
+	o += (size_t)snprintf(buf + o, len - o,
+		"],\"active_tags\":[%d],\"focused_workspace\":%d}",
+		output->active_workspace + 1, output->active_workspace + 1);
 	return o;
 }
 
@@ -5862,6 +5090,122 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	output_update_geometry(output);
 }
 
+static struct amber_output *find_output(struct amber_server *server,
+		struct wlr_output *wlr_output) {
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->wlr_output == wlr_output) {
+			return output;
+		}
+	}
+	return NULL;
+}
+
+/* wayland-output-management-v1: kanshi-style tools reconfigure outputs at
+ * runtime (mode, scale, transform, position, enable). wlroots maintains the
+ * head list; we apply the requested heads and reply. */
+static void output_manager_send_configuration(struct amber_server *server) {
+	if (server->output_manager == NULL) {
+		return;
+	}
+	struct wlr_output_configuration_v1 *config =
+		wlr_output_configuration_v1_create();
+	struct amber_output *amber_output;
+	wl_list_for_each(amber_output, &server->outputs, link) {
+		struct wlr_output_configuration_head_v1 *head =
+			wlr_output_configuration_head_v1_create(config,
+				amber_output->wlr_output);
+		struct wlr_output_layout_output *layout_out =
+			wlr_output_layout_get(server->output_layout,
+				amber_output->wlr_output);
+		if (layout_out != NULL) {
+			head->state.x = layout_out->x;
+			head->state.y = layout_out->y;
+		}
+	}
+	wlr_output_manager_v1_set_configuration(server->output_manager, config);
+}
+
+static void output_manager_apply(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, output_manager_apply);
+	struct wlr_output_configuration_v1 *config = data;
+
+	bool ok = true;
+	struct wlr_output_configuration_head_v1 *head;
+	wl_list_for_each(head, &config->heads, link) {
+		struct wlr_output *wlr_output = head->state.output;
+		struct amber_output *output = find_output(server, wlr_output);
+		/* The head position maps to output-layout coordinates; apply it
+		 * before committing so the geometry is consistent. */
+		wlr_output_layout_add(server->output_layout, wlr_output,
+			head->state.x, head->state.y);
+
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		wlr_output_head_v1_state_apply(&head->state, &state);
+		if (!wlr_output_commit_state(wlr_output, &state)) {
+			ok = false;
+		}
+		wlr_output_state_finish(&state);
+
+		if (output != NULL) {
+			output_update_geometry(output);
+		}
+	}
+
+	if (ok) {
+		wlr_output_configuration_v1_send_succeeded(config);
+	} else {
+		wlr_output_configuration_v1_send_failed(config);
+	}
+	wlr_output_configuration_v1_destroy(config);
+
+	output_manager_send_configuration(server);
+}
+
+static void output_manager_test(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, output_manager_test);
+	struct wlr_output_configuration_v1 *config = data;
+
+	bool ok = true;
+	struct wlr_output_configuration_head_v1 *head;
+	wl_list_for_each(head, &config->heads, link) {
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		wlr_output_head_v1_state_apply(&head->state, &state);
+		if (!wlr_output_test_state(head->state.output, &state)) {
+			ok = false;
+		}
+		wlr_output_state_finish(&state);
+	}
+
+	if (ok) {
+		wlr_output_configuration_v1_send_succeeded(config);
+	} else {
+		wlr_output_configuration_v1_send_failed(config);
+	}
+	wlr_output_configuration_v1_destroy(config);
+}
+
+static void output_power_set_mode(struct wl_listener *listener, void *data) {
+	/* zwlr_output_power_manager_v1: wlopm turns a monitor off/on by
+	 * committing an output with the enabled flag toggled (DPMS off on
+	 * the DRM backend is exactly that). */
+	struct amber_server *server =
+		wl_container_of(listener, server, output_power_set_mode);
+	struct wlr_output_power_v1_set_mode_event *event = data;
+
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_enabled(&state,
+		event->mode == ZWLR_OUTPUT_POWER_V1_MODE_ON);
+	wlr_output_commit_state(event->output, &state);
+	wlr_output_state_finish(&state);
+	(void)server;
+}
+
 /* ext-workspace-v1 requires all group/workspace handles destroyed
  * before the display tears down; also needed for outputs that never
  * pass through output_destroy (direct wl_display_destroy at exit). */
@@ -6215,6 +5559,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	output->fx_tree = wlr_scene_tree_create(&server->scene->tree);
 
 	output_update_geometry(output);
+
+	/* Publish the new monitor to output-management clients (kanshi). */
+	output_manager_send_configuration(server);
 }
 
 static void output_update_geometry(struct amber_output *output) {
@@ -6559,15 +5906,35 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 
 	if (was_focused && !toplevel->server->shutting_down) {
 		/* Closing the focused window must not leave the seat
-		 * focusless: hand focus to the neighbor that took the
-		 * slot (right one first, else left). Skipped during
-		 * teardown, where neighbors may already be freed. */
+		 * focusless: first hand focus to the neighbor that took
+		 * the slot (right one first, else left). If the workspace
+		 * emptied out entirely, hop to the nearest occupied
+		 * workspace like niri does instead of staring at an empty
+		 * desktop with no focused window. */
 		struct wl_list *pick = nb_next != &ws->toplevels
 			? nb_next : nb_prev;
 		if (pick != &ws->toplevels) {
 			struct amber_toplevel *n;
 			n = wl_container_of(pick, n, link);
 			focus_toplevel(n);
+		} else {
+			struct amber_output *o = toplevel->output;
+			int idx = -1;
+			for (int d = 1; idx < 0 &&
+					d < AMBER_WORKSPACE_COUNT; d++) {
+				int lo = toplevel->workspace - d;
+				int hi = toplevel->workspace + d;
+				if (lo >= 0 &&
+						!wl_list_empty(&o->workspaces[lo].toplevels)) {
+					idx = lo;
+				} else if (hi < AMBER_WORKSPACE_COUNT &&
+						!wl_list_empty(&o->workspaces[hi].toplevels)) {
+					idx = hi;
+				}
+			}
+			if (idx >= 0) {
+				workspace_switch(o, idx);
+			}
 		}
 	}
 }
@@ -7025,6 +6392,36 @@ int main(int argc, char *argv[]) {
 	wlr_xdg_output_manager_v1_create(server.wl_display,
 		server.output_layout);
 
+	/* Output management (kanshi) and power (wlopm): runtime monitor
+	 * reconfiguration and power switching. */
+	server.output_manager = wlr_output_manager_v1_create(server.wl_display);
+	server.output_manager_apply.notify = output_manager_apply;
+	wl_signal_add(&server.output_manager->events.apply,
+		&server.output_manager_apply);
+	server.output_manager_test.notify = output_manager_test;
+	wl_signal_add(&server.output_manager->events.test,
+		&server.output_manager_test);
+	server.output_power_mgr =
+		wlr_output_power_manager_v1_create(server.wl_display);
+	server.output_power_set_mode.notify = output_power_set_mode;
+	wl_signal_add(&server.output_power_mgr->events.set_mode,
+		&server.output_power_set_mode);
+
+	/* Virtual input devices (kanata/kmonad/ydotool remappers) and
+	 * relative pointer motion (games, 3D viewports). */
+	server.relative_pointer_mgr =
+		wlr_relative_pointer_manager_v1_create(server.wl_display);
+	struct wlr_virtual_keyboard_manager_v1 *virtual_kbd_mgr =
+		wlr_virtual_keyboard_manager_v1_create(server.wl_display);
+	server.virtual_keyboard_new.notify = server_new_virtual_keyboard;
+	wl_signal_add(&virtual_kbd_mgr->events.new_virtual_keyboard,
+		&server.virtual_keyboard_new);
+	struct wlr_virtual_pointer_manager_v1 *virtual_ptr_mgr =
+		wlr_virtual_pointer_manager_v1_create(server.wl_display);
+	server.virtual_pointer_new.notify = server_new_virtual_pointer;
+	wl_signal_add(&virtual_ptr_mgr->events.new_virtual_pointer,
+		&server.virtual_pointer_new);
+
 	struct wlr_cursor_shape_manager_v1 *shape_mgr =
 		wlr_cursor_shape_manager_v1_create(server.wl_display, 1);
 	server.cursor_shape_request.notify = handle_cursor_shape_request;
@@ -7041,6 +6438,14 @@ int main(int argc, char *argv[]) {
 	 * players keep the screen awake). */
 	wlr_idle_notifier_v1_create(server.wl_display);
 	wlr_idle_inhibit_v1_create(server.wl_display);
+
+	/* Pointer constraints (games): pointer lock + confine. Enforcement
+	 * lives in the constraint_* helpers on the cursor motion path. */
+	server.pointer_constraints_mgr =
+		wlr_pointer_constraints_v1_create(server.wl_display);
+	server.pointer_constraints_new.notify = handle_pointer_constraint_new;
+	wl_signal_add(&server.pointer_constraints_mgr->events.new_constraint,
+		&server.pointer_constraints_new);
 
 	/* Taskbar/dock window listing and control. */
 	server.foreign_toplevel_mgr = wlr_foreign_toplevel_manager_v1_create(
@@ -7186,6 +6591,9 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* Tell output-management clients about the initial monitor layout. */
+	output_manager_send_configuration(&server);
+
 	/* Set the WAYLAND_DISPLAY environment variable to our socket and run
 	 * autostart commands (in config order), then the -s command. */
 	setenv("WAYLAND_DISPLAY", socket, true);
@@ -7248,6 +6656,7 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.new_input.link);
 	wl_list_remove(&server.request_cursor.link);
 	wl_list_remove(&server.pointer_focus_change.link);
+	wl_list_remove(&server.pointer_constraints_new.link);
 	wl_list_remove(&server.request_set_selection.link);
 
 	wl_list_remove(&server.new_output.link);

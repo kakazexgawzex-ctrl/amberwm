@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}",
+                "/usr/include/scenefx-0.5",
+                "/usr/include/wlroots-0.20",
+                "/usr/include/pixman-1",
+                "/usr/include/libdrm",
+                "${default}"
+            ],
+            "defines": [
+                "WLR_USE_UNSTABLE"
+            ],
+            "compilerPath": "/usr/bin/cc",
+            "cStandard": "c17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}

@@ -1,8 +1,8 @@
 # amberwm
 
 A lightweight scrollable-column Wayland compositor built on **wlroots 0.20**
-and **scenefx**, with KDE-style open/close/wobble animations, an interactive
-region screenshot tool, and a tiny IPC helper (`ambermsg`).
+and **scenefx**, with KDE-style open/close/wobble animations and a tiny IPC
+helper (`ambermsg`).
 
 ## Build
 
@@ -59,20 +59,22 @@ per-app window rules.
   dead-center focus (`center-focused-column=yes`); clicking any window
   scrolls the camera onto it
 - Tiles glide into their new slot on every rearrange (150 ms ease-out)
-- Region screenshots on Print: screen freezes under a dim layer, drag to
-  select, drag inside to move the rectangle, `P` stamps the pointer,
-  `Ctrl+C` copies, `Space` saves, `Esc` cancels; Shift+Print captures
-  the whole screen
 - Clipboard done properly: selection serves PNG + text, and the
   data-control + primary-selection protocols let noctalia's clipboard
   history, wl-copy/wl-paste and cliphist read and set it
-- 9 workspaces with urgency pills over `ext-workspace-v1`; window lists
-  via both `zwlr_foreign_toplevel_management` and
+- Up to 9 workspaces per output, dynamic by default: only active and
+  occupied workspaces show on bars over `ext-workspace-v1`
+  (`dynamic-workspaces=no` reverts to the fixed-9 mode); urgency pills;
+  window lists via both `zwlr_foreign_toplevel_management` and
   `ext_foreign_toplevel_list_v1` so bars/switchers always see everything;
   taskbar clicks focus — and follow across workspaces
 - Keyboard niceties: config key names are physical keys (case-folded),
   auto-repeat never re-fires one-shot binds, Ctrl+Alt+Fx reaches the TTY,
-  closing the focused window hands focus to its neighbor
+  closing the focused window hands focus to its neighbor and migrates to
+  the nearest occupied workspace if the current one empties
+- Gaming: pointer lock + confine (`pointer-constraints-v1`) enforced by the
+  compositor, and raw unaccelerated deltas over `relative-pointer-v1` for
+  camera input; xdg-activation lets apps pull focus (open-link flows)
 - Crash-resilient sessions: systemd unit restarts on failure and keeps
   logs in journald
 
@@ -83,9 +85,8 @@ other compositors — but several concepts and behaviors are deliberately
 inspired by great projects:
 
 - **[niri](https://github.com/niri-wm/niri)** (GPL-3.0) — the scrollable
-  column layout idea and interaction model, center-focused column
-  scrolling, and the region-screenshot UX (frozen frame behind a dim
-  layer, persistent selection, move / copy / save keys).
+  column layout idea and interaction model and center-focused column
+  scrolling.
 - **[mango](https://github.com/mangowm/mango)** (GPL-3.0) — the
   tile-reflow animation approach (windows glide to their new slot on any
   rearrange) and stable numeric client ids exposed over IPC.
