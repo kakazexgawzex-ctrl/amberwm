@@ -19,16 +19,25 @@ wlr-layer-shell-unstable-v1-protocol.h: protocols/wlr-layer-shell-unstable-v1.xm
 wlr-output-power-management-unstable-v1-protocol.h: protocols/wlr-output-power-management-unstable-v1.xml
 	wayland-scanner server-header $< $@
 
-amberwm.o: amberwm.c wlr-layer-shell-unstable-v1-protocol.h wlr-output-power-management-unstable-v1-protocol.h
+ext-background-effect-v1-protocol.h: protocols/ext-background-effect-v1.xml
+	wayland-scanner server-header $< $@
+
+ext-background-effect-v1-protocol.c: protocols/ext-background-effect-v1.xml
+	wayland-scanner private-code $< $@
+
+amberwm.o: amberwm.c wlr-layer-shell-unstable-v1-protocol.h wlr-output-power-management-unstable-v1-protocol.h ext-background-effect-v1-protocol.h
 	$(CC) -c $< $(CFLAGS) -o $@
 
-amberwm: amberwm.o
+ext-background-effect-v1-protocol.o: ext-background-effect-v1-protocol.c
+	$(CC) -c $< $(CFLAGS) -fPIC -o $@
+
+amberwm: amberwm.o ext-background-effect-v1-protocol.o
 	$(CC) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
 ambermsg: ambermsg.c
 	$(CC) -g -O2 -Werror -march=x86-64 -mtune=generic $< -o $@
 
 clean:
-	rm -f amberwm ambermsg amberwm.o wlr-layer-shell-unstable-v1-protocol.h wlr-output-power-management-unstable-v1-protocol.h
+	rm -f amberwm ambermsg amberwm.o ext-background-effect-v1-protocol.o wlr-layer-shell-unstable-v1-protocol.h wlr-output-power-management-unstable-v1-protocol.h ext-background-effect-v1-protocol.h ext-background-effect-v1-protocol.c
 
 .PHONY: all clean

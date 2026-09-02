@@ -3,7 +3,7 @@ Description=AmberWM compositor
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/amberwm
+ExecStart=%h/.local/bin/amberwm-session
 Restart=on-failure
 RestartSec=2
 # SIGTERM at session end (logout) exits 143: that is clean, never restart.

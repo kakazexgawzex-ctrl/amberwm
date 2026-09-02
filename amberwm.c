@@ -20,6 +20,7 @@
 #include <wlr/types/wlr_primary_selection_v1.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/drm.h>
 #include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
@@ -81,6 +82,7 @@
 #include <wlr/util/log.h>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
+#include "ext-background-effect-v1-protocol.h"
 
 /* For brevity's sake, struct members are annotated where they are used. */
 #define AMBER_WORKSPACE_COUNT 9
@@ -94,6 +96,7 @@ enum amber_cursor_mode {
 	AMBER_CURSOR_PASSTHROUGH,
 	AMBER_CURSOR_MOVE,
 	AMBER_CURSOR_RESIZE,
+	AMBER_CURSOR_COLUMN_RESIZE,
 };
 
 /* Per-app window rule from the config:
@@ -107,6 +110,8 @@ struct amber_window_rule {
 	bool blur;
 	bool has_corner;
 	int corner_radius;
+	bool has_opacity;
+	float opacity;
 };
 
 /* Persistent IPC connection receiving state pushes (mango-IPC style). */
@@ -314,6 +319,20 @@ struct amber_server {
 	struct wl_list animations; // amber_animation.link
 	struct wl_event_source *anim_source;
 	bool anim_timer_armed;
+	/* Idle CPU/GPU throttle: when the desktop has been idle for
+	 * idle-throttle-seconds (and nothing is playing video via
+	 * idle-inhibit), drop output refresh from 60Hz to a low rate to
+	 * cut GPU/CPU draw cost. Wakes back to 60Hz on any input or when
+	 * media starts. */
+	bool idle_throttle_enabled;
+	int idle_throttle_seconds;   // inactivity before throttling, s
+	int idle_throttle_hz;        // low refresh rate while idle, Hz
+	int64_t last_input_usec;     // last key/pointer activity
+	bool idle_throttled;         // currently in low-refresh state
+	struct wl_event_source *idle_source;
+	struct wlr_idle_inhibit_manager_v1 *idle_inhibit_mgr;
+	struct wl_listener idle_inhibit_new;
+	size_t idle_inhibitors;      // active video/media inhibitors
 	/* Per-app window rules (config "rule=" lines). Matched by app-id;
 	 * a rule with empty app_id matches every window. */
 	struct wl_list window_rules; // amber_window_rule.link
@@ -342,6 +361,23 @@ struct amber_server {
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
 	struct wl_listener new_output;
+
+	/* ext-background-effect-v1 (hand-rolled; not in wlroots 0.20).
+	 * Lets clients (e.g. dms panels) attach a blur region to a
+	 * wl_surface; amber renders a scenefx optimized-blur behind it. */
+	struct amber_extbe_manager *extbe_mgr;
+};
+
+/* Niri-style overview: a single row showing one workspace snapshot. */
+struct overview_row {
+	struct amber_output *output;
+	int workspace; // index into output->workspaces
+	struct wlr_scene_buffer *thumb;   // scaled workspace snapshot
+	struct wlr_scene_buffer *ring;    // focus highlight border
+	struct wlr_scene_buffer *fallback;  // empty-workspace placeholder
+	struct wlr_scene_rect *box;       // dim backdrop behind snapshot
+	struct wlr_box geom;              // on-screen box (for hit-testing)
+	struct wlr_buffer *buf;           // captured snapshot buffer
 };
 
 struct amber_output {
@@ -368,6 +404,13 @@ struct amber_output {
 	/* Animation overlay: lamp-close snapshots + workspace slides render
 	 * here, above every layer. Created last => stacked on top. */
 	struct wlr_scene_tree *fx_tree;
+
+	/* Niri-style overview: all workspaces stacked vertically as
+	 * scaled live snapshots over a dim layer. */
+	bool ov_active;
+	struct wlr_scene_rect *ov_dim;
+	struct wlr_scene_tree *ov_tree;   // rows container
+	struct overview_row *ov_rows[AMBER_WORKSPACE_COUNT];
 
 	struct wl_listener frame;
 	struct wl_listener request_state;
@@ -399,6 +442,8 @@ struct amber_toplevel {
 	/* Drop shadow (floating windows only; static scene node, so it is
 	 * free once placed). */
 	struct wlr_scene_shadow *shadow_node;
+	/* Manual opacity override from a key binding; -1 = follow rules. */
+	float fx_opacity;
 	/* Stable numeric id exposed over IPC (mango-style client ids). */
 	long ipc_id;
 	int tile_x, tile_w; // arrangement cache (local coords)
@@ -479,6 +524,330 @@ struct amber_keyboard {
 	struct wl_listener destroy;
 };
 
+/* ============================ ext-background-effect-v1 ================
+ * Hand-rolled: wlroots-0.20 ships no implementation of this staging
+ * protocol. A client binds ext_background_effect_manager_v1, asks for
+ * ext_background_effect_surface_v1 on some wl_surface, and sets a
+ * double-buffered blur region. On each surface commit we place a scenefx
+ * wlr_scene_optimized_blur node right behind the containing surface's
+ * scene tree, blurred over that region. Uses wlr_surface_synced so the
+ * pending/current semantics are correct for free. */
+
+#define EXTBE_VERSION 1
+
+struct amber_extbe_state {
+	pixman_region32_t blur_region;
+};
+
+struct amber_extbe_surface {
+	struct wl_resource *resource;
+	struct amber_server *server;
+	struct wlr_surface *surface;
+	struct wlr_addon addon;
+	struct wlr_surface_synced synced;
+	struct amber_extbe_state pending, current;
+	/* Scene blur node behind the owning surface's tree. NULL until the
+	 * first commit with a non-empty blur region. */
+	struct wlr_scene_optimized_blur *blur_node;
+};
+
+struct amber_extbe_manager {
+	struct wl_global *global;
+	struct wl_list resources; // wl_resource link
+	uint32_t capabilities;
+	struct amber_server *server;
+	struct wl_listener display_destroy;
+};
+
+/* text for a per-surface blur node is driven entirely from the state;
+ * but scenefx rounded corners need a real box, so we park the owning
+ * scene tree's current size here. */
+static struct wlr_scene_tree *extbe_parent_tree(
+		struct amber_server *server, struct wlr_surface *surface) {
+	/* xdg toplevels: follow the xdg_surface -> scene_tree backref.
+	 * wlroots nulls `data` before the toplevel is freed, so this never
+	 * walks into a destroyed window (the naive workspace->toplevels scan
+	 * could deref a stale ->xdg_toplevel on teardown). */
+	struct wlr_xdg_toplevel *tl =
+		wlr_xdg_toplevel_try_from_wlr_surface(surface);
+	if (tl != NULL && tl->base->data != NULL) {
+		return tl->base->data;
+	}
+	/* layer surfaces: their scene_layer is a stable tree handle. */
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		for (int b = 0; b < 4; b++) {
+			struct amber_layer_surface *layer;
+			wl_list_for_each(layer, &output->layers[b], link) {
+				if (layer->layer_surface->surface == surface &&
+						layer->scene_layer != NULL) {
+					return layer->scene_layer->tree;
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
+/* Apply the committed blur region of es to its scenefx blur node.
+ * Called from wlr_surface_synced commit, so `current` is up to date. */
+static void extbe_apply_blur(struct amber_extbe_surface *es) {
+	bool has_blur = pixman_region32_not_empty(&es->current.blur_region);
+	if (!has_blur) {
+		if (es->blur_node != NULL) {
+			wlr_scene_node_set_enabled(&es->blur_node->node, false);
+		}
+		return;
+	}
+
+	struct wlr_scene_tree *tree =
+		extbe_parent_tree(es->server, es->surface);
+	if (tree == NULL) {
+		return;
+	}
+
+	/* Size the blur to the surface's committed size (surface-local).
+	 * The region itself is advisory: scenefx blurs whatever sits
+	 * behind the node. */
+	int w = es->surface->current.width;
+	int h = es->surface->current.height;
+	if (w < 1 || h < 1) {
+		return;
+	}
+
+	if (es->blur_node == NULL) {
+		es->blur_node = wlr_scene_optimized_blur_create(tree, w, h);
+		if (es->blur_node == NULL) {
+			return;
+		}
+	} else {
+		wlr_scene_optimized_blur_set_size(es->blur_node, w, h);
+	}
+	wlr_scene_node_set_enabled(&es->blur_node->node, true);
+}
+
+static const struct ext_background_effect_surface_v1_interface
+		extbe_surface_impl;
+static const struct ext_background_effect_manager_v1_interface
+		extbe_manager_impl;
+
+static struct amber_extbe_surface *extbe_surface_from_resource(
+		struct wl_resource *resource) {
+	assert(wl_resource_instance_of(resource,
+		&ext_background_effect_surface_v1_interface, &extbe_surface_impl));
+	return wl_resource_get_user_data(resource);
+}
+
+static void extbe_surface_destroy(struct amber_extbe_surface *es) {
+	if (es == NULL) {
+		return;
+	}
+	if (es->blur_node != NULL) {
+		wlr_scene_node_destroy(&es->blur_node->node);
+	}
+	wlr_surface_synced_finish(&es->synced);
+	wlr_addon_finish(&es->addon);
+	pixman_region32_fini(&es->pending.blur_region);
+	pixman_region32_fini(&es->current.blur_region);
+	if (es->resource != NULL) {
+		wl_resource_set_user_data(es->resource, NULL);
+	}
+	free(es);
+}
+
+static void extbe_surface_resource_destroy(struct wl_resource *resource) {
+	extbe_surface_destroy(extbe_surface_from_resource(resource));
+}
+
+static void extbe_surface_handle_destroy(struct wl_client *client,
+		struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+
+static void extbe_surface_handle_set_blur_region(struct wl_client *client,
+		struct wl_resource *resource, struct wl_resource *region_res) {
+	struct amber_extbe_surface *es = extbe_surface_from_resource(resource);
+	if (es == NULL) {
+		wl_resource_post_error(resource,
+			EXT_BACKGROUND_EFFECT_SURFACE_V1_ERROR_SURFACE_DESTROYED,
+			"The wl_surface object has been destroyed");
+		return;
+	}
+	if (region_res != NULL) {
+		const pixman_region32_t *region =
+			wlr_region_from_resource(region_res);
+		pixman_region32_copy(&es->pending.blur_region, region);
+	} else {
+		pixman_region32_clear(&es->pending.blur_region);
+	}
+}
+
+static const struct ext_background_effect_surface_v1_interface
+		extbe_surface_impl = {
+	.destroy = extbe_surface_handle_destroy,
+	.set_blur_region = extbe_surface_handle_set_blur_region,
+};
+
+static void extbe_synced_init_state(void *state) {
+	struct amber_extbe_state *st = state;
+	pixman_region32_init(&st->blur_region);
+}
+
+static void extbe_synced_finish_state(void *state) {
+	struct amber_extbe_state *st = state;
+	pixman_region32_fini(&st->blur_region);
+}
+
+static void extbe_synced_move_state(void *dst, void *src) {
+	struct amber_extbe_state *d = dst;
+	struct amber_extbe_state *s = src;
+	pixman_region32_copy(&d->blur_region, &s->blur_region);
+}
+
+static void extbe_synced_commit(struct wlr_surface_synced *synced) {
+	struct amber_extbe_surface *es =
+		wl_container_of(synced, es, synced);
+	extbe_apply_blur(es);
+}
+
+static const struct wlr_surface_synced_impl extbe_synced_impl = {
+	.state_size = sizeof(struct amber_extbe_state),
+	.init_state = extbe_synced_init_state,
+	.finish_state = extbe_synced_finish_state,
+	.move_state = extbe_synced_move_state,
+	.commit = extbe_synced_commit,
+};
+
+static void extbe_surface_addon_destroy(struct wlr_addon *addon) {
+	struct amber_extbe_surface *es =
+		wl_container_of(addon, es, addon);
+	extbe_surface_destroy(es);
+}
+
+static const struct wlr_addon_interface extbe_surface_addon_impl = {
+	.name = "ext_background_effect_surface_v1",
+	.destroy = extbe_surface_addon_destroy,
+};
+
+static struct amber_extbe_surface *extbe_surface_from_wlr_surface(
+		struct wlr_surface *surface) {
+	struct wlr_addon *addon = wlr_addon_find(&surface->addons, NULL,
+		&extbe_surface_addon_impl);
+	if (addon == NULL) {
+		return NULL;
+	}
+	struct amber_extbe_surface *es;
+	return wl_container_of(addon, es, addon);
+}
+
+static void extbe_manager_handle_destroy(struct wl_client *client,
+		struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+
+static void extbe_manager_handle_get_background_effect(struct wl_client *client,
+		struct wl_resource *manager_res, uint32_t id,
+		struct wl_resource *surface_res) {
+	struct amber_extbe_manager *mgr =
+		wl_resource_get_user_data(manager_res);
+	struct wlr_surface *wlr_surface =
+		wlr_surface_from_resource(surface_res);
+
+	if (extbe_surface_from_wlr_surface(wlr_surface) != NULL) {
+		wl_resource_post_error(manager_res,
+			EXT_BACKGROUND_EFFECT_MANAGER_V1_ERROR_BACKGROUND_EFFECT_EXISTS,
+			"The wl_surface object already has a "
+			"ext_background_effect_surface_v1 object");
+		return;
+	}
+
+	struct amber_extbe_surface *es = calloc(1, sizeof(*es));
+	if (es == NULL) {
+		wl_resource_post_no_memory(manager_res);
+		return;
+	}
+	if (!wlr_surface_synced_init(&es->synced, wlr_surface,
+			&extbe_synced_impl, &es->pending, &es->current)) {
+		free(es);
+		wl_resource_post_no_memory(manager_res);
+		return;
+	}
+
+	uint32_t version = wl_resource_get_version(manager_res);
+	es->resource = wl_resource_create(client,
+		&ext_background_effect_surface_v1_interface, version, id);
+	if (es->resource == NULL) {
+		wlr_surface_synced_finish(&es->synced);
+		pixman_region32_fini(&es->pending.blur_region);
+		pixman_region32_fini(&es->current.blur_region);
+		free(es);
+		wl_resource_post_no_memory(manager_res);
+		return;
+	}
+	wl_resource_set_implementation(es->resource, &extbe_surface_impl, es,
+		extbe_surface_resource_destroy);
+	es->surface = wlr_surface;
+	wlr_addon_init(&es->addon, &wlr_surface->addons, es->resource,
+		&extbe_surface_addon_impl);
+}
+
+static const struct ext_background_effect_manager_v1_interface
+		extbe_manager_impl = {
+	.destroy = extbe_manager_handle_destroy,
+	.get_background_effect = extbe_manager_handle_get_background_effect,
+};
+
+static void extbe_manager_resource_destroy(struct wl_resource *resource) {
+	wl_list_remove(wl_resource_get_link(resource));
+}
+
+static void extbe_manager_bind(struct wl_client *client, void *data,
+		uint32_t version, uint32_t id) {
+	struct amber_extbe_manager *mgr = data;
+	struct wl_resource *resource = wl_resource_create(client,
+		&ext_background_effect_manager_v1_interface, version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &extbe_manager_impl, mgr,
+		extbe_manager_resource_destroy);
+	wl_list_insert(&mgr->resources, wl_resource_get_link(resource));
+
+	ext_background_effect_manager_v1_send_capabilities(resource,
+		mgr->capabilities);
+}
+
+static void extbe_handle_display_destroy(struct wl_listener *listener,
+		void *data) {
+	struct amber_extbe_manager *mgr =
+		wl_container_of(listener, mgr, display_destroy);
+	wl_global_destroy(mgr->global);
+	wl_list_remove(&mgr->display_destroy.link);
+	free(mgr);
+}
+
+static void extbe_manager_init(struct amber_server *server) {
+	struct amber_extbe_manager *mgr = calloc(1, sizeof(*mgr));
+	if (mgr == NULL) {
+		return;
+	}
+	mgr->global = wl_global_create(server->wl_display,
+		&ext_background_effect_manager_v1_interface, EXTBE_VERSION, mgr,
+		extbe_manager_bind);
+	if (mgr->global == NULL) {
+		free(mgr);
+		return;
+	}
+	mgr->capabilities = EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR;
+	mgr->server = server;
+	wl_list_init(&mgr->resources);
+	mgr->display_destroy.notify = extbe_handle_display_destroy;
+	wl_display_add_destroy_listener(server->wl_display,
+		&mgr->display_destroy);
+	server->extbe_mgr = mgr;
+}
+
 /* A toplevel is "alive" (safe to send state to) only while its xdg
  * surface is initialized. wlroots resets that flag on unmap, and
  * sending any set_* to a reset surface trips an assertion. */
@@ -558,6 +927,8 @@ static void toplevel_apply_fx(struct amber_toplevel *toplevel);
 struct amber_animation;
 static void animation_destroy(struct amber_server *server,
 	struct amber_animation *anim, bool restore);
+static void animation_tree_set_opacity(struct wlr_scene_tree *tree,
+	float opacity);
 static int64_t anim_now_usec(void);
 static void animations_kick(struct amber_server *server);
 
@@ -1199,10 +1570,11 @@ static void fx_corner_cb(struct wlr_scene_buffer *buffer,
  * first matching rule wins for each property (later rules override). */
 static void rule_resolve(struct amber_server *server,
 		struct amber_toplevel *toplevel, bool *blur_out,
-		int *radius_out) {
+		int *radius_out, float *opacity_out) {
 	const char *app_id = toplevel->xdg_toplevel->app_id;
 	bool blur = server->blur_enabled;
 	int radius = server->corner_radius;
+	float opacity = 1.0f;
 
 	struct amber_window_rule *rule;
 	wl_list_for_each(rule, &server->window_rules, link) {
@@ -1216,9 +1588,14 @@ static void rule_resolve(struct amber_server *server,
 		if (rule->has_corner) {
 			radius = rule->corner_radius;
 		}
+		if (rule->has_opacity) {
+			opacity = rule->opacity;
+		}
 	}
 	*blur_out = blur;
 	*radius_out = radius < 0 ? 0 : radius;
+	*opacity_out = opacity < 0.0f ? 0.0f :
+		(opacity > 1.0f ? 1.0f : opacity);
 }
 
 static bool parse_rule_bool(const char *v, bool *out) {
@@ -1281,6 +1658,11 @@ static void parse_window_rule(struct amber_server *server,
 				if (rule->corner_radius < 0) {
 					rule->corner_radius = 0;
 				}
+			} else if (strcmp(key, "opacity") == 0) {
+				float o = atof(val);
+				rule->opacity = o < 0.0f ? 0.0f :
+					(o > 1.0f ? 1.0f : o);
+				rule->has_opacity = true;
 			}
 			/* Unknown keys are ignored. */
 		}
@@ -1296,11 +1678,13 @@ static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
 
 	bool blur;
 	int radius;
+	float opacity;
 	if (fullscreen) {
 		blur = false;
 		radius = 0;
+		opacity = 1.0f;
 	} else {
-		rule_resolve(server, toplevel, &blur, &radius);
+		rule_resolve(server, toplevel, &blur, &radius, &opacity);
 	}
 	if (!fullscreen) {
 		struct amber_animation *wa, *wtmp;
@@ -1318,6 +1702,10 @@ static void toplevel_apply_fx(struct amber_toplevel *toplevel) {
 	}
 	wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
 		fx_corner_cb, &radius);
+
+	/* --- opacity (fades the whole window content incl. popups) --- */
+	animation_tree_set_opacity(toplevel->scene_tree,
+		toplevel->fx_opacity >= 0 ? toplevel->fx_opacity : opacity);
 
 	/* --- blur (backdrop) --- */
 	if (blur) {
@@ -1415,6 +1803,8 @@ enum amber_binding_id {
 	AMBER_BINDING_TOGGLE_FULLSCREEN,
 	AMBER_BINDING_TOGGLE_MAXIMIZE,
 	AMBER_BINDING_SWITCHER,
+	AMBER_BINDING_OVERVIEW,
+	AMBER_BINDING_CYCLE_OPACITY,
 };
 
 struct amber_binding {
@@ -1486,6 +1876,8 @@ static const struct amber_binding_defaults amber_default_bindings[] = {
 	{ "SUPER+V", AMBER_BINDING_TOGGLE_FLOAT, 0, NULL },
 	{ "SUPER+F", AMBER_BINDING_TOGGLE_MAXIMIZE, 0, NULL },
 	{ "SUPER+SHIFT+F", AMBER_BINDING_TOGGLE_FULLSCREEN, 0, NULL },
+	{ "SUPER+S", AMBER_BINDING_CYCLE_OPACITY, 0, NULL },
+	{ "SUPER+D", AMBER_BINDING_OVERVIEW, 0, NULL },
 	{ "SUPER+T", AMBER_BINDING_TERMINAL, 0, NULL },
 	{ "SUPER+SPACE", AMBER_BINDING_EXEC, 0,
 			"noctalia msg panel-toggle launcher" },
@@ -1603,6 +1995,8 @@ static bool parse_action(struct amber_server *server,
 		b->id = AMBER_BINDING_TOGGLE_MAXIMIZE;
 	} else if (strcmp(buf, "switcher") == 0) {
 		b->id = AMBER_BINDING_SWITCHER;
+	} else if (strcmp(buf, "overview") == 0) {
+		b->id = AMBER_BINDING_OVERVIEW;
 	} else if (strcmp(buf, "workspace") == 0 || strcmp(buf,
 				"move-to-workspace") == 0) {
 		int n = sp ? atoi(sp + 1) : 0;
@@ -1664,6 +2058,17 @@ static int config_add_binding(struct amber_server *server,
 		return AMBER_CONFIG_ERROR;
 	}
 
+	/* A config "bind=" line overrides a default with the same combo
+	 * instead of stacking a second entry. */
+	for (int i = 0; i < server->binding_count; i++) {
+		struct amber_binding *old = &server->bindings[i];
+		if (old->mods == b.mods && old->sym == b.sym) {
+			free(old->cmd);
+			*old = b;
+			return AMBER_CONFIG_OK;
+		}
+	}
+
 	struct amber_binding *grown = realloc(server->bindings,
 		(server->binding_count + 1) * sizeof(b));
 	if (grown == NULL) {
@@ -1715,6 +2120,11 @@ static void config_load(struct amber_server *server) {
 	server->ws_slide_enabled = true;
 	server->ws_slide_duration_ms = 250;
 	server->wobbly_windows = true; // Compiz-style spring grid on drag
+	server->idle_throttle_enabled = true;
+	server->idle_throttle_seconds = 30;
+	server->idle_throttle_hz = 10;
+	server->idle_throttled = false;
+	server->idle_inhibitors = 0;
 	server->dyn_ws = true; // advertise only active/occupied workspaces
 	const char *env_theme = getenv("XCURSOR_THEME");
 	server->cursor_theme = env_theme != NULL ? strdup(env_theme) : NULL;
@@ -1755,6 +2165,12 @@ static void config_load(struct amber_server *server) {
 		wlr_log(WLR_INFO, "no config found, using defaults");
 		return;
 	}
+
+	/* Always load the full default binding set first; a config "bind="
+	 * line then overrides any default that shares its key combo. Without
+	 * this, a hand-written config silently drops every default shortcut
+	 * (terminal, workspaces, exit, overview, etc.). */
+	config_set_defaults(server);
 
 	char line[1024];
 	while (fgets(line, sizeof(line), f) != NULL) {
@@ -1835,6 +2251,17 @@ static void config_load(struct amber_server *server) {
 		} else if (strcmp(key, "wobbly-windows") == 0) {
 			server->wobbly_windows =
 				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "idle-throttle") == 0) {
+			server->idle_throttle_enabled =
+				strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "idle-throttle-seconds") == 0) {
+			int v = atoi(value);
+			server->idle_throttle_seconds =
+				v >= 1 && v <= 3600 ? v : 30;
+		} else if (strcmp(key, "idle-throttle-hz") == 0) {
+			int v = atoi(value);
+			server->idle_throttle_hz =
+				v >= 1 && v <= 60 ? v : 10;
 		} else if (strcmp(key, "cursor-theme") == 0) {
 			free(server->cursor_theme);
 			server->cursor_theme = *value == '\0'
@@ -1883,10 +2310,6 @@ static void config_load(struct amber_server *server) {
 		}
 	}
 	fclose(f);
-
-	if (server->binding_count == 0) {
-		config_set_defaults(server);
-	}
 }
 
 /* Re-read amberwm.cfg live (IPC "reload" / SIGHUP). Autostart commands
@@ -2014,6 +2437,12 @@ static void config_watch_init(struct amber_server *server) {
 static void ext_ws_dyn_sync(struct amber_output *output);
 
 static void switcher_open(struct amber_server *server);
+static void switcher_select(struct amber_server *server, size_t idx);
+static int64_t idle_now_usec(void);
+static void idle_mark_activity(struct amber_server *server);
+static struct amber_output *overview_output(struct amber_server *server);
+static void overview_open(struct amber_server *server,
+	struct amber_output *output);
 
 static void binding_exec(struct amber_server *server,
 		const struct amber_binding *binding) {
@@ -2038,6 +2467,13 @@ static void binding_exec(struct amber_server *server,
 	case AMBER_BINDING_SWITCHER:
 		switcher_open(server);
 		break;
+	case AMBER_BINDING_OVERVIEW: {
+		struct amber_output *output = active_output(server);
+		if (output != NULL) {
+			overview_open(server, output);
+		}
+		break;
+	}
 	case AMBER_BINDING_CYCLE_FOCUS:
 		cycle_focus(server, binding->arg);
 		break;
@@ -2075,6 +2511,25 @@ static void binding_exec(struct amber_server *server,
 			toplevel_toggle_maximize(server->focused_toplevel);
 		}
 		break;
+	case AMBER_BINDING_CYCLE_OPACITY: {
+		struct amber_toplevel *t = server->focused_toplevel;
+		if (t == NULL || !toplevel_alive(t)) {
+			break;
+		}
+		static const float stages[] = {1.0f, 0.85f, 0.7f, 0.5f, 0.3f};
+		const int nst = (int)(sizeof(stages) / sizeof(stages[0]));
+		float cur = t->fx_opacity >= 0 ? t->fx_opacity : 1.0f;
+		int next = 0;
+		for (int i = 0; i < nst; i++) {
+			if (stages[i] > cur - 0.001f) {
+				next = (i + 1) % nst;
+				break;
+			}
+		}
+		t->fx_opacity = stages[next];
+		toplevel_apply_fx(t);
+		break;
+	}
 	}
 }
 
@@ -2450,6 +2905,23 @@ static void switcher_key(struct amber_server *server,
 			switcher_activate_selected(server);
 			return;
 		}
+		if (sym == XKB_KEY_Home) {
+			switcher_select(server, 0);
+			return;
+		}
+		if (sym == XKB_KEY_End) {
+			switcher_select(server, n - 1);
+			return;
+		}
+		if (sym == XKB_KEY_Page_Down) {
+			switcher_select(server, server->sw_selected + cols);
+			return;
+		}
+		if (sym == XKB_KEY_Page_Up) {
+			switcher_select(server, server->sw_selected + n -
+				(n > cols ? cols : 1));
+			return;
+		}
 		if (sym >= XKB_KEY_1 && sym <= XKB_KEY_9) {
 			size_t d = (size_t)(sym - XKB_KEY_1);
 			if (d < n) {
@@ -2479,6 +2951,339 @@ static void switcher_button(struct amber_server *server,
 		}
 	}
 	switcher_close(server);
+}
+
+/* ================= Built-in overview (niri-style) =====================
+ * Pans out to show every workspace of the focused output stacked
+ * vertically (workspace 0 on top, 8 at the bottom) as scaled live-ish
+ * snapshots; click one to jump to that workspace and focus its window.
+ * Each row is captured by temporarily making its workspace the visible
+ * one, reusing screenshot_capture (the same machinery the switcher and
+ * the thumbnail path use). */
+
+static struct amber_output *overview_output(struct amber_server *server) {
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->ov_active) {
+			return output;
+		}
+	}
+	return NULL;
+}
+
+/* Temporarily show workspace `idx` and grab a full-output snapshot.
+ * Always restores the originally visible workspace/tree enable state. */
+static struct wlr_buffer *overview_capture(struct amber_server *server,
+		struct amber_output *output, int idx) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (wlr_output->width <= 0 || wlr_output->height <= 0) {
+		return NULL;
+	}
+	int og = output->active_workspace;
+	if (og == idx) {
+		return NULL; // captured live by the caller instead
+	}
+	/* Anchor the target tree at the output origin and show it. */
+	wlr_scene_node_set_position(&output->workspaces[idx].tree->node,
+		output->layout_box.x, output->layout_box.y);
+	wlr_scene_node_set_enabled(
+		&output->workspaces[idx].tree->node, true);
+	wlr_scene_node_set_enabled(
+		&output->workspaces[og].tree->node, false);
+	struct wlr_buffer *buf = NULL;
+	unsigned char *px = screenshot_capture(server, output,
+		(struct wlr_box){ .x = 0, .y = 0,
+			.width = wlr_output->width,
+			.height = wlr_output->height });
+	if (px != NULL) {
+		buf = rgba_buffer_take(wlr_output->width,
+			wlr_output->height, px);
+	}
+	/* Restore visibility immediately, before anyone repaints. */
+	wlr_scene_node_set_enabled(
+		&output->workspaces[og].tree->node, true);
+	wlr_scene_node_set_enabled(
+		&output->workspaces[idx].tree->node, false);
+	return buf;
+}
+
+static void overview_clear_rows(struct amber_output *output) {
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		struct overview_row *row = output->ov_rows[i];
+		if (row == NULL) {
+			continue;
+		}
+		if (row->thumb != NULL) {
+			wlr_scene_node_destroy(&row->thumb->node);
+		}
+		if (row->ring != NULL) {
+			wlr_scene_node_destroy(&row->ring->node);
+		}
+		if (row->fallback != NULL) {
+			wlr_scene_node_destroy(&row->fallback->node);
+		}
+		if (row->box != NULL) {
+			wlr_scene_node_destroy(&row->box->node);
+		}
+		if (row->buf != NULL) {
+			wlr_buffer_unlock(row->buf);
+		}
+		free(row);
+		output->ov_rows[i] = NULL;
+	}
+}
+
+static void overview_close(struct amber_server *server) {
+	struct amber_output *output = overview_output(server);
+	if (output == NULL) {
+		return;
+	}
+	/* Row nodes are children of ov_tree: destroying the tree frees them
+	 * too. Clear them first (freeing the row structs/buffers), then the
+	 * now-empty container tree, so nothing is double-destroyed. */
+	overview_clear_rows(output);
+	if (output->ov_dim != NULL) {
+		wlr_scene_node_destroy(&output->ov_dim->node);
+		output->ov_dim = NULL;
+	}
+	if (output->ov_tree != NULL) {
+		wlr_scene_node_destroy(&output->ov_tree->node);
+		output->ov_tree = NULL;
+	}
+	output->ov_active = false;
+}
+
+static void overview_select(struct amber_server *server, int idx) {
+	struct amber_output *output = overview_output(server);
+	if (output == NULL) {
+		return;
+	}
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		struct overview_row *row = output->ov_rows[i];
+		if (row != NULL && row->ring != NULL) {
+			wlr_scene_node_set_enabled(&row->ring->node,
+				i == idx);
+		}
+	}
+}
+
+static void overview_activate(struct amber_server *server, int idx) {
+	struct amber_output *output = overview_output(server);
+	int target = idx;
+	overview_close(server);
+	if (output == NULL || target < 0 ||
+			target >= AMBER_WORKSPACE_COUNT) {
+		return;
+	}
+	if (target != output->active_workspace) {
+		workspace_switch(output, target);
+	}
+	struct amber_workspace *ws = &output->workspaces[target];
+	struct amber_toplevel *t;
+	wl_list_for_each(t, &ws->toplevels, link) {
+		if (toplevel_alive(t)) {
+			focus_toplevel(t);
+			break;
+		}
+	}
+	workspace_arrange(ws);
+}
+
+static void overview_key(struct amber_server *server,
+		const xkb_keysym_t *syms, int nsyms) {
+	int cur = -1;
+	struct amber_output *output = overview_output(server);
+	if (output != NULL) {
+		cur = output->active_workspace;
+	}
+	for (int i = 0; i < nsyms; i++) {
+		xkb_keysym_t sym = syms[i];
+		if (sym == XKB_KEY_Escape) {
+			overview_close(server);
+			return;
+		}
+		if (sym == XKB_KEY_Return || sym == XKB_KEY_space) {
+			overview_activate(server, cur);
+			return;
+		}
+		if (sym == XKB_KEY_Down || sym == XKB_KEY_KP_Down ||
+				sym == XKB_KEY_j) {
+			cur = cur < AMBER_WORKSPACE_COUNT - 1
+				? cur + 1 : cur;
+			overview_select(server, cur);
+			continue;
+		}
+		if (sym == XKB_KEY_Up || sym == XKB_KEY_KP_Up ||
+				sym == XKB_KEY_k) {
+			cur = cur > 0 ? cur - 1 : cur;
+			overview_select(server, cur);
+			continue;
+		}
+		if (sym >= XKB_KEY_1 && sym <= XKB_KEY_9) {
+			int d = (int)(sym - XKB_KEY_1);
+			overview_activate(server, d);
+			return;
+		}
+	}
+}
+
+static void overview_button(struct amber_server *server,
+		const struct wlr_pointer_button_event *event) {
+	if (event->state != WL_POINTER_BUTTON_STATE_PRESSED) {
+		return;
+	}
+	struct amber_output *output = overview_output(server);
+	if (output == NULL) {
+		return;
+	}
+	double cx = server->cursor->x - output->layout_box.x;
+	double cy = server->cursor->y - output->layout_box.y;
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		struct overview_row *row = output->ov_rows[i];
+		if (row == NULL) {
+			continue;
+		}
+		struct wlr_box *b = &row->geom;
+		if (cx >= b->x && cy >= b->y &&
+				cx < b->x + b->width && cy < b->y + b->height) {
+			overview_activate(server, i);
+			return;
+		}
+	}
+	overview_close(server);
+}
+
+static void overview_open(struct amber_server *server,
+		struct amber_output *output) {
+	if (output->ov_active) {
+		overview_close(server);
+		return;
+	}
+	if (server->sw_active) {
+		switcher_close(server);
+	}
+	/* Nothing to show on a disabled/zero-size output. */
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (wlr_output->width <= 0 || wlr_output->height <= 0) {
+		return;
+	}
+	/* Finish any in-flight workspace slide so tree visibility is
+	 * well-defined while we temporarily flip enabled states. */
+	struct amber_animation *anim, *tmp;
+	wl_list_for_each_safe(anim, tmp, &server->animations, link) {
+		if (anim->kind == ANIM_WS_SLIDE &&
+				anim->output == output) {
+			animation_destroy(server, anim, true);
+		}
+	}
+
+	/* Capture every workspace BEFORE creating any overlay nodes, so no
+	 * dim/row geometry leaks into the snapshots. */
+	struct wlr_buffer *snaps[AMBER_WORKSPACE_COUNT] = {0};
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		if (i == output->active_workspace) {
+			unsigned char *px = screenshot_capture(server, output,
+				(struct wlr_box){ .x = 0, .y = 0,
+					.width = wlr_output->width,
+					.height = wlr_output->height });
+			snaps[i] = px != NULL
+				? rgba_buffer_take(wlr_output->width,
+					wlr_output->height, px)
+				: NULL;
+		} else {
+			snaps[i] = overview_capture(server, output, i);
+		}
+	}
+
+	output->ov_active = true;
+
+	/* Dim backdrop + container tree for the stacked rows. */
+	float dim_col[4] = {0.0f, 0.0f, 0.0f, 0.6f};
+	output->ov_dim = wlr_scene_rect_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY],
+		wlr_output->width, wlr_output->height, dim_col);
+	output->ov_tree = wlr_scene_tree_create(
+		output->layer_trees[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]);
+	if (output->ov_dim == NULL || output->ov_tree == NULL) {
+		for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+			if (snaps[i] != NULL) {
+				wlr_buffer_unlock(snaps[i]);
+			}
+		}
+		overview_close(server);
+		return;
+	}
+	struct wlr_scene_tree *ov = output->ov_tree;
+
+	/* Layout rows: N workspaces stacked vertically, margin + gaps. */
+	int ow = wlr_output->width, oh = wlr_output->height;
+	int margin = 40, gap = 40;
+	int avail_h = oh - 2 * margin - gap * (AMBER_WORKSPACE_COUNT - 1);
+	int row_h = avail_h / AMBER_WORKSPACE_COUNT;
+	if (row_h < 40) {
+		row_h = 40;
+	}
+	int row_w = row_h * 16 / 9;
+	if (row_w > ow - 2 * margin) {
+		row_w = ow - 2 * margin;
+	}
+	if (row_w < 80) {
+		row_w = 80;
+	}
+	int oy = margin;
+	int ox = (ow - row_w) / 2;
+
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		struct overview_row *row = calloc(1, sizeof(*row));
+		if (row == NULL) {
+			continue;
+		}
+		row->output = output;
+		row->workspace = i;
+		row->geom = (struct wlr_box){
+			.x = ox, .y = oy, .width = row_w, .height = row_h };
+
+		int ring_pad = 6;
+		if (snaps[i] == NULL) {
+			float fb_col[4] = {0.13f, 0.13f, 0.16f, 0.97f};
+			row->fallback = ui_attach(ov,
+				ui_rounded_card(row_w, row_h, 16, fb_col));
+			if (row->fallback != NULL) {
+				wlr_scene_node_set_position(
+					&row->fallback->node, ox, oy);
+			}
+		} else {
+			row->buf = snaps[i];
+			snaps[i] = NULL;
+			row->thumb = wlr_scene_buffer_create(ov, row->buf);
+			if (row->thumb != NULL) {
+				wlr_scene_node_set_position(
+					&row->thumb->node, ox, oy);
+				wlr_scene_buffer_set_dest_size(
+					row->thumb, row_w, row_h);
+			}
+			wlr_buffer_unlock(row->buf);
+			row->buf = NULL;
+		}
+		struct wlr_buffer *ring = ui_rounded_ring(
+			row_w + 2 * ring_pad, row_h + 2 * ring_pad, 16, 4,
+			(float[4]){1.0f, 1.0f, 1.0f, 1.0f});
+		row->ring = ui_attach(ov, ring);
+		if (row->ring != NULL) {
+			wlr_scene_node_set_position(
+				&row->ring->node, ox - ring_pad, oy - ring_pad);
+			wlr_scene_node_set_enabled(&row->ring->node,
+				i == output->active_workspace);
+		}
+		output->ov_rows[i] = row;
+		oy += row_h + gap;
+	}
+	for (int i = 0; i < AMBER_WORKSPACE_COUNT; i++) {
+		if (snaps[i] != NULL) {
+			wlr_buffer_unlock(snaps[i]);
+		}
+	}
+	overview_select(server, output->active_workspace);
 }
 
 /* App-icon badges for the switcher: loaded once per app_id and cached
@@ -2700,7 +3505,19 @@ static void switcher_open(struct amber_server *server) {
 	server->sw_cols = cols;
 	server->sw_output = out;
 	server->sw_active = true;
-	switcher_select(server, 0);
+	/* Alt-Tab feel: land on the window AFTER the focused one so a single
+	 * SUPER+TAB opens AND advances to the next window. If focus isn't
+	 * one of the tiles, just start at the first tile. */
+	size_t start = 0;
+	if (server->focused_toplevel != NULL) {
+		for (size_t i = 0; i < n; i++) {
+			if (server->sw_tiles[i].tl == server->focused_toplevel) {
+				start = (i + 1) % n;
+				break;
+			}
+		}
+	}
+	switcher_select(server, start);
 }
 
 
@@ -2772,6 +3589,8 @@ static void keyboard_handle_key(
 	struct wlr_keyboard_key_event *event = data;
 	struct wlr_seat *seat = server->seat;
 
+	idle_mark_activity(server);
+
 	if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
 		keyboard_held_clear(keyboard, event->keycode);
 		if (keyboard_consume_swallowed(keyboard, event->keycode)) {
@@ -2794,6 +3613,13 @@ static void keyboard_handle_key(
 			wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~keyboard->lock_mask;
 		if (!is_repeat) {
+			struct amber_output *ov_out = overview_output(server);
+			if (ov_out != NULL) {
+				keyboard_mark_swallowed(keyboard,
+					event->keycode);
+				overview_key(server, syms, nsyms);
+				return;
+			}
 			if (server->sw_active) {
 				keyboard_mark_swallowed(keyboard,
 					event->keycode);
@@ -3358,6 +4184,43 @@ static void process_cursor_resize(struct amber_server *server) {
 	}
 }
 
+/* Begin a mouse-driven resize of the focused window's column. The column
+ * width is adjusted by how far the pointer travels horizontally from the
+ * grab point (a live drag on the column's right edge). */
+static void begin_column_resize(struct amber_server *server,
+		struct amber_toplevel *toplevel) {
+	if (toplevel == NULL || toplevel->floating) {
+		return;
+	}
+	server->grabbed_toplevel = toplevel;
+	server->cursor_mode = AMBER_CURSOR_COLUMN_RESIZE;
+	/* Remember pointer position in layout space and the starting width. */
+	double lx = server->cursor->x -
+		(toplevel->output ? toplevel->output->layout_box.x : 0);
+	server->grab_x = lx;
+	server->grab_geobox.width = toplevel->col_width;
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+		"col-resize");
+}
+
+static void process_cursor_column_resize(struct amber_server *server) {
+	struct amber_toplevel *toplevel = server->grabbed_toplevel;
+	if (toplevel == NULL || !toplevel_alive(toplevel) || toplevel->floating) {
+		return;
+	}
+	double lx = server->cursor->x -
+		(toplevel->output ? toplevel->output->layout_box.x : 0);
+	int cur_width = (int)server->grab_geobox.width + (int)(lx - server->grab_x);
+	if (cur_width < 80) {
+		cur_width = 80; // enforce a sane minimum column width
+	}
+	toplevel->col_width = cur_width;
+	struct amber_workspace *ws = toplevel_workspace(toplevel);
+	if (ws != NULL) {
+		workspace_arrange(ws);
+	}
+}
+
 static void process_cursor_motion(struct amber_server *server, uint32_t time) {
 	/* Track which output the cursor is on; new windows, workspace
 	 * switches and cycling all target it. Cheap: one layout walk per
@@ -3380,6 +4243,9 @@ static void process_cursor_motion(struct amber_server *server, uint32_t time) {
 		return;
 	} else if (server->cursor_mode == AMBER_CURSOR_RESIZE) {
 		process_cursor_resize(server);
+		return;
+	} else if (server->cursor_mode == AMBER_CURSOR_COLUMN_RESIZE) {
+		process_cursor_column_resize(server);
 		return;
 	}
 
@@ -3422,6 +4288,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_motion);
 	struct wlr_pointer_motion_event *event = data;
+	idle_mark_activity(server);
 	/* The cursor doesn't move unless we tell it to. The cursor automatically
 	 * handles constraining the motion to the output layout, as well as any
 	 * special configuration applied for the specific input device which
@@ -3456,6 +4323,7 @@ static void server_cursor_motion_absolute(
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
+	idle_mark_activity(server);
 	wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x,
 		event->y);
 	if (server->active_constraint != NULL) {
@@ -3466,6 +4334,9 @@ static void server_cursor_motion_absolute(
 
 static void begin_interactive(struct amber_toplevel *toplevel,
 		enum amber_cursor_mode mode, uint32_t edges);
+static void begin_column_resize(struct amber_server *server,
+		struct amber_toplevel *toplevel);
+static void process_cursor_column_resize(struct amber_server *server);
 
 static void server_cursor_button(struct wl_listener *listener, void *data) {
 	/* This event is forwarded by the cursor when a pointer emits a button
@@ -3473,7 +4344,11 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
-
+	idle_mark_activity(server);
+	if (overview_output(server) != NULL) {
+		overview_button(server, event);
+		return;
+	}
 	if (server->sw_active) {
 		switcher_button(server, event);
 		return;
@@ -3520,6 +4395,15 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 		}
 
 		if (event->button == BTN_LEFT) {
+			/* SUPER+SHIFT+LEFT-drag on a TILED window resizes its
+			 * column (mirrors the SUPER+SHIFT+arrow binding);
+			 * plain SUPER+LEFT stays the move/reorder drag. */
+			bool shift =
+				modifier_held(server, WLR_MODIFIER_SHIFT);
+			if (shift && !toplevel->floating) {
+				begin_column_resize(server, toplevel);
+				return;
+			}
 			begin_interactive(toplevel, AMBER_CURSOR_MOVE, 0);
 		} else {
 			/* Pick resize edges from which quadrant of the window
@@ -3571,6 +4455,22 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
 	struct amber_server *server =
 		wl_container_of(listener, server, cursor_axis);
 	struct wlr_pointer_axis_event *event = data;
+	idle_mark_activity(server);
+	/* Switcher/overview: scroll wheel cycles the selection instead of
+	 * scrolling a client underneath. */
+	if (server->sw_active) {
+		if (event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL &&
+				event->source == WL_POINTER_AXIS_SOURCE_WHEEL &&
+				event->delta_discrete != 0) {
+			int dir = event->delta_discrete > 0 ? 1 : -1;
+			int step = (int)server->sw_cols > 0
+				? (int)server->sw_cols : 1;
+			switcher_select(server,
+				server->sw_selected + (size_t)(dir * step));
+			return;
+		}
+		return; // swallow the axis while the switcher is open
+	}
 	/* Notify the client with pointer focus of the axis event. */
 	wlr_seat_pointer_notify_axis(server->seat,
 			event->time_msec, event->orientation, event->delta,
@@ -5090,6 +5990,146 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	output_update_geometry(output);
 }
 
+/* ---- Idle CPU/GPU throttle (niri-style refresh drop while idle) ----
+ * When no input has arrived for idle-throttle-seconds AND nothing is
+ * playing video (no active idle-inhibitor), drop each DRM output to a
+ * low refresh rate (idle-throttle-hz, default 10Hz) to cut draw cost.
+ * Any input or media activity restores the normal refresh. */
+
+static void idle_throttle_apply(struct amber_server *server, bool throttle) {
+	if (server->idle_throttled == throttle) {
+		return;
+	}
+	server->idle_throttled = throttle;
+	struct amber_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_output *wlr_output = output->wlr_output;
+		if (!wlr_backend_is_drm(wlr_output->backend)) {
+			continue;
+		}
+		struct wlr_output_mode *mode = wlr_output->current_mode;
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		wlr_output_state_set_enabled(&state, true);
+		if (throttle) {
+			/* Low-refresh custom modes only work on outputs with a
+			 * real mode menu. A fixed panel that exposes a single
+			 * mode (e.g. LVDS/edp laptops) cannot display an
+			 * arbitrary 10Hz rate; modesetting it retries and
+			 * flickers. Only throttle when >= 2 modes exist. */
+			int modes = 0;
+			struct wlr_output_mode *m;
+			wl_list_for_each(m, &wlr_output->modes, link) {
+				modes++;
+			}
+			if (modes >= 2 && mode != NULL) {
+				int mhz = server->idle_throttle_hz * 1000;
+				wlr_output_state_set_custom_mode(&state,
+					mode->width, mode->height, mhz);
+			}
+		} else if (mode != NULL) {
+			wlr_output_state_set_mode(&state, mode);
+		}
+		wlr_output_commit_state(wlr_output, &state);
+		wlr_output_state_finish(&state);
+	}
+	if (throttle) {
+		wlr_log(WLR_INFO, "idle-throttle: low refresh requested "
+			"(skipped on fixed-mode outputs)");
+	} else {
+		wlr_log(WLR_INFO, "idle-throttle: normal refresh");
+	}
+}
+
+/* Called periodically (once a second). Depending on idle time, media
+ * inhibitors, and live animations, drop or restore the refresh rate. */
+static int idle_throttle_tick(void *data) {
+	struct amber_server *server = data;
+	bool busy = server->idle_inhibitors > 0 ||
+		!wl_list_empty(&server->animations);
+	bool active = server->idle_throttle_enabled;
+	if (server->idle_throttled && (busy || !active)) {
+		idle_throttle_apply(server, false);
+		return 0;
+	}
+	if (!active) {
+		return 0;
+	}
+	int64_t now = idle_now_usec();
+	int64_t idle_us = now - server->last_input_usec;
+	if (busy) {
+		/* Remember idle age so a pause of a video still throttles
+		 * after the configured delay. */
+		server->last_input_usec = now;
+		return 0;
+	}
+	if (idle_us >= (int64_t)server->idle_throttle_seconds * 1000000) {
+		idle_throttle_apply(server, true);
+	}
+	return 0;
+}
+
+#define IDLE_TICK_MS 1000
+
+static int64_t idle_now_usec(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* Stamped by every keyboard/pointer event: user is awake. */
+static void idle_mark_activity(struct amber_server *server) {
+	server->last_input_usec = idle_now_usec();
+	if (server->idle_throttled) {
+		idle_throttle_apply(server, false);
+	}
+}
+
+/* One of these is tracked per live idle-inhibitor (a video playing). */
+struct idle_inhibitor_track {
+	struct amber_server *server;
+	struct wl_listener destroy;
+};
+
+static void idle_inhibitor_track_destroy(struct wl_listener *listener,
+		void *data) {
+	struct idle_inhibitor_track *track =
+		wl_container_of(listener, track, destroy);
+	struct amber_server *server = track->server;
+	(void)data;
+	if (server->idle_inhibitors > 0) {
+		server->idle_inhibitors--;
+	}
+	wl_list_remove(&listener->link);
+	free(track);
+	/* Media stopped, so an idle pause may now legitimately throttle. */
+	if (server->idle_inhibitors == 0) {
+		idle_mark_activity(server);
+	}
+}
+
+static void idle_inhibit_new(struct wl_listener *listener, void *data) {
+	struct amber_server *server =
+		wl_container_of(listener, server, idle_inhibit_new);
+	struct wlr_idle_inhibitor_v1 *inhibitor = data;
+	/* Register a per-inhibitor destroy listener so we can track how
+	 * many media sources are currently inhibiting idle. */
+	struct idle_inhibitor_track *track =
+		calloc(1, sizeof(*track));
+	if (track == NULL) {
+		return;
+	}
+	track->server = server;
+	track->destroy.notify = idle_inhibitor_track_destroy;
+	wl_signal_add(&inhibitor->events.destroy, &track->destroy);
+	server->idle_inhibitors++;
+	/* Media started playing: restore full refresh immediately. */
+	if (server->idle_throttled) {
+		idle_throttle_apply(server, false);
+	}
+	server->last_input_usec = idle_now_usec();
+}
+
 static struct amber_output *find_output(struct amber_server *server,
 		struct wlr_output *wlr_output) {
 	struct amber_output *output;
@@ -5241,6 +6281,11 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 				anim->output == output) {
 			animation_destroy(server, anim, false);
 		}
+	}
+
+	/* Release overview UI before the layers/buffers are torn down. */
+	if (output->ov_active) {
+		overview_close(server);
 	}
 
 	wl_list_remove(&output->frame.link);
@@ -5631,9 +6676,11 @@ static void toplevel_foreign_init(struct amber_toplevel *toplevel) {
 		toplevel->foreign_handle =
 			wlr_foreign_toplevel_handle_v1_create(
 				server->foreign_toplevel_mgr);
-		wlr_foreign_toplevel_handle_v1_set_app_id(
-			toplevel->foreign_handle,
-			toplevel->xdg_toplevel->app_id);
+		if (toplevel->xdg_toplevel->app_id != NULL) {
+			wlr_foreign_toplevel_handle_v1_set_app_id(
+				toplevel->foreign_handle,
+				toplevel->xdg_toplevel->app_id);
+		}
 		if (title != NULL) {
 			wlr_foreign_toplevel_handle_v1_set_title(
 				toplevel->foreign_handle, title);
@@ -6104,6 +7151,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->xdg_toplevel = xdg_toplevel;
 	toplevel->sent_w = -1; // force the first real configure through
 	toplevel->sent_h = -1;
+	toplevel->fx_opacity = -1; // follow rules (no manual override)
 	toplevel->ipc_id = ++server->ipc_next_id;
 	toplevel->scene_tree =
 		wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
@@ -6366,6 +7414,10 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.layer_shell->events.new_surface,
 		&server.new_layer_surface);
 
+	/* ext-background-effect-v1: lets client panels (e.g. dms) blur the
+	 * backdrop behind a surface. Hand-rolled (see structs above). */
+	extbe_manager_init(&server);
+
 	/* Decoration negotiation: answer both protocols with "server-side",
 	 * then decorate with nothing (no titlebars, no CSD). */
 	struct wlr_server_decoration_manager *legacy_decor =
@@ -6437,7 +7489,10 @@ int main(int argc, char *argv[]) {
 	/* Idle reporting (idle behaviors in bars) + inhibition (video
 	 * players keep the screen awake). */
 	wlr_idle_notifier_v1_create(server.wl_display);
-	wlr_idle_inhibit_v1_create(server.wl_display);
+	server.idle_inhibit_mgr = wlr_idle_inhibit_v1_create(server.wl_display);
+	server.idle_inhibit_new.notify = idle_inhibit_new;
+	wl_signal_add(&server.idle_inhibit_mgr->events.new_inhibitor,
+		&server.idle_inhibit_new);
 
 	/* Pointer constraints (games): pointer lock + confine. Enforcement
 	 * lives in the constraint_* helpers on the cursor motion path. */
@@ -6587,8 +7642,12 @@ int main(int argc, char *argv[]) {
 	 * master, etc */
 	if (!wlr_backend_start(server.backend)) {
 		wlr_backend_destroy(server.backend);
-		wl_display_destroy(server.wl_display);
-		return 1;
+		/* Do NOT wl_display_destroy() here: if the backend partially
+		 * registered globals before failing, wlroots 0.20 asserts inside
+		 * wl_display_destroy() and masks the real error. Just log and
+		 * pull the plug so the failed backend's reason hits the console. */
+		wlr_log(WLR_ERROR, "failed to start backend; aborting");
+		exit(1);
 	}
 
 	/* Tell output-management clients about the initial monitor layout. */
@@ -6606,6 +7665,15 @@ int main(int argc, char *argv[]) {
 		wl_display_get_event_loop(server.wl_display);
 	server.anim_source =
 		wl_event_loop_add_timer(anim_loop, animation_tick, &server);
+
+	/* Idle refresh throttle: periodic check (once a second) that drops
+	 * output refresh while the desktop sits idle with no media. */
+	server.last_input_usec = anim_now_usec();
+	server.idle_source =
+		wl_event_loop_add_timer(anim_loop, idle_throttle_tick, &server);
+	if (server.idle_source != NULL) {
+		wl_event_source_timer_update(server.idle_source, IDLE_TICK_MS);
+	}
 
 	/* Reload config on SIGHUP (wlroots event loop makes this safe). */
 	wl_event_loop_add_signal(anim_loop, SIGHUP,
@@ -6646,6 +7714,9 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.cursor_shape_request.link);
 	wl_list_remove(&server.xdg_activation_request.link);
 	wl_list_remove(&server.session_lock_new_lock.link);
+	wl_list_remove(&server.virtual_keyboard_new.link);
+	wl_list_remove(&server.virtual_pointer_new.link);
+	wl_list_remove(&server.idle_inhibit_new.link);
 
 	wl_list_remove(&server.cursor_motion.link);
 	wl_list_remove(&server.cursor_motion_absolute.link);
@@ -6693,6 +7764,18 @@ int main(int argc, char *argv[]) {
 	if (server.ext_ws_mgr != NULL) {
 		/* wlroots asserts the commit listener is gone at teardown. */
 		wl_list_remove(&server.ext_ws_commit.link);
+	}
+	/* Output-management listens on the manager; without removing them,
+	 * wlroots 0.20 asserts in manager_handle_display_destroy. */
+	if (server.output_manager != NULL) {
+		wl_list_remove(&server.output_manager_apply.link);
+		wl_list_remove(&server.output_manager_test.link);
+	}
+	/* Same for the output-power manager: its set_mode listener must be
+	 * unregistered before wl_display_destroy or wlroots asserts in
+	 * output_power_management_v1 handle_display_destroy. */
+	if (server.output_power_mgr != NULL) {
+		wl_list_remove(&server.output_power_set_mode.link);
 	}
 	struct amber_output *out, *out_tmp;
 	wl_list_for_each_safe(out, out_tmp, &server.outputs, link) {

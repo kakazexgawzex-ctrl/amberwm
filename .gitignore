@@ -1,3 +1,5 @@
 amberwm
 *.o
 build/
+ext-background-effect-v1-protocol.c
+ext-background-effect-v1-protocol.h
